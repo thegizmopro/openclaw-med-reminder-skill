@@ -1,0 +1,897 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Med Reminder Editor</title>
+<style>
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+:root {
+  --blue:   #2563eb;
+  --blue-h: #1d4ed8;
+  --green:  #16a34a;
+  --red:    #dc2626;
+  --amber:  #d97706;
+  --gray:   #64748b;
+  --border: #e2e8f0;
+  --bg:     #f8fafc;
+  --card:   #ffffff;
+  --text:   #1e293b;
+  --muted:  #94a3b8;
+}
+
+body { font-family: system-ui, -apple-system, sans-serif; font-size: 14px;
+       background: var(--bg); color: var(--text); line-height: 1.5; }
+
+/* ── Layout ── */
+#app { max-width: 860px; margin: 0 auto; padding: 16px; }
+
+header { display: flex; align-items: center; gap: 12px; flex-wrap: wrap;
+         padding: 12px 0 16px; border-bottom: 1px solid var(--border); margin-bottom: 20px; }
+header h1 { font-size: 18px; font-weight: 700; flex: 1; }
+
+#status { font-size: 12px; padding: 4px 10px; border-radius: 4px; display: none; }
+#status.ok  { display: block; background: #dcfce7; color: #15803d; }
+#status.err { display: block; background: #fee2e2; color: #b91c1c; }
+#status.info{ display: block; background: #dbeafe; color: #1d4ed8; }
+
+section { background: var(--card); border: 1px solid var(--border);
+          border-radius: 8px; padding: 16px; margin-bottom: 16px; }
+section h2 { font-size: 14px; font-weight: 600; letter-spacing: .03em;
+             text-transform: uppercase; color: var(--gray); margin-bottom: 14px; }
+
+/* ── Buttons ── */
+.btn { display: inline-flex; align-items: center; gap: 5px; padding: 7px 14px;
+       font-size: 13px; font-weight: 500; border-radius: 5px; cursor: pointer;
+       border: 1px solid transparent; transition: background .15s, opacity .15s; }
+.btn:disabled { opacity: .45; cursor: not-allowed; }
+.btn-primary  { background: var(--blue);  color: #fff; border-color: var(--blue); }
+.btn-primary:not(:disabled):hover { background: var(--blue-h); }
+.btn-outline  { background: #fff; color: var(--text); border-color: var(--border); }
+.btn-outline:not(:disabled):hover { background: var(--bg); }
+.btn-danger   { background: #fff; color: var(--red); border-color: #fca5a5; }
+.btn-danger:not(:disabled):hover  { background: #fee2e2; }
+.btn-sm { padding: 4px 10px; font-size: 12px; }
+
+/* ── Forms ── */
+.field { margin-bottom: 12px; }
+.field label { display: block; font-size: 12px; font-weight: 600;
+               color: var(--gray); margin-bottom: 4px; }
+.field input, .field select, .field textarea {
+  width: 100%; padding: 7px 10px; border: 1px solid var(--border);
+  border-radius: 5px; font-size: 13px; background: #fff;
+  transition: border-color .15s; }
+.field input:focus, .field select:focus, .field textarea:focus {
+  outline: none; border-color: var(--blue); }
+.field textarea { resize: vertical; min-height: 60px; }
+.field .hint { font-size: 11px; color: var(--muted); margin-top: 3px; }
+.field.inline { display: flex; align-items: center; gap: 8px; }
+.field.inline input[type=checkbox] { width: auto; }
+.field.inline label { margin: 0; font-weight: 400; font-size: 13px; color: var(--text); }
+.field-row { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+@media (max-width: 500px) { .field-row { grid-template-columns: 1fr; } }
+
+/* ── Global config grid ── */
+.global-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+@media (max-width: 500px) { .global-grid { grid-template-columns: 1fr; } }
+
+/* ── Med cards ── */
+#meds-list { display: flex; flex-direction: column; gap: 8px; margin-top: 12px; }
+.med-card { display: flex; align-items: center; gap: 10px; padding: 10px 12px;
+            border: 1px solid var(--border); border-radius: 6px; background: #fff; }
+.med-card.paused { opacity: .55; }
+.med-card-main { flex: 1; min-width: 0; }
+.med-card-name { font-weight: 600; font-size: 14px; }
+.med-card-meta { font-size: 12px; color: var(--gray); white-space: nowrap;
+                 overflow: hidden; text-overflow: ellipsis; }
+.med-card-actions { display: flex; gap: 6px; flex-shrink: 0; }
+.badge { display: inline-block; padding: 2px 7px; border-radius: 12px;
+         font-size: 11px; font-weight: 600; }
+.badge-paused  { background: #f1f5f9; color: var(--gray); }
+.badge-pending { background: #dbeafe; color: #1d4ed8; }
+.badge-missed  { background: #fee2e2; color: var(--red); }
+.badge-late    { background: #fef3c7; color: var(--amber); }
+.badge-ok      { background: #dcfce7; color: var(--green); }
+
+/* ── Modal ── */
+.modal-overlay { position: fixed; inset: 0; background: rgba(0,0,0,.45);
+                 display: flex; align-items: flex-start; justify-content: center;
+                 padding: 24px 16px; overflow-y: auto; z-index: 100; }
+.modal-overlay.hidden { display: none; }
+.modal-box { background: #fff; border-radius: 10px; width: 100%; max-width: 540px;
+             box-shadow: 0 20px 60px rgba(0,0,0,.25); }
+.modal-header { display: flex; align-items: center; justify-content: space-between;
+                padding: 16px 20px; border-bottom: 1px solid var(--border); }
+.modal-header h3 { font-size: 16px; font-weight: 700; }
+.modal-close { background: none; border: none; font-size: 20px; cursor: pointer;
+               color: var(--gray); padding: 0 4px; line-height: 1; }
+.modal-body  { padding: 20px; }
+.modal-footer{ padding: 12px 20px; border-top: 1px solid var(--border);
+               display: flex; justify-content: flex-end; gap: 8px; }
+
+/* ── Validation errors ── */
+#val-errors { background: #fee2e2; border: 1px solid #fca5a5; border-radius: 6px;
+              padding: 10px 14px; margin-bottom: 16px; display: none; }
+#val-errors ul { padding-left: 16px; }
+#val-errors li { font-size: 13px; color: var(--red); margin: 2px 0; }
+
+/* ── Section divider ── */
+.section-divider { font-size: 11px; font-weight: 700; letter-spacing: .06em;
+                   text-transform: uppercase; color: var(--muted);
+                   margin: 16px 0 10px; padding-bottom: 4px;
+                   border-bottom: 1px solid var(--border); }
+/* ── Times list ── */
+.times-list { display: flex; flex-direction: column; gap: 6px; }
+.time-row   { display: flex; align-items: center; gap: 8px; }
+.time-row input { flex: 1; }
+.time-remove { background: none; border: none; cursor: pointer;
+               color: var(--red); font-size: 16px; padding: 0 4px; }
+
+/* ── State info (read-only) ── */
+.state-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; }
+.state-item { text-align: center; padding: 8px; background: var(--bg);
+              border-radius: 6px; border: 1px solid var(--border); }
+.state-item .val { font-size: 16px; font-weight: 700; }
+.state-item .lbl { font-size: 10px; color: var(--muted); text-transform: uppercase; }
+
+/* ── Empty state ── */
+.empty-state { text-align: center; color: var(--muted); padding: 24px;
+               font-size: 13px; }
+
+/* ── Unsaved indicator ── */
+.unsaved { width: 8px; height: 8px; border-radius: 50%; background: var(--amber);
+           display: inline-block; margin-right: 4px; }
+
+/* ── History table ── */
+.history-table { width: 100%; border-collapse: collapse; font-size: 12px; margin-top: 8px; }
+.history-table th { text-align: left; color: var(--muted); font-weight: 600;
+                    padding: 4px 6px; border-bottom: 1px solid var(--border);
+                    text-transform: uppercase; font-size: 10px; letter-spacing: .04em; }
+.history-table td { padding: 5px 6px; border-bottom: 1px solid var(--border); vertical-align: top; }
+.history-table tr:last-child td { border-bottom: none; }
+.history-table tr:hover td { background: var(--bg); }
+.ev-taken   { color: var(--green); font-weight: 600; }
+.ev-missed  { color: var(--red);   font-weight: 600; }
+.ev-late    { color: var(--amber); font-weight: 600; }
+.ev-deferred{ color: var(--gray);  font-weight: 600; }
+</style>
+</head>
+<body>
+<div id="app">
+
+<header>
+  <h1>Med Reminder Editor</h1>
+  <span id="file-label" style="font-size:12px;color:var(--gray)">No file open</span>
+  <span id="status"></span>
+  <button class="btn btn-outline" onclick="newFile()">New</button>
+  <button class="btn btn-outline" onclick="openFile()">Open file</button>
+  <button class="btn btn-outline" id="saveas-btn" onclick="saveAs()" disabled>Save As</button>
+  <button class="btn btn-primary" id="save-btn" onclick="saveFile()" disabled>Save</button>
+</header>
+
+<!-- Validation errors -->
+<div id="val-errors"><ul id="val-list"></ul></div>
+
+<!-- Global settings -->
+<section id="global-section" style="display:none">
+  <h2>Global Settings</h2>
+  <div class="global-grid">
+    <div class="field">
+      <label>Timezone (IANA)</label>
+      <input id="g-timezone" type="text" placeholder="America/Los_Angeles" oninput="syncGlobal()">
+      <div class="hint">e.g. America/Chicago, Europe/London</div>
+    </div>
+    <div class="field">
+      <label>Delivery Channel</label>
+      <select id="g-channel" onchange="syncGlobal()">
+        <option value="whatsapp">WhatsApp</option>
+      </select>
+    </div>
+    <div class="field">
+      <label>Quiet Hours Start</label>
+      <input id="g-quiet-start" type="time" oninput="syncGlobal()">
+    </div>
+    <div class="field">
+      <label>Quiet Hours End</label>
+      <input id="g-quiet-end" type="time" oninput="syncGlobal()">
+    </div>
+    <div class="field">
+      <label>Daily Digest Time</label>
+      <input id="g-digest" type="time" oninput="syncGlobal()">
+    </div>
+    <div class="field" style="display:flex;align-items:center;gap:8px;padding-top:20px">
+      <input id="g-paused" type="checkbox" style="width:auto" onchange="syncGlobal()">
+      <label for="g-paused" style="font-size:13px;font-weight:400;color:var(--text);margin:0">
+        Global pause (silence all reminders)
+      </label>
+    </div>
+  </div>
+</section>
+
+<!-- Medications -->
+<section id="meds-section" style="display:none">
+  <h2>Medications</h2>
+  <button class="btn btn-outline" onclick="openAddMed()">+ Add Medication</button>
+  <div id="meds-list"></div>
+</section>
+
+<!-- Placeholder when no file open -->
+<section id="welcome-section">
+  <div class="empty-state">
+    <div style="font-size:40px;margin-bottom:8px">&#128137;</div>
+    <div style="font-weight:600;margin-bottom:4px">No file open</div>
+    <div>Click <strong>Open file</strong> to load your meds-state.json</div>
+    <div style="margin-top:8px;color:var(--muted)">Chromium browser required (Chrome, Edge, Brave)</div>
+  </div>
+</section>
+
+</div><!-- #app -->
+
+<!-- Med add/edit modal -->
+<div class="modal-overlay hidden" id="modal">
+<div class="modal-box">
+  <div class="modal-header">
+    <h3 id="modal-title">Add Medication</h3>
+    <button class="modal-close" onclick="closeModal()">&#xD7;</button>
+  </div>
+  <div class="modal-body">
+
+    <div class="section-divider">Basic Info</div>
+    <div class="field-row">
+      <div class="field">
+        <label>Name *</label>
+        <input id="f-name" type="text" placeholder="Metformin">
+      </div>
+      <div class="field">
+        <label>Type *</label>
+        <select id="f-type">
+          <option value="pill">Pill</option>
+          <option value="liquid">Liquid</option>
+          <option value="injection">Injection</option>
+          <option value="patch">Patch</option>
+          <option value="inhaler">Inhaler</option>
+          <option value="other">Other</option>
+        </select>
+      </div>
+    </div>
+    <div class="field-row">
+      <div class="field">
+        <label>Dose Amount *</label>
+        <input id="f-dose" type="text" placeholder="500">
+      </div>
+      <div class="field">
+        <label>Unit *</label>
+        <input id="f-unit" type="text" placeholder="mg">
+        <div class="hint">mg, ml, tablet, unit, IU ...</div>
+      </div>
+    </div>
+    <div class="field inline">
+      <input id="f-paused" type="checkbox">
+      <label for="f-paused">Paused (skip reminders for this med)</label>
+    </div>
+
+    <div class="section-divider">Schedule</div>
+    <div class="field">
+      <label>Frequency *</label>
+      <select id="f-freq" onchange="onFreqChange()">
+        <option value="once_daily">Once daily</option>
+        <option value="twice_daily">Twice daily</option>
+        <option value="weekly">Weekly (same day each week)</option>
+        <option value="interval">Every N hours</option>
+        <option value="as_needed">As needed (no auto-reminder)</option>
+      </select>
+    </div>
+    <div id="f-times-section">
+      <div class="field">
+        <label>Dose Time(s) *</label>
+        <div class="times-list" id="f-times-list"></div>
+        <button type="button" class="btn btn-outline btn-sm" style="margin-top:6px"
+                onclick="addTimeRow()">+ Add time</button>
+      </div>
+    </div>
+    <div id="f-interval-section" style="display:none">
+      <div class="field">
+        <label>Interval (hours) *</label>
+        <input id="f-interval" type="number" min="1" max="168" placeholder="6">
+        <div class="hint">How many hours between doses (1-168)</div>
+      </div>
+    </div>
+    <div class="field inline">
+      <input id="f-food" type="checkbox">
+      <label for="f-food">Take with food</label>
+    </div>
+    <div class="field">
+      <label>Timing Notes</label>
+      <input id="f-notes" type="text" placeholder="Take with morning meal">
+    </div>
+
+    <div class="section-divider">Escalation</div>
+    <div class="field-row">
+      <div class="field">
+        <label>Late Threshold (min) *</label>
+        <input id="f-late" type="number" min="1" placeholder="30">
+        <div class="hint">Minutes past due before LATE nudge</div>
+      </div>
+      <div class="field">
+        <label>Missed Threshold (min) *</label>
+        <input id="f-miss" type="number" min="1" placeholder="90">
+        <div class="hint">Must be &gt; late threshold</div>
+      </div>
+    </div>
+    <div class="field">
+      <label>Late Message *</label>
+      <textarea id="f-late-msg" placeholder="Hey &mdash; still need to take your {name} ({dose}{unit})."></textarea>
+      <div class="hint">Variables: {name} {dose} {unit}</div>
+    </div>
+    <div class="field">
+      <label>Missed Message *</label>
+      <textarea id="f-miss-msg" placeholder="You missed your {name} dose. Logging it."></textarea>
+    </div>
+
+    <!-- State info (edit mode only) -->
+    <div id="f-state-section" style="display:none">
+      <div class="section-divider">Current State (read-only)</div>
+      <div class="state-grid">
+        <div class="state-item">
+          <div class="val" id="st-status">-</div>
+          <div class="lbl">Status</div>
+        </div>
+        <div class="state-item">
+          <div class="val" id="st-missed">0</div>
+          <div class="lbl">Missed</div>
+        </div>
+        <div class="state-item">
+          <div class="val" id="st-history">0</div>
+          <div class="lbl">History entries</div>
+        </div>
+      </div>
+      <div style="font-size:11px;color:var(--muted);margin-top:8px">
+        Last taken: <span id="st-last">never</span> &nbsp;|&nbsp;
+        Next due: <span id="st-next">not set</span>
+      </div>
+      <div id="st-history-wrap" style="display:none;margin-top:10px;max-height:200px;overflow-y:auto;border:1px solid var(--border);border-radius:6px;">
+        <table class="history-table">
+          <thead><tr><th>When</th><th>Event</th><th>Dose</th><th>Notes</th></tr></thead>
+          <tbody id="st-history-body"></tbody>
+        </table>
+      </div>
+    </div>
+
+    <div id="f-form-errors" style="display:none;margin-top:12px;padding:8px 12px;
+         background:#fee2e2;border-radius:5px;font-size:12px;color:var(--red)"></div>
+  </div>
+  <div class="modal-footer">
+    <button class="btn btn-outline" onclick="closeModal()">Cancel</button>
+    <button class="btn btn-primary" onclick="saveMed()">Save medication</button>
+  </div>
+</div>
+</div><!-- modal -->
+
+<script>
+'use strict';
+
+// ── State ──────────────────────────────────────────────────────────────────
+let currentState = null;
+let fileHandle   = null;
+let editingId    = null; // null = add, string = edit existing
+
+// ── Validation ─────────────────────────────────────────────────────────────
+const HHMM  = /^([01][0-9]|2[0-3]):[0-5][0-9]$/;
+const MED_ID = /^med-[0-9]{3,}$/;
+const ISO_DT = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?(Z|[+-]\d{2}:\d{2})$/;
+
+function validate(s) {
+  const e = [];
+  if (!s || typeof s !== 'object')  { e.push('State must be a JSON object'); return e; }
+  if (s.version !== '1')            e.push(`version must be "1" (got "${s.version}")`);
+  if (!Array.isArray(s.meds))       { e.push('meds must be an array'); return e; }
+
+  const g = s.global || {};
+  if (!g.timezone)                  e.push('global.timezone is required');
+  if (!g.quiet_hours)               e.push('global.quiet_hours is required');
+  else {
+    if (!HHMM.test(g.quiet_hours.start||'')) e.push(`global.quiet_hours.start "${g.quiet_hours.start}" must be HH:MM (zero-padded)`);
+    if (!HHMM.test(g.quiet_hours.end||''))   e.push(`global.quiet_hours.end "${g.quiet_hours.end}" must be HH:MM`);
+  }
+  if (typeof g.paused !== 'boolean')  e.push('global.paused must be boolean');
+  if (!HHMM.test(g.digest_time||''))  e.push(`global.digest_time "${g.digest_time}" must be HH:MM`);
+  if (!g.delivery_channel)            e.push('global.delivery_channel is required');
+
+  const seenIds = new Set();
+  s.meds.forEach((m, i) => {
+    const p = `meds[${i}]`;
+    if (!MED_ID.test(m.id||''))     e.push(`${p}.id "${m.id}" must match med-NNN pattern`);
+    if (seenIds.has(m.id))          e.push(`${p}: duplicate id "${m.id}"`);
+    seenIds.add(m.id);
+    if (!m.name?.trim())            e.push(`${p}.name is required`);
+    const TYPES = ['pill','liquid','injection','patch','inhaler','other'];
+    if (!TYPES.includes(m.type))    e.push(`${p}.type must be one of ${TYPES.join(', ')}`);
+    if (!m.dose?.trim())            e.push(`${p}.dose is required`);
+    if (!m.unit?.trim())            e.push(`${p}.unit is required`);
+    if (typeof m.paused !== 'boolean') e.push(`${p}.paused must be boolean`);
+
+    const sc = m.schedule || {};
+    const FREQS = ['once_daily','twice_daily','interval','weekly','as_needed'];
+    if (!FREQS.includes(sc.frequency)) e.push(`${p}.schedule.frequency must be one of ${FREQS.join(', ')}`);
+    if (sc.frequency === 'interval') {
+      if (!Number.isInteger(sc.interval_hours) || sc.interval_hours < 1 || sc.interval_hours > 168)
+        e.push(`${p}.schedule.interval_hours must be integer 1-168`);
+    } else if (sc.frequency !== 'as_needed') {
+      if (!Array.isArray(sc.times) || sc.times.length === 0)
+        e.push(`${p}.schedule.times required for frequency "${sc.frequency}"`);
+      (sc.times||[]).forEach((t,j) => {
+        if (!HHMM.test(t)) e.push(`${p}.schedule.times[${j}] "${t}" must be HH:MM (zero-padded)`);
+      });
+    }
+
+    const es = m.escalation || {};
+    if (!Number.isInteger(es.late_threshold_minutes) || es.late_threshold_minutes < 1)
+      e.push(`${p}.escalation.late_threshold_minutes must be positive integer`);
+    if (!Number.isInteger(es.missed_threshold_minutes) || es.missed_threshold_minutes < 1)
+      e.push(`${p}.escalation.missed_threshold_minutes must be positive integer`);
+    if (Number.isInteger(es.late_threshold_minutes) && Number.isInteger(es.missed_threshold_minutes)
+        && es.late_threshold_minutes >= es.missed_threshold_minutes)
+      e.push(`${p}: late_threshold (${es.late_threshold_minutes}) must be less than missed_threshold (${es.missed_threshold_minutes})`);
+    if (!es.late_message?.trim())   e.push(`${p}.escalation.late_message is required`);
+    if (!es.missed_message?.trim()) e.push(`${p}.escalation.missed_message is required`);
+
+    const st = m.state || {};
+    const STATUSES = ['pending','reminded','confirmed','late','missed','deferred'];
+    if (!STATUSES.includes(st.status)) e.push(`${p}.state.status must be one of ${STATUSES.join(', ')}`);
+    if (!Number.isInteger(st.missed_count) || st.missed_count < 0)
+      e.push(`${p}.state.missed_count must be non-negative integer`);
+    if (!Array.isArray(st.history))  e.push(`${p}.state.history must be an array`);
+    if ((st.history||[]).length > 30) e.push(`${p}.state.history has ${st.history.length} entries (max 30)`);
+    [st.last_taken, st.last_reminded, st.next_due].forEach((v, j) => {
+      const fn = ['last_taken','last_reminded','next_due'][j];
+      if (v !== null && v !== undefined && !ISO_DT.test(v))
+        e.push(`${p}.state.${fn} must be ISO 8601 with timezone or null`);
+    });
+  });
+  return e;
+}
+
+// ── Template ───────────────────────────────────────────────────────────────
+const TEMPLATE = {
+  version: '1',
+  global: {
+    timezone: 'America/Los_Angeles',
+    quiet_hours: { start: '22:00', end: '07:00' },
+    paused: false,
+    digest_time: '08:00',
+    delivery_channel: 'whatsapp'
+  },
+  meds: []
+};
+
+// ── File I/O ───────────────────────────────────────────────────────────────
+function newFile() {
+  if (currentState && !confirm('Discard current file and create a new one?')) return;
+  fileHandle    = null;
+  currentState  = JSON.parse(JSON.stringify(TEMPLATE));
+  renderAll();
+  document.getElementById('file-label').textContent = 'Untitled (unsaved)';
+  document.getElementById('save-btn').disabled      = false;
+  document.getElementById('saveas-btn').disabled    = false;
+  document.getElementById('welcome-section').style.display = 'none';
+  document.getElementById('global-section').style.display  = '';
+  document.getElementById('meds-section').style.display    = '';
+  hideValErrors();
+  markUnsaved();
+}
+
+async function openFile() {
+  if (!window.showOpenFilePicker) {
+    setStatus('File System Access API requires Chrome, Edge, or Brave (not Firefox/Safari).', 'err');
+    return;
+  }
+  try {
+    [fileHandle] = await window.showOpenFilePicker({
+      types: [{ description: 'JSON', accept: { 'application/json': ['.json'] } }]
+    });
+    const file = await fileHandle.getFile();
+    const text = await file.text();
+    let parsed;
+    try { parsed = JSON.parse(text); }
+    catch(ex) { setStatus('Invalid JSON: ' + ex.message, 'err'); return; }
+
+    const errs = validate(parsed);
+    if (errs.length) {
+      showValErrors(errs);
+      setStatus('File loaded with ' + errs.length + ' validation error(s) — shown below.', 'err');
+    } else {
+      hideValErrors();
+    }
+    currentState = parsed;
+    renderAll();
+    document.getElementById('file-label').textContent    = file.name;
+    document.getElementById('save-btn').disabled         = false;
+    document.getElementById('saveas-btn').disabled       = false;
+    document.getElementById('welcome-section').style.display = 'none';
+    document.getElementById('global-section').style.display  = '';
+    document.getElementById('meds-section').style.display    = '';
+    if (!errs.length) setStatus('Opened: ' + file.name, 'ok');
+  } catch (ex) {
+    if (ex.name !== 'AbortError') setStatus('Open failed: ' + ex.message, 'err');
+  }
+}
+
+async function writeToHandle(handle) {
+  const writable = await handle.createWritable();
+  await writable.write(JSON.stringify(currentState, null, 2));
+  await writable.close();
+  const name = (await handle.getFile()).name;
+  document.getElementById('file-label').textContent = name;
+  document.getElementById('save-btn').innerHTML = 'Save';
+  setStatus('Saved to ' + name, 'ok');
+}
+
+async function saveFile() {
+  if (!currentState) return;
+  syncGlobal();
+  const errs = validate(currentState);
+  if (errs.length) { showValErrors(errs); setStatus(errs.length + ' validation error(s) — cannot save.', 'err'); return; }
+  hideValErrors();
+  try {
+    if (!fileHandle) {
+      fileHandle = await window.showSaveFilePicker({
+        suggestedName: 'meds-state.json',
+        types: [{ description: 'JSON', accept: { 'application/json': ['.json'] } }]
+      });
+    }
+    await writeToHandle(fileHandle);
+  } catch (ex) {
+    if (ex.name !== 'AbortError') setStatus('Save failed: ' + ex.message, 'err');
+  }
+}
+
+async function saveAs() {
+  if (!currentState) return;
+  syncGlobal();
+  const errs = validate(currentState);
+  if (errs.length) { showValErrors(errs); setStatus(errs.length + ' validation error(s) — cannot save.', 'err'); return; }
+  hideValErrors();
+  if (!window.showSaveFilePicker) { setStatus('File System Access API requires Chrome, Edge, or Brave.', 'err'); return; }
+  try {
+    const handle = await window.showSaveFilePicker({
+      suggestedName: 'meds-state.json',
+      types: [{ description: 'JSON', accept: { 'application/json': ['.json'] } }]
+    });
+    fileHandle = handle;
+    await writeToHandle(handle);
+  } catch (ex) {
+    if (ex.name !== 'AbortError') setStatus('Save failed: ' + ex.message, 'err');
+  }
+}
+
+function markUnsaved() {
+  const btn = document.getElementById('save-btn');
+  btn.innerHTML = '<span class="unsaved"></span>Save';
+}
+
+// ── Render ─────────────────────────────────────────────────────────────────
+function renderAll() {
+  if (!currentState) return;
+  renderGlobal();
+  renderMeds();
+}
+
+function renderGlobal() {
+  const g = currentState.global;
+  document.getElementById('g-timezone').value    = g.timezone    || '';
+  document.getElementById('g-quiet-start').value = g.quiet_hours?.start || '';
+  document.getElementById('g-quiet-end').value   = g.quiet_hours?.end   || '';
+  document.getElementById('g-digest').value      = g.digest_time || '';
+  document.getElementById('g-channel').value     = g.delivery_channel || 'whatsapp';
+  document.getElementById('g-paused').checked    = !!g.paused;
+}
+
+function syncGlobal() {
+  if (!currentState) return;
+  currentState.global.timezone         = document.getElementById('g-timezone').value.trim();
+  currentState.global.quiet_hours.start= document.getElementById('g-quiet-start').value;
+  currentState.global.quiet_hours.end  = document.getElementById('g-quiet-end').value;
+  currentState.global.digest_time      = document.getElementById('g-digest').value;
+  currentState.global.delivery_channel = document.getElementById('g-channel').value;
+  currentState.global.paused           = document.getElementById('g-paused').checked;
+  markUnsaved();
+}
+
+function fmtStatus(st) {
+  const map = { pending:'pending', reminded:'reminded', confirmed:'ok',
+                late:'late', missed:'missed', deferred:'deferred' };
+  const cls = { pending:'badge-pending', reminded:'badge-pending', confirmed:'badge-ok',
+                late:'badge-late', missed:'badge-missed', deferred:'badge-paused' };
+  return `<span class="badge ${cls[st]||''}">${st}</span>`;
+}
+
+function fmtSchedule(med) {
+  const s = med.schedule;
+  if (s.frequency === 'interval') return `every ${s.interval_hours}h`;
+  if (s.frequency === 'as_needed') return 'as needed';
+  const ts = (s.times||[]).map(t => {
+    const [h,m] = t.split(':').map(Number);
+    const suf = h < 12 ? 'am' : 'pm';
+    return `${h%12||12}:${String(m).padStart(2,'0')}${suf}`;
+  });
+  const freq = { once_daily:'daily', twice_daily:'twice daily', weekly:'weekly' }[s.frequency] || s.frequency;
+  return `${freq} at ${ts.join(', ')}`;
+}
+
+function renderMeds() {
+  const list = document.getElementById('meds-list');
+  if (!currentState.meds.length) {
+    list.innerHTML = '<div class="empty-state" style="padding:20px">No medications yet. Click + Add Medication.</div>';
+    return;
+  }
+  list.innerHTML = currentState.meds.map(med => `
+    <div class="med-card ${med.paused ? 'paused' : ''}">
+      <div class="med-card-main">
+        <div class="med-card-name">${esc(med.name)} <small style="font-weight:400;color:var(--gray)">${esc(med.dose)}${esc(med.unit)} &bull; ${esc(med.type)}</small></div>
+        <div class="med-card-meta">${esc(fmtSchedule(med))} &nbsp; ${fmtStatus(med.state.status)} ${med.paused ? '<span class="badge badge-paused">paused</span>' : ''}</div>
+      </div>
+      <div class="med-card-actions">
+        <button class="btn btn-outline btn-sm" onclick="openEditMed('${esc(med.id)}')">Edit</button>
+        <button class="btn btn-danger btn-sm" onclick="deleteMed('${esc(med.id)}')">Delete</button>
+      </div>
+    </div>
+  `).join('');
+}
+
+// ── Med modal ──────────────────────────────────────────────────────────────
+function openAddMed() {
+  editingId = null;
+  document.getElementById('modal-title').textContent = 'Add Medication';
+  clearMedForm();
+  // Defaults
+  document.getElementById('f-freq').value   = 'once_daily';
+  document.getElementById('f-late').value   = '30';
+  document.getElementById('f-miss').value   = '90';
+  document.getElementById('f-late-msg').value = 'Reminder: still need to take your {name} ({dose}{unit}).';
+  document.getElementById('f-miss-msg').value = 'You missed your {name} dose. Logging it.';
+  document.getElementById('f-state-section').style.display = 'none';
+  document.getElementById('f-form-errors').style.display = 'none';
+  onFreqChange();
+  addTimeRow('08:00');
+  document.getElementById('modal').classList.remove('hidden');
+}
+
+function openEditMed(id) {
+  const med = currentState.meds.find(m => m.id === id);
+  if (!med) return;
+  editingId = id;
+  document.getElementById('modal-title').textContent = 'Edit Medication';
+  clearMedForm();
+
+  document.getElementById('f-name').value  = med.name;
+  document.getElementById('f-type').value  = med.type;
+  document.getElementById('f-dose').value  = med.dose;
+  document.getElementById('f-unit').value  = med.unit;
+  document.getElementById('f-paused').checked = med.paused;
+
+  const s = med.schedule;
+  document.getElementById('f-freq').value  = s.frequency;
+  if (s.frequency === 'interval') {
+    document.getElementById('f-interval').value = s.interval_hours || '';
+  } else {
+    (s.times || ['08:00']).forEach(t => addTimeRow(t));
+  }
+  document.getElementById('f-food').checked  = !!s.with_food;
+  document.getElementById('f-notes').value   = s.notes || '';
+
+  document.getElementById('f-late').value     = med.escalation.late_threshold_minutes;
+  document.getElementById('f-miss').value     = med.escalation.missed_threshold_minutes;
+  document.getElementById('f-late-msg').value = med.escalation.late_message;
+  document.getElementById('f-miss-msg').value = med.escalation.missed_message;
+
+  // State info
+  const st = med.state;
+  document.getElementById('st-status').textContent  = st.status;
+  document.getElementById('st-missed').textContent  = st.missed_count;
+  document.getElementById('st-history').textContent = st.history.length;
+  document.getElementById('st-last').textContent    = st.last_taken  ? fmtDt(st.last_taken) : 'never';
+  document.getElementById('st-next').textContent    = st.next_due    ? fmtDt(st.next_due)   : 'not set';
+
+  // History table
+  const histWrap = document.getElementById('st-history-wrap');
+  const histBody = document.getElementById('st-history-body');
+  if (st.history && st.history.length) {
+    const evCls = { taken:'ev-taken', missed:'ev-missed', late_nudge_sent:'ev-late', deferred:'ev-deferred' };
+    histBody.innerHTML = [...st.history].reverse().map(h => `
+      <tr>
+        <td style="white-space:nowrap">${fmtDt(h.timestamp)}</td>
+        <td class="${evCls[h.event]||''}">${esc(h.event.replace(/_/g,' '))}</td>
+        <td>${esc(h.dose_prescribed)}${h.dose_taken ? ` <span style="color:var(--amber)">(actual: ${esc(h.dose_taken)})</span>` : ''}</td>
+        <td style="color:var(--gray)">${esc(h.notes||'')}</td>
+      </tr>`).join('');
+    histWrap.style.display = '';
+  } else {
+    histWrap.style.display = 'none';
+  }
+
+  document.getElementById('f-state-section').style.display = '';
+  document.getElementById('f-form-errors').style.display = 'none';
+
+  onFreqChange();
+  document.getElementById('modal').classList.remove('hidden');
+}
+
+function closeModal() {
+  document.getElementById('modal').classList.add('hidden');
+  editingId = null;
+}
+
+function clearMedForm() {
+  ['f-name','f-dose','f-unit','f-notes','f-late-msg','f-miss-msg','f-interval'].forEach(id => {
+    document.getElementById(id).value = '';
+  });
+  document.getElementById('f-type').value    = 'pill';
+  document.getElementById('f-freq').value    = 'once_daily';
+  document.getElementById('f-paused').checked = false;
+  document.getElementById('f-food').checked   = false;
+  document.getElementById('f-times-list').innerHTML = '';
+}
+
+function onFreqChange() {
+  const freq = document.getElementById('f-freq').value;
+  const isInterval  = freq === 'interval';
+  const isAsNeeded  = freq === 'as_needed';
+  document.getElementById('f-times-section').style.display    = (isInterval || isAsNeeded) ? 'none' : '';
+  document.getElementById('f-interval-section').style.display = isInterval ? '' : 'none';
+}
+
+function addTimeRow(val = '') {
+  const row = document.createElement('div');
+  row.className = 'time-row';
+  row.innerHTML = `<input type="time" value="${esc(val)}" required>
+    <button type="button" class="time-remove" onclick="this.parentElement.remove()" title="Remove">&#xD7;</button>`;
+  document.getElementById('f-times-list').appendChild(row);
+}
+
+function collectTimes() {
+  return Array.from(document.querySelectorAll('#f-times-list input[type=time]'))
+    .map(el => el.value).filter(Boolean);
+}
+
+function saveMed() {
+  const name  = document.getElementById('f-name').value.trim();
+  const type  = document.getElementById('f-type').value;
+  const dose  = document.getElementById('f-dose').value.trim();
+  const unit  = document.getElementById('f-unit').value.trim();
+  const paused= document.getElementById('f-paused').checked;
+  const freq  = document.getElementById('f-freq').value;
+  const food  = document.getElementById('f-food').checked;
+  const notes = document.getElementById('f-notes').value.trim();
+  const late  = parseInt(document.getElementById('f-late').value, 10);
+  const miss  = parseInt(document.getElementById('f-miss').value, 10);
+  const lateMsg = document.getElementById('f-late-msg').value.trim();
+  const missMsg = document.getElementById('f-miss-msg').value.trim();
+
+  // Local validation
+  const errs = [];
+  if (!name)   errs.push('Name is required');
+  if (!dose)   errs.push('Dose amount is required');
+  if (!unit)   errs.push('Unit is required');
+  if (freq === 'interval') {
+    const ih = parseInt(document.getElementById('f-interval').value, 10);
+    if (!ih || ih < 1 || ih > 168) errs.push('Interval hours must be 1–168');
+  } else if (freq !== 'as_needed') {
+    const times = collectTimes();
+    if (!times.length) errs.push('At least one dose time is required');
+    times.forEach((t, i) => { if (!HHMM.test(t)) errs.push(`Time ${i+1} "${t}" must be HH:MM (zero-padded, 24h)`); });
+  }
+  if (isNaN(late) || late < 1)  errs.push('Late threshold must be a positive number');
+  if (isNaN(miss) || miss < 1)  errs.push('Missed threshold must be a positive number');
+  if (!isNaN(late) && !isNaN(miss) && late >= miss)
+    errs.push(`Late threshold (${late}) must be less than missed threshold (${miss})`);
+  if (!lateMsg) errs.push('Late message is required');
+  if (!missMsg) errs.push('Missed message is required');
+
+  const errEl = document.getElementById('f-form-errors');
+  if (errs.length) { errEl.style.display = ''; errEl.textContent = errs.join('\n'); return; }
+  errEl.style.display = 'none';
+
+  // Build schedule
+  const schedule = { frequency: freq };
+  if (freq === 'interval') {
+    schedule.interval_hours = parseInt(document.getElementById('f-interval').value, 10);
+  } else if (freq !== 'as_needed') {
+    schedule.interval_hours = null;
+    schedule.times = collectTimes();
+  } else {
+    schedule.interval_hours = null;
+  }
+  schedule.with_food = food;
+  if (notes) schedule.notes = notes;
+
+  if (editingId) {
+    // Update existing
+    const med = currentState.meds.find(m => m.id === editingId);
+    med.name = name; med.type = type; med.dose = dose; med.unit = unit; med.paused = paused;
+    med.schedule   = schedule;
+    med.escalation = { late_threshold_minutes: late, missed_threshold_minutes: miss,
+                       late_message: lateMsg, missed_message: missMsg };
+    // preserve med.state
+  } else {
+    // Add new
+    currentState.meds.push({
+      id: generateId(), name, type, dose, unit, paused,
+      schedule,
+      escalation: { late_threshold_minutes: late, missed_threshold_minutes: miss,
+                    late_message: lateMsg, missed_message: missMsg },
+      state: { status: 'pending', last_taken: null, last_reminded: null,
+               next_due: null, missed_count: 0, history: [] }
+    });
+  }
+
+  renderMeds();
+  closeModal();
+  markUnsaved();
+}
+
+function deleteMed(id) {
+  const med = currentState.meds.find(m => m.id === id);
+  if (!med) return;
+  if (!confirm(`Delete "${med.name}"? This removes it from the state file.`)) return;
+  currentState.meds = currentState.meds.filter(m => m.id !== id);
+  renderMeds();
+  markUnsaved();
+}
+
+// ── Helpers ────────────────────────────────────────────────────────────────
+function generateId() {
+  const nums = (currentState.meds || [])
+    .map(m => parseInt((m.id||'').replace('med-','')) || 0)
+    .filter(n => !isNaN(n));
+  const max = nums.length ? Math.max(...nums) : 0;
+  return `med-${String(max + 1).padStart(3, '0')}`;
+}
+
+function esc(s) {
+  return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+}
+
+function fmtDt(iso) {
+  try {
+    const d = new Date(iso);
+    return d.toLocaleDateString(undefined,{month:'short',day:'numeric'}) + ' ' +
+           d.toLocaleTimeString(undefined,{hour:'2-digit',minute:'2-digit'});
+  } catch { return iso; }
+}
+
+function setStatus(msg, type) {
+  const el = document.getElementById('status');
+  el.textContent = msg;
+  el.className = type; // 'ok' | 'err' | 'info'
+  if (type === 'ok') setTimeout(() => { if (el.textContent === msg) el.className = ''; }, 4000);
+}
+
+function showValErrors(errs) {
+  const box  = document.getElementById('val-errors');
+  const list = document.getElementById('val-list');
+  list.innerHTML = errs.map(e => `<li>${esc(e)}</li>`).join('');
+  box.style.display = '';
+  box.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+}
+
+function hideValErrors() {
+  document.getElementById('val-errors').style.display = 'none';
+}
+
+// Close modal on overlay click
+document.getElementById('modal').addEventListener('click', e => {
+  if (e.target === document.getElementById('modal')) closeModal();
+});
+
+// Keyboard shortcuts
+document.addEventListener('keydown', e => {
+  if (e.key === 'Escape') { closeModal(); return; }
+  if ((e.ctrlKey || e.metaKey) && e.key === 's') {
+    e.preventDefault();
+    if (currentState && !document.getElementById('save-btn').disabled) saveFile();
+  }
+});
+</script>
+</body>
+</html>
