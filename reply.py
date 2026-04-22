@@ -76,6 +76,11 @@ def handle_confirm(med_id: str, dose_taken: Optional[str], dry_run: bool) -> Non
         print(f"Skipped: {med['name']} is paused.")
         return
 
+    if med["state"]["status"] == "confirmed":
+        log.info("SKIP [confirm] %s — already confirmed", med_id)
+        print(f"Already confirmed: {med['name']} (taken at {med['state'].get('last_taken', 'unknown')}).")
+        return
+
     med["state"]["status"]     = "confirmed"
     med["state"]["last_taken"] = now.isoformat()
 
@@ -129,6 +134,8 @@ def handle_confirm_all(dose_taken: Optional[str], dry_run: bool) -> None:
         print(f"Confirmed: {', '.join(confirmed)}.")
     if skipped:
         print(f"Skipped: {', '.join(skipped)}.")
+    if not confirmed and not skipped:
+        print("Nothing to confirm — no active meds found.")
 
 
 def handle_defer(med_id: str, dry_run: bool) -> None:

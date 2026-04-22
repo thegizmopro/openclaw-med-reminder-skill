@@ -38,6 +38,7 @@ BACKUP_FILE  = Path(str(STATE_FILE) + ".bak")
 TMP_FILE     = Path(str(STATE_FILE) + ".tmp")
 LOCK_TIMEOUT = 30   # seconds before declaring lock stale
 LOCK_WAIT    = 5    # seconds to wait before giving up on a live lock
+HISTORY_MAX  = 30   # must match dispatch.HISTORY_MAX
 
 log = logging.getLogger("safe_write")
 
@@ -179,8 +180,8 @@ def validate(state: dict) -> None:
         if not isinstance(mstate["history"], list):
             _die(f"{p}.state.history must be an array")
 
-        if len(mstate["history"]) > 30:
-            _die(f"{p}.state.history has {len(mstate['history'])} entries (max 30)")
+        if len(mstate["history"]) > HISTORY_MAX:
+            _die(f"{p}.state.history has {len(mstate['history'])} entries (max {HISTORY_MAX})")
 
         for field in ("last_taken", "last_reminded", "next_due"):
             val = mstate[field]
