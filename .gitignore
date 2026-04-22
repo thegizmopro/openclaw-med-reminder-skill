@@ -7,3 +7,9 @@
 .env
 secrets.json
 *.bak
+meds-state.json
+meds-state.json.bak
+.registered-tasks.json
+*.log
+med-passport.html
+.pytest_cache/

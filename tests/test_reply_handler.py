@@ -1,35 +1,35 @@
 """
-Reply handler tests — dispatch.py confirm and defer subcommands.
+Reply handler tests — reply.py confirm and defer subcommands.
 """
 from datetime import datetime, timedelta
 from unittest.mock import patch
 
 import pytest
 
-from dispatch import handle_confirm, handle_confirm_all, handle_defer
+from reply import handle_confirm, handle_confirm_all, handle_defer
 from tests.conftest import make_state, make_med, iso, local_dt, TZ
 
 
 def run_confirm(state, med_id, dose_taken=None):
     saved = []
-    with patch("dispatch.load_state", return_value=state), \
-         patch("dispatch.save_state", side_effect=lambda s, dr: saved.append(s)):
+    with patch("reply.load_state", return_value=state), \
+         patch("reply.save_state", side_effect=lambda s, dr: saved.append(s)):
         handle_confirm(med_id, dose_taken, dry_run=False)
     return saved
 
 
 def run_confirm_all(state, dose_taken=None):
     saved = []
-    with patch("dispatch.load_state", return_value=state), \
-         patch("dispatch.save_state", side_effect=lambda s, dr: saved.append(s)):
+    with patch("reply.load_state", return_value=state), \
+         patch("reply.save_state", side_effect=lambda s, dr: saved.append(s)):
         handle_confirm_all(dose_taken, dry_run=False)
     return saved
 
 
 def run_defer(state, med_id):
     saved = []
-    with patch("dispatch.load_state", return_value=state), \
-         patch("dispatch.save_state", side_effect=lambda s, dr: saved.append(s)):
+    with patch("reply.load_state", return_value=state), \
+         patch("reply.save_state", side_effect=lambda s, dr: saved.append(s)):
         handle_defer(med_id, dry_run=False)
     return saved
 
@@ -176,7 +176,7 @@ def test_confirm_dry_run_does_not_call_save():
     med   = make_med(med_id="med-001")
     state = make_state(meds=[med])
     saved = []
-    with patch("dispatch.load_state", return_value=state), \
-         patch("dispatch.save_state", side_effect=lambda s, dr: saved.append(s) if not dr else None):
+    with patch("reply.load_state", return_value=state), \
+         patch("reply.save_state", side_effect=lambda s, dr: saved.append(s) if not dr else None):
         handle_confirm("med-001", None, dry_run=True)
     assert len(saved) == 0

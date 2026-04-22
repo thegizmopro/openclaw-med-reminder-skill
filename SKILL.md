@@ -251,16 +251,16 @@ Use the appropriate subcommand. `dispatch.py` validates, writes atomically via
 
 ```bash
 # Confirm one med as taken (prescribed dose):
-python3 dispatch.py confirm med-001
+python3 reply.py confirm med-001
 
 # Confirm one med with a different actual dose:
-python3 dispatch.py confirm med-001 --dose-taken 250mg
+python3 reply.py confirm med-001 --dose-taken 250mg
 
 # Confirm all pending/reminded/late meds at once:
-python3 dispatch.py confirm --all
+python3 reply.py confirm --all
 
 # Defer one med until next digest cycle:
-python3 dispatch.py defer med-001
+python3 reply.py defer med-001
 ```
 
 After the command runs, report the result to the user using the output printed by

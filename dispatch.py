@@ -29,6 +29,7 @@ import logging
 import os
 import subprocess
 import sys
+import time
 from datetime import datetime, timedelta, timezone as tz_fixed
 from pathlib import Path
 from typing import Optional
@@ -43,10 +44,12 @@ if sys.version_info < (3, 9):
 
 SCRIPT_DIR = Path(__file__).parent.resolve()
 STATE_FILE  = Path(os.environ.get("MEDS_STATE_FILE", SCRIPT_DIR / "meds-state.json"))
-SAFE_WRITE  = SCRIPT_DIR / "safe-write.sh"
 LOG_FILE    = Path(os.environ.get("MEDS_LOG_FILE",   SCRIPT_DIR / "dispatch.log"))
 SEND_CMD    = os.environ.get("MEDS_SEND_CMD", "")
 HISTORY_MAX = 30
+
+sys.path.insert(0, str(SCRIPT_DIR))
+from safe_write import safe_write as _safe_write_fn
 
 log = logging.getLogger("dispatch")
 
@@ -76,21 +79,21 @@ def load_state() -> dict:
         return json.load(f)
 
 def save_state(state: dict, dry_run: bool) -> None:
-    payload = json.dumps(state, indent=2)
     if dry_run:
+        payload = json.dumps(state, indent=2)
         log.info("[DRY RUN] Would write state (first 300 chars):\n%s", payload[:300])
         return
-    result = subprocess.run(
-        ["bash", str(SAFE_WRITE)],
-        input=payload,
-        capture_output=True,
-        text=True,
-    )
-    if result.returncode != 0:
-        sys.exit(f"safe-write.sh failed:\n{result.stderr}\n{result.stdout}")
+    try:
+        _safe_write_fn(state)
+    except (ValueError, RuntimeError) as e:
+        sys.exit(f"safe_write failed: {e}")
     log.debug("State saved OK")
 
 # ── Messaging ─────────────────────────────────────────────────────────────────
+
+SEND_RETRIES = 3
+SEND_RETRY_DELAY = 5  # seconds between attempts
+
 
 def send_message(text: str, dry_run: bool) -> None:
     if dry_run:
@@ -107,11 +110,20 @@ def send_message(text: str, dry_run: bool) -> None:
             "send-message.sh receives the message text on stdin."
         )
 
-    result = subprocess.run(cmd, shell=True, input=text, capture_output=True, text=True)
-    if result.returncode != 0:
-        log.error("Send failed (exit %d): %s", result.returncode, result.stderr.strip())
-        sys.exit(1)
-    log.info("Message sent (%d chars)", len(text))
+    last_err = ""
+    for attempt in range(1, SEND_RETRIES + 1):
+        result = subprocess.run(cmd, shell=True, input=text, capture_output=True, text=True)
+        if result.returncode == 0:
+            log.info("Message sent (%d chars, attempt %d)", len(text), attempt)
+            return
+        last_err = result.stderr.strip()
+        log.warning("Send attempt %d/%d failed (exit %d): %s",
+                    attempt, SEND_RETRIES, result.returncode, last_err)
+        if attempt < SEND_RETRIES:
+            time.sleep(SEND_RETRY_DELAY)
+
+    log.error("Send failed after %d attempts: %s", SEND_RETRIES, last_err)
+    sys.exit(1)
 
 # ── Timezone ──────────────────────────────────────────────────────────────────
 
@@ -432,112 +444,6 @@ def handle_digest(dry_run: bool) -> None:
     log.info("DIGEST sent (%d active med(s))", len(active))
 
 
-def handle_confirm(med_id: str, dose_taken: Optional[str], dry_run: bool) -> None:
-    """
-    Mark a single med as taken. Called by the AI reply handler.
-
-    - Sets status → 'confirmed', last_taken → now
-    - Recomputes next_due via compute_next_due()
-    - Appends a 'taken' history entry (with dose_taken if different from prescribed)
-    - Writes state via safe-write.sh
-
-    Use --all to confirm all currently pending/reminded/late meds in one write.
-    """
-    state = load_state()
-    tz    = get_tz(state)
-    now   = datetime.now(tz=tz)
-    med   = find_med(state, med_id)
-
-    if med.get("paused"):
-        log.info("SKIP [confirm] %s — med is paused", med_id)
-        print(f"Skipped: {med['name']} is paused.")
-        return
-
-    med["state"]["status"]     = "confirmed"
-    med["state"]["last_taken"] = now.isoformat()
-
-    nd = compute_next_due(med, now, tz)
-    med["state"]["next_due"] = nd.isoformat() if nd else None
-
-    append_history(med, "taken", dose_taken=dose_taken or None)
-
-    save_state(state, dry_run)
-    next_str = nd.strftime("%b %d %H:%M %Z") if nd else "n/a"
-    log.info(
-        "CONFIRM [%s] taken=%s dose_taken=%s next_due=%s",
-        med_id, now.isoformat(), dose_taken or "(prescribed)", med["state"]["next_due"],
-    )
-    print(f"Confirmed: {med['name']} {med['dose']}{med['unit']} taken at "
-          f"{now.strftime('%H:%M')}. Next due: {next_str}.")
-
-
-def handle_confirm_all(dose_taken: Optional[str], dry_run: bool) -> None:
-    """
-    Mark ALL active, unconfirmed meds as taken in a single state write.
-    Used for 'all taken' / 'done' replies.
-    Skips: paused meds, as_needed meds, already-confirmed meds.
-    """
-    state = load_state()
-    tz    = get_tz(state)
-    now   = datetime.now(tz=tz)
-
-    confirmed = []
-    skipped   = []
-
-    for med in state["meds"]:
-        if med.get("paused"):
-            skipped.append(f"{med['name']} (paused)")
-            continue
-        if med["schedule"]["frequency"] == "as_needed":
-            skipped.append(f"{med['name']} (as-needed — skip manually if taken)")
-            continue
-        if med["state"]["status"] == "confirmed":
-            skipped.append(f"{med['name']} (already confirmed)")
-            continue
-
-        med["state"]["status"]     = "confirmed"
-        med["state"]["last_taken"] = now.isoformat()
-
-        nd = compute_next_due(med, now, tz)
-        med["state"]["next_due"] = nd.isoformat() if nd else None
-
-        append_history(med, "taken", dose_taken=dose_taken or None)
-        confirmed.append(med["name"])
-        log.info("CONFIRM-ALL [%s] taken=%s next_due=%s",
-                 med["id"], now.isoformat(), med["state"]["next_due"])
-
-    if confirmed:
-        save_state(state, dry_run)
-
-    if confirmed:
-        print(f"Confirmed: {', '.join(confirmed)}.")
-    if skipped:
-        print(f"Skipped: {', '.join(skipped)}.")
-
-
-def handle_defer(med_id: str, dry_run: bool) -> None:
-    """
-    Defer a med to the next digest cycle. Called by the AI for 'skip' replies.
-
-    Sets status → 'deferred'. Dispatch skips this med until reset-deferred
-    fires at midnight (or digest fires, whichever comes first).
-    """
-    state = load_state()
-    med   = find_med(state, med_id)
-
-    if med.get("paused"):
-        log.info("SKIP [defer] %s — already paused", med_id)
-        print(f"Note: {med['name']} is already paused.")
-        return
-
-    med["state"]["status"] = "deferred"
-    append_history(med, "deferred")
-
-    save_state(state, dry_run)
-    log.info("DEFER [%s]", med_id)
-    print(f"Deferred: {med['name']} — skipped until next cycle.")
-
-
 def handle_reset_deferred(dry_run: bool) -> None:
     """
     Midnight reset: all deferred meds → pending.
@@ -587,18 +493,7 @@ def main() -> None:
 
     sub.add_parser("digest",         help="Send daily med summary, reset deferred")
     sub.add_parser("reset-deferred", help="Midnight: reset deferred meds to pending")
-
-    p_confirm = sub.add_parser("confirm", help="Mark a med as taken (AI reply handler)")
-    p_confirm_grp = p_confirm.add_mutually_exclusive_group(required=True)
-    p_confirm_grp.add_argument("med_id", nargs="?", default=None,
-                               help="Med ID to confirm, e.g. med-001")
-    p_confirm_grp.add_argument("--all", dest="confirm_all", action="store_true",
-                               help="Confirm all pending/reminded/late meds at once")
-    p_confirm.add_argument("--dose-taken", default="",
-                           help="Actual dose if different from prescribed, e.g. '250mg'")
-
-    p_defer = sub.add_parser("defer", help="Defer a med until next cycle (AI reply handler)")
-    p_defer.add_argument("med_id", help="Med ID to defer, e.g. med-001")
+    # confirm / defer live in reply.py — use: python3 reply.py confirm <med-id>
 
     args = parser.parse_args()
     setup_logging(args.dry_run)
@@ -616,15 +511,6 @@ def main() -> None:
         handle_digest(dr)
     elif mode == "reset-deferred":
         handle_reset_deferred(dr)
-    elif mode == "confirm":
-        if args.confirm_all:
-            handle_confirm_all(args.dose_taken or None, dr)
-        else:
-            if not args.med_id:
-                parser.error("confirm requires a med_id or --all")
-            handle_confirm(args.med_id, args.dose_taken or None, dr)
-    elif mode == "defer":
-        handle_defer(args.med_id, dr)
 
 
 if __name__ == "__main__":

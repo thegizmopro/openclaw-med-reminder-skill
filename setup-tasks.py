@@ -48,7 +48,7 @@ if sys.version_info < (3, 9):
 SCRIPT_DIR    = Path(__file__).parent.resolve()
 STATE_FILE    = Path(os.environ.get("MEDS_STATE_FILE", SCRIPT_DIR / "meds-state.json"))
 DISPATCH_FILE = SCRIPT_DIR / "dispatch.py"
-SAFE_WRITE    = SCRIPT_DIR / "safe-write.sh"
+# safe-write.sh kept for users who prefer it; dispatch.py uses safe_write.py directly
 REGISTRY_FILE = SCRIPT_DIR / ".registered-tasks.json"
 
 TASK_FOLDER   = "MedReminder"   # Windows Task Scheduler subfolder
