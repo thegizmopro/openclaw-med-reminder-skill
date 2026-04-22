@@ -96,8 +96,8 @@ def validate(state: dict) -> None:
     if not isinstance(g["paused"], bool):
         _die("global.paused must be a boolean")
 
-    if g["delivery_channel"] not in ("whatsapp",):
-        _die(f"global.delivery_channel '{g['delivery_channel']}' is not a supported channel")
+    if not isinstance(g["delivery_channel"], str) or not g["delivery_channel"].strip():
+        _die("global.delivery_channel must be a non-empty string (e.g. 'whatsapp', 'telegram', 'sms')")
 
     for field in ("start", "end"):
         if field not in g["quiet_hours"]:

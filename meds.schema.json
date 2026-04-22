@@ -49,8 +49,8 @@
         },
         "delivery_channel": {
           "type": "string",
-          "enum": ["whatsapp"],
-          "description": "Messaging channel for outbound reminders. Swappable in future versions."
+          "minLength": 1,
+          "description": "Messaging channel for outbound reminders, e.g. 'whatsapp', 'telegram', 'sms'. Wire up send-message.sh for your channel."
         }
       }
     },

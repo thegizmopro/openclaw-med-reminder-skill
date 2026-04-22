@@ -128,8 +128,8 @@ for field in ["timezone", "quiet_hours", "paused", "digest_time", "delivery_chan
 if not isinstance(g["paused"], bool):
     die("global.paused must be a boolean")
 
-if g["delivery_channel"] not in ["whatsapp"]:
-    die(f"global.delivery_channel '{g['delivery_channel']}' is not a supported channel")
+if not isinstance(g["delivery_channel"], str) or not g["delivery_channel"].strip():
+    die("global.delivery_channel must be a non-empty string (e.g. 'whatsapp', 'telegram', 'sms')")
 
 hhmm = re.compile(r"^([01][0-9]|2[0-3]):[0-5][0-9]$")
 
