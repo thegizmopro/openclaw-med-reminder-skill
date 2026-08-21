@@ -4,9 +4,7 @@ and fired DAILY because day-of-week wasn't in the schema.
 
 Fixture date 2026-04-21 is a Tuesday; Monday is 2026-04-20.
 """
-import importlib.util
 from datetime import timedelta
-from pathlib import Path
 from unittest.mock import patch
 
 from dispatch import (
@@ -17,13 +15,9 @@ from dispatch import (
     most_recent_weekly_time,
     skip_if_needed,
 )
-from tests.conftest import make_state, make_med, local_dt, iso, fake_now, TZ
+from tests.conftest import make_state, make_med, local_dt, iso, fake_now, load_setup_tasks, TZ
 
-# setup-tasks.py has a hyphenated filename — import by path
-_spec = importlib.util.spec_from_file_location(
-    "setup_tasks", Path(__file__).parent.parent / "setup-tasks.py")
-setup_tasks = importlib.util.module_from_spec(_spec)
-_spec.loader.exec_module(setup_tasks)
+setup_tasks = load_setup_tasks()
 build_tasks, hhmm_to_cron = setup_tasks.build_tasks, setup_tasks.hhmm_to_cron
 
 def monday(hour=9, minute=0):

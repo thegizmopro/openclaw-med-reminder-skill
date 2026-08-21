@@ -431,6 +431,9 @@ def handle_miss(med_id: str, dose_index: int, dry_run: bool) -> None:
     """
     MISSED at dose_time + missed_threshold. Log as missed, advance next_due.
     Advisory: exits silently if confirmed.
+    The missed log is always written; the outbound message is suppressed
+    during quiet hours (no 3am pings) — unlike fire/check, skipping the whole
+    event would lose the log and leave next_due stale.
     """
     state = load_state()
     tz    = get_tz(state)
@@ -441,7 +444,10 @@ def handle_miss(med_id: str, dose_index: int, dry_run: bool) -> None:
     if skip_if_needed(state, med, dose_time, "miss", tz, now):
         return
 
-    send_message(expand(med["escalation"]["missed_message"], med), dry_run)
+    if in_quiet_hours(now, state["global"]["quiet_hours"], tz):
+        log.info("MISS [%s] — quiet hours: logging without message", med_id)
+    else:
+        send_message(expand(med["escalation"]["missed_message"], med), dry_run)
 
     med["state"]["status"]       = "missed"
     med["state"]["missed_count"] += 1

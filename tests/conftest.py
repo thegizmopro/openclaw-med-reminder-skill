@@ -102,3 +102,13 @@ def fake_now(fixed):
         def now(cls, tz=None):
             return fixed
     return FakeDateTime
+
+
+def load_setup_tasks():
+    """Import setup-tasks.py (hyphenated filename) by path."""
+    import importlib.util
+    spec = importlib.util.spec_from_file_location(
+        "setup_tasks", Path(__file__).parent.parent / "setup-tasks.py")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod

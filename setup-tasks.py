@@ -102,6 +102,16 @@ def hhmm_to_cron(hhmm: str, day_of_week: Optional[str] = None) -> str:
     dow = str(_CRON_DAY[day_of_week]) if day_of_week else "*"
     return f"{m} {h} * * {dow}"
 
+def in_quiet_window(hhmm: str, quiet: dict) -> bool:
+    """True if HH:MM falls inside the quiet window (handles midnight-spanning)."""
+    def mins(s: str) -> int:
+        h, m = map(int, s.split(":"))
+        return h * 60 + m
+    t, start, end = mins(hhmm), mins(quiet["start"]), mins(quiet["end"])
+    if start <= end:
+        return start <= t < end
+    return t >= start or t < end
+
 # ── Registry (tracks registered task names for cleanup) ───────────────────────
 
 def load_registry() -> list:
@@ -164,6 +174,12 @@ def build_tasks(state: dict) -> list:
             continue
 
         # Time-of-day meds (once_daily, twice_daily, weekly)
+        if freq not in ("interval", "as_needed"):
+            for t in sched["times"]:
+                if in_quiet_window(t, g["quiet_hours"]):
+                    print(f"  WARNING: {mid} ({name}) dose at {t} is inside quiet hours "
+                          f"({g['quiet_hours']['start']}-{g['quiet_hours']['end']}) — it will "
+                          "never send a reminder. Move the dose time or adjust quiet hours.")
         weekly_day = None
         if freq == "weekly":
             weekly_day = sched.get("day_of_week")
