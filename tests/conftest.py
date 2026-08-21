@@ -44,8 +44,10 @@ def make_med(
     last_taken=None,
     last_reminded=None,
     next_due=None,
+    confirmed_dose=None,
     missed_count=0,
     history=None,
+    include_confirmed_dose=True,
 ):
     sched = {"frequency": frequency, "with_food": with_food, "notes": notes}
     if frequency == "interval":
@@ -74,6 +76,8 @@ def make_med(
             "next_due": next_due,
             "missed_count": missed_count,
             "history": history if history is not None else [],
+            # include_confirmed_dose=False builds a legacy state block (pre-per-dose files)
+            **({"confirmed_dose": confirmed_dose} if include_confirmed_dose else {}),
         },
     }
 
@@ -86,3 +90,12 @@ def local_dt(hour, minute=0, second=0, tz=TZ,
 
 def iso(dt):
     return dt.isoformat()
+
+
+def fake_now(fixed):
+    """A datetime stand-in whose .now() always returns `fixed` (tz-aware)."""
+    class FakeDateTime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return fixed
+    return FakeDateTime

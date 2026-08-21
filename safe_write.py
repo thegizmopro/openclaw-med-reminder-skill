@@ -188,6 +188,11 @@ def validate(state: dict) -> None:
             if val is not None and not _ISO.match(str(val)):
                 _die(f"{p}.state.{field} must be ISO 8601 with timezone or null")
 
+        # Optional per-dose confirmation anchor (absent in older state files)
+        cd = mstate.get("confirmed_dose")
+        if cd is not None and not _ISO.match(str(cd)):
+            _die(f"{p}.state.confirmed_dose must be ISO 8601 with timezone or null")
+
         for j, entry in enumerate(mstate["history"]):
             ep = f"{p}.state.history[{j}]"
             for field in ("timestamp", "event", "dose_prescribed"):

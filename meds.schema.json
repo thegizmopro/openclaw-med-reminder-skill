@@ -194,6 +194,11 @@
           "$ref": "#/definitions/isoDatetime",
           "description": "ISO 8601 timestamp of next scheduled dose. Set by setup-tasks.py on registration. Recomputed after each confirmation via compute_next_due()."
         },
+        "confirmed_dose": {
+          "type": ["string", "null"],
+          "$ref": "#/definitions/isoDatetime",
+          "description": "Scheduled dose occurrence credited by the last confirm. A scheduled event is skipped only when it matches this occurrence, so an early confirm and a same-day second dose are never conflated. Null for interval/as-needed meds; absent in older state files."
+        },
         "missed_count": {
           "type": "integer",
           "minimum": 0,

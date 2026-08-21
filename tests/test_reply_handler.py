@@ -7,7 +7,7 @@ from unittest.mock import patch
 import pytest
 
 from reply import handle_confirm, handle_confirm_all, handle_defer
-from tests.conftest import make_state, make_med, iso, local_dt, TZ
+from tests.conftest import make_state, make_med, iso, local_dt, fake_now, TZ
 
 
 def run_confirm(state, med_id, dose_taken=None):
@@ -130,19 +130,31 @@ def test_confirm_all_skips_paused():
 
 
 def test_confirm_all_skips_already_confirmed():
-    m1 = make_med(med_id="med-001", name="Metformin",  status="confirmed")
+    # Skipped only when the confirm would re-credit the same occurrence —
+    # at 08:30 the covered occurrence for an 08:00 med is 08:00.
+    m1 = make_med(med_id="med-001", name="Metformin",  status="confirmed",
+                  confirmed_dose=iso(local_dt(8, 0)))
     m2 = make_med(med_id="med-002", name="Lisinopril", status="late")
     state = make_state(meds=[m1, m2])
-    saved = run_confirm_all(state)
+    saved = []
+    with patch("reply.datetime", fake_now(local_dt(8, 30))), \
+         patch("reply.load_state", return_value=state), \
+         patch("reply.save_state", side_effect=lambda s, dr: saved.append(s)):
+        handle_confirm_all(None, dry_run=False)
     result = saved[-1]["meds"]
     assert result[0]["state"]["status"] == "confirmed"  # was already confirmed, unchanged
     assert result[1]["state"]["status"] == "confirmed"  # newly confirmed
 
 
 def test_confirm_all_no_save_when_nothing_to_confirm():
-    m1 = make_med(med_id="med-001", status="confirmed")
+    m1 = make_med(med_id="med-001", status="confirmed",
+                  confirmed_dose=iso(local_dt(8, 0)))
     state = make_state(meds=[m1])
-    saved = run_confirm_all(state)
+    saved = []
+    with patch("reply.datetime", fake_now(local_dt(8, 30))), \
+         patch("reply.load_state", return_value=state), \
+         patch("reply.save_state", side_effect=lambda s, dr: saved.append(s)):
+        handle_confirm_all(None, dry_run=False)
     assert len(saved) == 0
 
 

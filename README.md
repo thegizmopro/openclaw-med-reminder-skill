@@ -202,7 +202,7 @@ pip install pytest tzdata   # one-time
 pytest tests/ -v
 ```
 
-57 tests covering escalation resolver, next-due calculation, history trimming, digest logic, safe-write atomicity, and passport generation.
+91 tests covering escalation resolver, next-due calculation, per-dose confirmation, history trimming, digest logic, safe-write atomicity, and passport generation.
 
 ---
 

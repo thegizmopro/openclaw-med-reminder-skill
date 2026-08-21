@@ -38,6 +38,7 @@ sys.path.insert(0, str(SCRIPT_DIR))
 from dispatch import (
     append_history,
     compute_next_due,
+    covered_dose_occurrence,
     find_med,
     get_tz,
     load_state,
@@ -76,15 +77,27 @@ def handle_confirm(med_id: str, dose_taken: Optional[str], dry_run: bool) -> Non
         print(f"Skipped: {med['name']} is paused.")
         return
 
-    if med["state"]["status"] == "confirmed":
-        log.info("SKIP [confirm] %s — already confirmed", med_id)
-        print(f"Already confirmed: {med['name']} (taken at {med['state'].get('last_taken', 'unknown')}).")
+    # Per-dose idempotency: only refuse when the last confirm already credited
+    # the occurrence this confirm would cover. A bare 'confirmed' status is not
+    # enough — for a twice-daily med the evening dose is still loggable after
+    # the morning one (e.g. when the scheduled fire never ran).
+    covered = covered_dose_occurrence(med, now, tz)
+    prev    = med["state"].get("confirmed_dose")
+    if (med["state"]["status"] == "confirmed"
+            and covered is not None and prev
+            and datetime.fromisoformat(prev) == covered):
+        log.info("SKIP [confirm] %s — this dose already confirmed", med_id)
+        print(f"Already confirmed: {med['name']} (dose at {prev}).")
         return
 
     med["state"]["status"]     = "confirmed"
     med["state"]["last_taken"] = now.isoformat()
+    if covered is not None:
+        med["state"]["confirmed_dose"] = covered.isoformat()
 
-    nd = compute_next_due(med, now, tz)
+    # Anchor next_due to the credited occurrence so an early confirm does not
+    # point next_due at the dose it just covered.
+    nd = compute_next_due(med, covered or now, tz)
     med["state"]["next_due"] = nd.isoformat() if nd else None
 
     append_history(med, "taken", dose_taken=dose_taken or None)
@@ -112,14 +125,20 @@ def handle_confirm_all(dose_taken: Optional[str], dry_run: bool) -> None:
         if med["schedule"]["frequency"] == "as_needed":
             skipped.append(f"{med['name']} (as-needed — confirm individually if taken)")
             continue
-        if med["state"]["status"] == "confirmed":
+        covered = covered_dose_occurrence(med, now, tz)
+        prev    = med["state"].get("confirmed_dose")
+        if (med["state"]["status"] == "confirmed"
+                and covered is not None and prev
+                and datetime.fromisoformat(prev) == covered):
             skipped.append(f"{med['name']} (already confirmed)")
             continue
 
         med["state"]["status"]     = "confirmed"
         med["state"]["last_taken"] = now.isoformat()
+        if covered is not None:
+            med["state"]["confirmed_dose"] = covered.isoformat()
 
-        nd = compute_next_due(med, now, tz)
+        nd = compute_next_due(med, covered or now, tz)
         med["state"]["next_due"] = nd.isoformat() if nd else None
 
         append_history(med, "taken", dose_taken=dose_taken or None)

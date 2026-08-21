@@ -36,6 +36,7 @@
         "last_taken": null,
         "last_reminded": null,
         "next_due": null,
+        "confirmed_dose": null,
         "missed_count": 0,
         "history": []
       }

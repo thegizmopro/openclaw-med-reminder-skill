@@ -48,6 +48,10 @@ LOG_FILE    = Path(os.environ.get("MEDS_LOG_FILE",   SCRIPT_DIR / "dispatch.log"
 SEND_CMD    = os.environ.get("MEDS_SEND_CMD", "")
 HISTORY_MAX = 30
 
+# A confirm taken now credits the upcoming dose if it is due within this window
+# (e.g. 'all taken' replied to the morning digest just before the first dose).
+EARLY_CONFIRM_WINDOW = timedelta(hours=6)
+
 sys.path.insert(0, str(SCRIPT_DIR))
 from safe_write import safe_write as _safe_write_fn
 
@@ -157,6 +161,36 @@ def most_recent_dose_time(times: list, dose_index: int, tz: ZoneInfo, now: datet
         t -= timedelta(days=1)
     return t
 
+def covered_dose_occurrence(med: dict, now: datetime, tz: ZoneInfo) -> Optional[datetime]:
+    """
+    The scheduled dose occurrence a confirm taken at `now` credits (per-dose
+    bookkeeping). Compare against state.confirmed_dose to tell whether a given
+    scheduled event was already confirmed.
+
+    Credits the next upcoming occurrence when it is due within
+    EARLY_CONFIRM_WINDOW and is nearer than the most recent past occurrence;
+    otherwise credits the most recent past occurrence (a late or out-of-cycle
+    dose). Returns None for interval and as_needed meds — no per-dose tracking.
+    """
+    sched = med["schedule"]
+    freq  = sched["frequency"]
+    if freq in ("as_needed", "interval"):
+        return None
+    period = timedelta(days=7 if freq == "weekly" else 1)
+    pasts, futures = [], []
+    for t in sched["times"]:
+        p = parse_hhmm(t, tz, now)
+        if p > now:
+            p -= period
+        pasts.append(p)
+        futures.append(p + period)
+    nearest_past  = max(pasts)   # most recent scheduled occurrence
+    next_future   = min(futures) # soonest upcoming scheduled occurrence
+    until_future  = next_future - now
+    if until_future <= EARLY_CONFIRM_WINDOW and until_future < (now - nearest_past):
+        return next_future
+    return nearest_past
+
 def in_quiet_hours(now: datetime, quiet: dict, tz: ZoneInfo) -> bool:
     """True if now is inside the quiet window. Handles midnight-spanning windows."""
     start = parse_hhmm(quiet["start"], tz, now)
@@ -253,7 +287,19 @@ def append_history(
 # ── Advisory skip logic ───────────────────────────────────────────────────────
 
 def already_confirmed(med: dict, dose_time: datetime) -> bool:
-    """True if last_taken >= dose_time (user already confirmed this dose)."""
+    """
+    True if the dose occurrence at dose_time was confirmed (per-dose check).
+
+    Primary: state.confirmed_dose holds the scheduled occurrence credited by
+    the last confirm — the dose is confirmed only on an exact match. This keeps
+    an early confirm ('all taken' before the dose fires) and a same-day second
+    dose from being conflated.
+    Legacy fallback for state files written before confirmed_dose existed:
+    last_taken >= dose_time.
+    """
+    cd = med["state"].get("confirmed_dose")
+    if cd:
+        return datetime.fromisoformat(cd) == dose_time
     last = med["state"].get("last_taken")
     if not last:
         return False
@@ -271,7 +317,7 @@ def skip_if_needed(state: dict, med: dict, dose_time: datetime, mode: str) -> bo
         log.info("SKIP [%s] %s — med deferred until next digest", mode, med["id"])
         return True
     if already_confirmed(med, dose_time):
-        log.info("SKIP [%s] %s — already confirmed (last_taken >= dose_time)", mode, med["id"])
+        log.info("SKIP [%s] %s — already confirmed (dose occurrence credited)", mode, med["id"])
         return True
     return False
 

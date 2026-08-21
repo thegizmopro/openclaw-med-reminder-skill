@@ -443,8 +443,8 @@ function validate(s) {
       e.push(`${p}.state.missed_count must be non-negative integer`);
     if (!Array.isArray(st.history))  e.push(`${p}.state.history must be an array`);
     if ((st.history||[]).length > 30) e.push(`${p}.state.history has ${st.history.length} entries (max 30)`);
-    [st.last_taken, st.last_reminded, st.next_due].forEach((v, j) => {
-      const fn = ['last_taken','last_reminded','next_due'][j];
+    [st.last_taken, st.last_reminded, st.next_due, st.confirmed_dose].forEach((v, j) => {
+      const fn = ['last_taken','last_reminded','next_due','confirmed_dose'][j];
       if (v !== null && v !== undefined && !ISO_DT.test(v))
         e.push(`${p}.state.${fn} must be ISO 8601 with timezone or null`);
     });
@@ -821,7 +821,7 @@ function saveMed() {
       escalation: { late_threshold_minutes: late, missed_threshold_minutes: miss,
                     late_message: lateMsg, missed_message: missMsg },
       state: { status: 'pending', last_taken: null, last_reminded: null,
-               next_due: null, missed_count: 0, history: [] }
+               next_due: null, confirmed_dose: null, missed_count: 0, history: [] }
     });
   }
 
