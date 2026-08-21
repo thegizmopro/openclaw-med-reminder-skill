@@ -66,6 +66,7 @@ _VALID_TYPES    = {"pill","liquid","injection","patch","inhaler","other"}
 _VALID_FREQS    = {"once_daily","twice_daily","interval","weekly","as_needed"}
 _VALID_STATUSES = {"pending","reminded","confirmed","late","missed","deferred"}
 _VALID_EVENTS   = {"taken","missed","late_nudge_sent","deferred"}
+_VALID_DAYS     = {"mon","tue","wed","thu","fri","sat","sun"}
 _MED_ID         = re.compile(r"^med-[0-9]{3,}$")
 
 
@@ -153,6 +154,14 @@ def validate(state: dict) -> None:
             for t in times:
                 if not _HHMM.match(str(t)):
                     _die(f"{p}.schedule.times contains invalid time '{t}' (expected HH:MM)")
+
+        # Optional: day-of-week for weekly meds (absent in older state files)
+        day = sched.get("day_of_week")
+        if day is not None and day not in _VALID_DAYS:
+            _die(f"{p}.schedule.day_of_week must be one of {sorted(_VALID_DAYS)} (or null)")
+        if freq == "weekly" and day is None:
+            _die(f"{p}.schedule.day_of_week is required for weekly meds "
+                 "(e.g. 'mon') — without it reminders fire daily")
 
         esc = med["escalation"]
         for field in ("late_threshold_minutes","missed_threshold_minutes","late_message","missed_message"):

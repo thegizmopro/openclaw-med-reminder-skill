@@ -22,6 +22,7 @@
         "frequency": "twice_daily",
         "times": ["08:00", "20:00"],
         "interval_hours": null,
+        "day_of_week": null,
         "with_food": false,
         "notes": ""
       },

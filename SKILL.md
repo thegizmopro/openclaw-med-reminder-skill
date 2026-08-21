@@ -93,8 +93,10 @@ Infer from context:
 | weekly / once a week | `weekly` | ask what time on what day* |
 | as needed / PRN | `as_needed` | no times |
 
-*Weekly: store the dose time in `times[0]`. The day-of-week is not in the schema v1 —
-just note it in `schedule.notes` (e.g. `"Every Monday"`).
+*Weekly: store the dose time in `times[0]` and the day in `schedule.day_of_week`
+(`"mon"`, `"tue"`, `"wed"`, `"thu"`, `"fri"`, `"sat"`, `"sun"`). Required — without
+it reminders fire every day. `schedule.notes` stays free-text ("Every Monday at
+breakfast" is fine, but the machine-readable day lives in `day_of_week`).
 
 ### schedule.times — asking for times
 Only ask for times if `frequency` is `once_daily`, `twice_daily`, or `weekly`.

@@ -36,6 +36,7 @@ def make_med(
     frequency="once_daily",
     times=None,
     interval_hours=None,
+    day_of_week=None,
     with_food=False,
     notes="",
     late_threshold=30,
@@ -54,6 +55,8 @@ def make_med(
         sched["interval_hours"] = interval_hours
     elif frequency != "as_needed":
         sched["times"] = times if times is not None else ["08:00"]
+        if frequency == "weekly" and day_of_week is not None:
+            sched["day_of_week"] = day_of_week
 
     return {
         "id": med_id,

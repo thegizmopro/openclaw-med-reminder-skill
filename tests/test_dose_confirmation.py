@@ -115,7 +115,7 @@ def test_fire_check_miss_all_skip_after_early_confirm():
         dose_time = most_recent_dose_time(["08:00", "20:00"], 0, TZ, now)
         assert dose_time == local_dt(8, 0)
         assert already_confirmed(med, dose_time), f"{mode} must see the dose as confirmed"
-        assert skip_if_needed(state, med, dose_time, mode) is True, f"{mode} must skip"
+        assert skip_if_needed(state, med, dose_time, mode, TZ, now) is True, f"{mode} must skip"
 
 
 def test_handle_fire_after_early_confirm_sends_nothing_and_writes_nothing():

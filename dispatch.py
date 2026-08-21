@@ -161,6 +161,18 @@ def most_recent_dose_time(times: list, dose_index: int, tz: ZoneInfo, now: datet
         t -= timedelta(days=1)
     return t
 
+# Day-of-week keys for weekly meds, in Python weekday() order (mon=0)
+DAY_KEYS = ("mon", "tue", "wed", "thu", "fri", "sat", "sun")
+
+def most_recent_weekly_time(day: str, hhmm: str, tz: ZoneInfo, now: datetime) -> datetime:
+    """Most recent past occurrence of (day-of-week, HH:MM) relative to now."""
+    target = DAY_KEYS.index(day)
+    t = parse_hhmm(hhmm, tz, now)
+    t -= timedelta(days=(t.weekday() - target) % 7)
+    if t > now:
+        t -= timedelta(days=7)
+    return t
+
 def covered_dose_occurrence(med: dict, now: datetime, tz: ZoneInfo) -> Optional[datetime]:
     """
     The scheduled dose occurrence a confirm taken at `now` credits (per-dose
@@ -177,11 +189,15 @@ def covered_dose_occurrence(med: dict, now: datetime, tz: ZoneInfo) -> Optional[
     if freq in ("as_needed", "interval"):
         return None
     period = timedelta(days=7 if freq == "weekly" else 1)
+    day = sched.get("day_of_week") if freq == "weekly" else None
     pasts, futures = [], []
     for t in sched["times"]:
-        p = parse_hhmm(t, tz, now)
-        if p > now:
-            p -= period
+        if day:
+            p = most_recent_weekly_time(day, t, tz, now)
+        else:
+            p = parse_hhmm(t, tz, now)
+            if p > now:
+                p -= period
         pasts.append(p)
         futures.append(p + period)
     nearest_past  = max(pasts)   # most recent scheduled occurrence
@@ -244,7 +260,11 @@ def compute_next_due(med: dict, after: datetime, tz: ZoneInfo) -> Optional[datet
         candidates.append(candidate)
 
     if freq == "weekly":
-        # Advance soonest candidate until it's at least 6 days out
+        day = sched.get("day_of_week")
+        if day:
+            # Next occurrence of (day, times[0]) — most recent one + 7 days
+            return most_recent_weekly_time(day, times[0], tz, after) + timedelta(days=7)
+        # Legacy weekly without day_of_week: advance soonest candidate ~a week out
         base = min(candidates)
         while (base - after) < timedelta(days=6):
             base += timedelta(days=7)
@@ -305,7 +325,8 @@ def already_confirmed(med: dict, dose_time: datetime) -> bool:
         return False
     return datetime.fromisoformat(last) >= dose_time
 
-def skip_if_needed(state: dict, med: dict, dose_time: datetime, mode: str) -> bool:
+def skip_if_needed(state: dict, med: dict, dose_time: datetime, mode: str,
+                   tz: ZoneInfo, now: datetime) -> bool:
     """Return True and log reason if this event should be skipped."""
     if state["global"]["paused"]:
         log.info("SKIP [%s] %s — global pause active", mode, med["id"])
@@ -315,6 +336,11 @@ def skip_if_needed(state: dict, med: dict, dose_time: datetime, mode: str) -> bo
         return True
     if med["state"]["status"] == "deferred":
         log.info("SKIP [%s] %s — med deferred until next digest", mode, med["id"])
+        return True
+    sched = med["schedule"]
+    if (sched["frequency"] == "weekly" and sched.get("day_of_week")
+            and DAY_KEYS.index(sched["day_of_week"]) != now.astimezone(tz).weekday()):
+        log.info("SKIP [%s] %s — weekly dose day is %s, not today", mode, med["id"], sched["day_of_week"])
         return True
     if already_confirmed(med, dose_time):
         log.info("SKIP [%s] %s — already confirmed (dose occurrence credited)", mode, med["id"])
@@ -332,10 +358,13 @@ def find_med(state: dict, med_id: str) -> dict:
 
 def dose_time_for(med: dict, dose_index: int, tz: ZoneInfo, now: datetime) -> datetime:
     """Reference dose time for advisory checks. Interval meds use next_due."""
-    if med["schedule"]["frequency"] == "interval":
+    sched = med["schedule"]
+    if sched["frequency"] == "interval":
         nd = med["state"].get("next_due")
         return datetime.fromisoformat(nd) if nd else now
-    return most_recent_dose_time(med["schedule"]["times"], dose_index, tz, now)
+    if sched["frequency"] == "weekly" and sched.get("day_of_week"):
+        return most_recent_weekly_time(sched["day_of_week"], sched["times"][dose_index], tz, now)
+    return most_recent_dose_time(sched["times"], dose_index, tz, now)
 
 # ── Mode handlers ─────────────────────────────────────────────────────────────
 
@@ -354,7 +383,7 @@ def handle_fire(med_id: str, dose_index: int, dry_run: bool) -> None:
         log.info("SKIP [fire] %s — quiet hours", med_id)
         return
 
-    if skip_if_needed(state, med, dose_time, "fire"):
+    if skip_if_needed(state, med, dose_time, "fire", tz, now):
         return
 
     msg = f"Reminder: {med['name']} {med['dose']}{med['unit']}"
@@ -386,7 +415,7 @@ def handle_check(med_id: str, dose_index: int, dry_run: bool) -> None:
         log.info("SKIP [check] %s — quiet hours", med_id)
         return
 
-    if skip_if_needed(state, med, dose_time, "check"):
+    if skip_if_needed(state, med, dose_time, "check", tz, now):
         return
 
     send_message(expand(med["escalation"]["late_message"], med), dry_run)
@@ -409,7 +438,7 @@ def handle_miss(med_id: str, dose_index: int, dry_run: bool) -> None:
     med   = find_med(state, med_id)
     dose_time = dose_time_for(med, dose_index, tz, now)
 
-    if skip_if_needed(state, med, dose_time, "miss"):
+    if skip_if_needed(state, med, dose_time, "miss", tz, now):
         return
 
     send_message(expand(med["escalation"]["missed_message"], med), dry_run)
@@ -475,7 +504,9 @@ def handle_digest(dry_run: bool) -> None:
         elif freq == "as_needed":
             time_str = "as needed"
         else:
-            time_str = ", ".join(fmt_12h(t) for t in sched["times"])
+            day = sched.get("day_of_week") if freq == "weekly" else None
+            prefix = f"{day.title()} " if day else ""
+            time_str = prefix + ", ".join(fmt_12h(t) for t in sched["times"])
 
         food = " (with food)" if sched.get("with_food") else ""
         lines.append(f"{i}. {med['name']} {med['dose']}{med['unit']} | {time_str}{food}")

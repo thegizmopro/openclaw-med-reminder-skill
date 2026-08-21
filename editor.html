@@ -290,6 +290,21 @@ section h2 { font-size: 14px; font-weight: 600; letter-spacing: .03em;
                 onclick="addTimeRow()">+ Add time</button>
       </div>
     </div>
+    <div id="f-day-section" style="display:none">
+      <div class="field">
+        <label>Day of Week *</label>
+        <select id="f-day">
+          <option value="mon">Monday</option>
+          <option value="tue">Tuesday</option>
+          <option value="wed">Wednesday</option>
+          <option value="thu">Thursday</option>
+          <option value="fri">Friday</option>
+          <option value="sat">Saturday</option>
+          <option value="sun">Sunday</option>
+        </select>
+        <div class="hint">Weekly meds remind only on this day</div>
+      </div>
+    </div>
     <div id="f-interval-section" style="display:none">
       <div class="field">
         <label>Interval (hours) *</label>
@@ -414,6 +429,11 @@ function validate(s) {
     const sc = m.schedule || {};
     const FREQS = ['once_daily','twice_daily','interval','weekly','as_needed'];
     if (!FREQS.includes(sc.frequency)) e.push(`${p}.schedule.frequency must be one of ${FREQS.join(', ')}`);
+    const DAYS = ['mon','tue','wed','thu','fri','sat','sun'];
+    if (sc.day_of_week != null && !DAYS.includes(sc.day_of_week))
+      e.push(`${p}.schedule.day_of_week must be one of ${DAYS.join(', ')}`);
+    if (sc.frequency === 'weekly' && !sc.day_of_week)
+      e.push(`${p}.schedule.day_of_week is required for weekly meds (e.g. 'mon') — without it reminders fire daily`);
     if (sc.frequency === 'interval') {
       if (!Number.isInteger(sc.interval_hours) || sc.interval_hours < 1 || sc.interval_hours > 168)
         e.push(`${p}.schedule.interval_hours must be integer 1-168`);
@@ -615,7 +635,11 @@ function fmtSchedule(med) {
     const suf = h < 12 ? 'am' : 'pm';
     return `${h%12||12}:${String(m).padStart(2,'0')}${suf}`;
   });
-  const freq = { once_daily:'daily', twice_daily:'twice daily', weekly:'weekly' }[s.frequency] || s.frequency;
+  if (s.frequency === 'weekly') {
+    const day = s.day_of_week ? `${s.day_of_week[0].toUpperCase()+s.day_of_week.slice(1)}s ` : '';
+    return `${day}${ts.join(', ')}`;
+  }
+  const freq = { once_daily:'daily', twice_daily:'twice daily' }[s.frequency] || s.frequency;
   return `${freq} at ${ts.join(', ')}`;
 }
 
@@ -672,6 +696,7 @@ function openEditMed(id) {
 
   const s = med.schedule;
   document.getElementById('f-freq').value  = s.frequency;
+  document.getElementById('f-day').value   = s.day_of_week || 'mon';
   if (s.frequency === 'interval') {
     document.getElementById('f-interval').value = s.interval_hours || '';
   } else {
@@ -728,6 +753,7 @@ function clearMedForm() {
   });
   document.getElementById('f-type').value    = 'pill';
   document.getElementById('f-freq').value    = 'once_daily';
+  document.getElementById('f-day').value     = 'mon';
   document.getElementById('f-paused').checked = false;
   document.getElementById('f-food').checked   = false;
   document.getElementById('f-times-list').innerHTML = '';
@@ -738,6 +764,7 @@ function onFreqChange() {
   const isInterval  = freq === 'interval';
   const isAsNeeded  = freq === 'as_needed';
   document.getElementById('f-times-section').style.display    = (isInterval || isAsNeeded) ? 'none' : '';
+  document.getElementById('f-day-section').style.display      = freq === 'weekly' ? '' : 'none';
   document.getElementById('f-interval-section').style.display = isInterval ? '' : 'none';
 }
 
@@ -796,11 +823,14 @@ function saveMed() {
   const schedule = { frequency: freq };
   if (freq === 'interval') {
     schedule.interval_hours = parseInt(document.getElementById('f-interval').value, 10);
+    schedule.day_of_week = null;
   } else if (freq !== 'as_needed') {
     schedule.interval_hours = null;
     schedule.times = collectTimes();
+    schedule.day_of_week = freq === 'weekly' ? document.getElementById('f-day').value : null;
   } else {
     schedule.interval_hours = null;
+    schedule.day_of_week = null;
   }
   schedule.with_food = food;
   if (notes) schedule.notes = notes;

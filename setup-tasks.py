@@ -54,6 +54,12 @@ REGISTRY_FILE = SCRIPT_DIR / ".registered-tasks.json"
 TASK_FOLDER   = "MedReminder"   # Windows Task Scheduler subfolder
 CRON_MARKER   = "# MedReminder" # crontab section marker
 
+# Day-of-week keys → schtasks /d value, cron day (0=Sun..6=Sat)
+_WINDOWS_DAY = {"mon": "MON", "tue": "TUE", "wed": "WED", "thu": "THU",
+                "fri": "FRI", "sat": "SAT", "sun": "SUN"}
+_CRON_DAY    = {"mon": 1, "tue": 2, "wed": 3, "thu": 4,
+                "fri": 5, "sat": 6, "sun": 0}
+
 # ── Import dispatch helpers (same directory) ──────────────────────────────────
 
 sys.path.insert(0, str(SCRIPT_DIR))
@@ -71,6 +77,7 @@ class Task:
     args: list                       # dispatch.py subcommand + positional args
     hhmm: Optional[str]              # HH:MM for daily-at-time trigger; None for interval
     interval_min: Optional[int]      # repeating interval in minutes; None for daily
+    day_of_week: Optional[str] = None  # 'mon'..'sun' for weekly tasks; None for daily
 
     @property
     def full_name(self) -> str:
@@ -89,10 +96,11 @@ def hhmm_add(hhmm: str, minutes: int) -> str:
     total = (h * 60 + m + minutes) % (24 * 60)
     return f"{total // 60:02d}:{total % 60:02d}"
 
-def hhmm_to_cron(hhmm: str) -> str:
-    """'08:30' → '30 8' (cron minute + hour fields)."""
+def hhmm_to_cron(hhmm: str, day_of_week: Optional[str] = None) -> str:
+    """'08:30' → '30 8' + day-of-week field (default '*' for daily)."""
     h, m = map(int, hhmm.split(":"))
-    return f"{m} {h}"
+    dow = str(_CRON_DAY[day_of_week]) if day_of_week else "*"
+    return f"{m} {h} * * {dow}"
 
 # ── Registry (tracks registered task names for cleanup) ───────────────────────
 
@@ -156,29 +164,40 @@ def build_tasks(state: dict) -> list:
             continue
 
         # Time-of-day meds (once_daily, twice_daily, weekly)
+        weekly_day = None
+        if freq == "weekly":
+            weekly_day = sched.get("day_of_week")
+            if not weekly_day:
+                print(f"  WARNING: {mid} ({name}) is weekly without schedule.day_of_week — "
+                      "tasks would fire daily. Set day_of_week (e.g. 'mon') and re-save.")
+        day_label = f" {weekly_day.title()}" if weekly_day else ""
+
         for i, t in enumerate(sched["times"]):
             check_t = hhmm_add(t, late)
             miss_t  = hhmm_add(t, miss)
             tasks.append(Task(
                 name=f"fire_{mid}_{i}",
-                label=f"{name}: reminder at {t}",
+                label=f"{name}: reminder at {t}{day_label}",
                 args=["fire", mid, str(i)],
                 hhmm=t,
                 interval_min=None,
+                day_of_week=weekly_day,
             ))
             tasks.append(Task(
                 name=f"check_{mid}_{i}",
-                label=f"{name}: late check at {check_t} (+{late}m)",
+                label=f"{name}: late check at {check_t} (+{late}m){day_label}",
                 args=["check", mid, str(i)],
                 hhmm=check_t,
                 interval_min=None,
+                day_of_week=weekly_day,
             ))
             tasks.append(Task(
                 name=f"miss_{mid}_{i}",
-                label=f"{name}: missed check at {miss_t} (+{miss}m)",
+                label=f"{name}: missed check at {miss_t} (+{miss}m){day_label}",
                 args=["miss", mid, str(i)],
                 hhmm=miss_t,
                 interval_min=None,
+                day_of_week=weekly_day,
             ))
 
     return tasks
@@ -260,6 +279,9 @@ def register_windows(tasks: list, dry_run: bool) -> None:
         if task.interval_min is not None:
             # Repeating every N minutes
             extra = ["/sc", "MINUTE", "/mo", str(task.interval_min)]
+        elif task.day_of_week:
+            # Weekly on a specific day
+            extra = ["/sc", "WEEKLY", "/d", _WINDOWS_DAY[task.day_of_week], "/st", task.hhmm]
         else:
             # Daily at specific time
             extra = ["/sc", "DAILY", "/st", task.hhmm]
@@ -333,9 +355,8 @@ def register_unix(tasks: list, dry_run: bool) -> None:
             # Every N minutes: */N * * * *
             entry = f"*/{task.interval_min} * * * * {cmd}"
         else:
-            # Daily at HH:MM
-            cron_time = hhmm_to_cron(task.hhmm)
-            entry = f"{cron_time} * * * {cmd}"
+            # Daily at HH:MM, or weekly when day_of_week is set
+            entry = f"{hhmm_to_cron(task.hhmm, task.day_of_week)} {cmd}"
 
         new_lines.append(f"# {task.label}")
         new_lines.append(entry)

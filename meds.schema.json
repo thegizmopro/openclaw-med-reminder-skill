@@ -116,6 +116,11 @@
           "maximum": 168,
           "description": "Hours between doses. Required when frequency is 'interval'. Null otherwise."
         },
+        "day_of_week": {
+          "type": ["string", "null"],
+          "enum": ["mon", "tue", "wed", "thu", "fri", "sat", "sun", null],
+          "description": "Dose day for weekly meds, e.g. 'mon'. Required when frequency is 'weekly' — without it reminders fire daily. Null otherwise."
+        },
         "with_food": {
           "type": "boolean",
           "description": "Whether the med should be taken with food. Informational only — shown in digest."
