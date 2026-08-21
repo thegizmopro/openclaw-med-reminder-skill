@@ -15,6 +15,8 @@ Subcommands:
 
 Flags:
     --dry-run    Print without sending or writing state
+    --state PATH Path to meds-state.json (overrides MEDS_STATE_FILE;
+                 baked into registered tasks by setup-tasks.py)
 
 Environment:
     MEDS_STATE_FILE   Path to meds-state.json   (default: same dir as script)
@@ -27,6 +29,7 @@ import argparse
 import json
 import logging
 import os
+import shutil
 import subprocess
 import sys
 import time
@@ -53,6 +56,7 @@ HISTORY_MAX = 30
 EARLY_CONFIRM_WINDOW = timedelta(hours=6)
 
 sys.path.insert(0, str(SCRIPT_DIR))
+import safe_write as _safe_write_mod
 from safe_write import safe_write as _safe_write_fn
 
 log = logging.getLogger("dispatch")
@@ -99,13 +103,34 @@ SEND_RETRIES = 3
 SEND_RETRY_DELAY = 5  # seconds between attempts
 
 
+def _bash_executable() -> str:
+    """
+    Resolve bash for send-message.sh. Scheduled tasks on Windows don't inherit
+    the user's PATH, so plain 'bash' fails there — fall back to the standard
+    Git for Windows locations.
+    """
+    bash = shutil.which("bash")
+    if bash:
+        return bash
+    for cand in (r"C:\Program Files\Git\bin\bash.exe",
+                 r"C:\Program Files (x86)\Git\bin\bash.exe"):
+        if Path(cand).exists():
+            return cand
+    return "bash"  # let the shell's own error speak
+
+
 def send_message(text: str, dry_run: bool) -> None:
     if dry_run:
         print(f"\n{'-' * 56}\n[DRY RUN] Message:\n{text}\n{'-' * 56}\n")
         return
 
     send_helper = SCRIPT_DIR / "send-message.sh"
-    cmd = SEND_CMD or (f"bash {send_helper}" if send_helper.exists() else "")
+    if SEND_CMD:
+        cmd = SEND_CMD
+    elif send_helper.exists():
+        cmd = f'"{_bash_executable()}" "{send_helper}"'
+    else:
+        cmd = ""
 
     if not cmd:
         sys.exit(
@@ -559,6 +584,12 @@ def main() -> None:
         action="store_true",
         help="Print actions without sending messages or writing state",
     )
+    parser.add_argument(
+        "--state",
+        default=None,
+        metavar="PATH",
+        help="Path to meds-state.json (overrides MEDS_STATE_FILE; baked into scheduled tasks)",
+    )
 
     sub = parser.add_subparsers(dest="mode", required=True, metavar="MODE")
 
@@ -580,6 +611,11 @@ def main() -> None:
 
     args = parser.parse_args()
     setup_logging(args.dry_run)
+
+    if args.state:
+        global STATE_FILE
+        STATE_FILE = Path(args.state)
+        _safe_write_mod.STATE_FILE = Path(args.state)  # writer keeps its own copy
 
     mode = args.mode
     dr   = args.dry_run

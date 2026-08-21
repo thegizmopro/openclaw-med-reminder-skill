@@ -12,8 +12,14 @@ Plus global daily tasks:
   reset-deferred at 00:00                    → midnight deferred → pending
 
 Platform:
-  Windows  — Task Scheduler via schtasks (/it = only when logged on)
+  Windows  — Task Scheduler via schtasks + generated task XML
+             (StartWhenAvailable=true: missed runs fire on wake;
+             runs on battery; only while the user is logged on)
   Mac/Linux — crontab
+
+Every registered command bakes in --state <resolved meds-state.json> because
+scheduled tasks don't inherit shell env vars (MEDS_STATE_FILE set in a
+profile never reaches them).
 
 Note on interval-frequency meds: only a repeating fire task is registered.
 LATE/MISSED escalation applies to time-of-day meds (once_daily, twice_daily,
@@ -35,13 +41,21 @@ import os
 import platform
 import subprocess
 import sys
+import tempfile
 from dataclasses import dataclass, field
 from datetime import datetime, timezone as tz_utc
 from pathlib import Path
 from typing import Optional
+from xml.sax.saxutils import escape as xml_escape
 
 if sys.version_info < (3, 9):
     sys.exit(f"Python 3.9+ required — found {sys.version.split()[0]}")
+
+# Console output includes unicode (arrows, em-dashes) that cp1252 consoles
+# can't encode — degrade gracefully instead of crashing
+for _stream in (sys.stdout, sys.stderr):
+    if hasattr(_stream, "reconfigure"):
+        _stream.reconfigure(encoding="utf-8", errors="replace")
 
 # ── Paths ─────────────────────────────────────────────────────────────────────
 
@@ -54,9 +68,7 @@ REGISTRY_FILE = SCRIPT_DIR / ".registered-tasks.json"
 TASK_FOLDER   = "MedReminder"   # Windows Task Scheduler subfolder
 CRON_MARKER   = "# MedReminder" # crontab section marker
 
-# Day-of-week keys → schtasks /d value, cron day (0=Sun..6=Sat)
-_WINDOWS_DAY = {"mon": "MON", "tue": "TUE", "wed": "WED", "thu": "THU",
-                "fri": "FRI", "sat": "SAT", "sun": "SUN"}
+# Day-of-week keys → cron day (0=Sun..6=Sat)
 _CRON_DAY    = {"mon": 1, "tue": 2, "wed": 3, "thu": 4,
                 "fri": 5, "sat": 6, "sun": 0}
 
@@ -253,12 +265,82 @@ def _schtasks(*args, dry_run: bool, capture: bool = True):
     result = subprocess.run(cmd, capture_output=capture, text=True)
     return result
 
-def _tr_command(task: Task) -> str:
-    """Build the /tr value: quoted python + dispatch path + args."""
-    python = str(Path(sys.executable).resolve())
-    dispatch = str(DISPATCH_FILE.resolve())
-    args_str = " ".join(task.args)
-    return f'"{python}" "{dispatch}" {args_str}'
+# Task Scheduler XML day element names
+_XML_DAY = {"mon": "Monday", "tue": "Tuesday", "wed": "Wednesday", "thu": "Thursday",
+            "fri": "Friday", "sat": "Saturday", "sun": "Sunday"}
+
+def _trigger_desc(task: Task) -> str:
+    """One-line human description of a task's trigger (dry-run output)."""
+    if task.interval_min is not None:
+        return f"every {task.interval_min}m"
+    if task.day_of_week:
+        return f"weekly {task.day_of_week} at {task.hhmm}"
+    return f"daily at {task.hhmm}"
+
+def _task_xml(task: Task, python: str, dispatch: str, state_flag: str,
+              start_date: str) -> str:
+    """
+    Task Scheduler 2.0 XML for one task.
+
+    StartWhenAvailable gives missed-run catch-up: if the machine was asleep or
+    off at the trigger time, the task runs as soon as it wakes. Battery
+    settings are relaxed so laptops on battery still remind.
+    """
+    if task.interval_min is not None:
+        trigger = f"""    <TimeTrigger>
+      <StartBoundary>{start_date}T00:00:00</StartBoundary>
+      <Enabled>true</Enabled>
+      <Repetition>
+        <Interval>PT{task.interval_min}M</Interval>
+        <StopAtDurationEnd>false</StopAtDurationEnd>
+      </Repetition>
+    </TimeTrigger>"""
+    elif task.day_of_week:
+        trigger = f"""    <CalendarTrigger>
+      <StartBoundary>{start_date}T{task.hhmm}:00</StartBoundary>
+      <Enabled>true</Enabled>
+      <ScheduleByWeek>
+        <WeeksInterval>1</WeeksInterval>
+        <DaysOfWeek>
+          <{_XML_DAY[task.day_of_week]}/>
+        </DaysOfWeek>
+      </ScheduleByWeek>
+    </CalendarTrigger>"""
+    else:
+        trigger = f"""    <CalendarTrigger>
+      <StartBoundary>{start_date}T{task.hhmm}:00</StartBoundary>
+      <Enabled>true</Enabled>
+      <ScheduleByDay>
+        <DaysInterval>1</DaysInterval>
+      </ScheduleByDay>
+    </CalendarTrigger>"""
+
+    arguments = f'"{dispatch}" {state_flag} {" ".join(task.args)}'
+    # Task Scheduler's XML reader requires UTF-16 (with BOM) for /xml imports
+    return f"""<?xml version="1.0" encoding="UTF-16"?>
+<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
+  <RegistrationInfo>
+    <Description>{xml_escape(task.label)}</Description>
+  </RegistrationInfo>
+  <Triggers>
+{trigger}
+  </Triggers>
+  <Settings>
+    <StartWhenAvailable>true</StartWhenAvailable>
+    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
+    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
+    <ExecutionTimeLimit>PT1H</ExecutionTimeLimit>
+    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
+    <Enabled>true</Enabled>
+  </Settings>
+  <Actions Context="Author">
+    <Exec>
+      <Command>{xml_escape(python)}</Command>
+      <Arguments>{xml_escape(arguments)}</Arguments>
+    </Exec>
+  </Actions>
+</Task>
+"""
 
 def clear_windows(dry_run: bool) -> None:
     registered = load_registry()
@@ -279,31 +361,31 @@ def clear_windows(dry_run: bool) -> None:
 
 def register_windows(tasks: list, dry_run: bool) -> None:
     names = []
-    today = datetime.now().strftime("%m/%d/%Y")
+    python = str(Path(sys.executable).resolve())
+    dispatch = str(DISPATCH_FILE.resolve())
+    # Bake the resolved state path into every task: scheduled tasks don't
+    # inherit shell env vars, so MEDS_STATE_FILE set in a profile never
+    # reaches them and they'd silently use the default location.
+    state_flag = f'--state "{STATE_FILE.resolve()}"'
+    today = datetime.now().strftime("%Y-%m-%d")
 
     for task in tasks:
         full_name = f"\\{TASK_FOLDER}\\{task.name}"
-        tr = _tr_command(task)
-        base_args = [
-            "/create", "/f",
-            "/tn", full_name,
-            "/tr", tr,
-            "/it",                   # only when user is logged on
-            "/sd", today,            # start today
-        ]
-
-        if task.interval_min is not None:
-            # Repeating every N minutes
-            extra = ["/sc", "MINUTE", "/mo", str(task.interval_min)]
-        elif task.day_of_week:
-            # Weekly on a specific day
-            extra = ["/sc", "WEEKLY", "/d", _WINDOWS_DAY[task.day_of_week], "/st", task.hhmm]
-        else:
-            # Daily at specific time
-            extra = ["/sc", "DAILY", "/st", task.hhmm]
-
-        r = _schtasks(*base_args, *extra, dry_run=dry_run)
-        if r and r.returncode != 0:
+        if dry_run:
+            print(f"  [DRY RUN] schtasks /create /f /tn {full_name} /xml <generated>")
+            print(f"            {_trigger_desc(task)} | StartWhenAvailable=true")
+            continue
+        xml = _task_xml(task, python, dispatch, state_flag, today)
+        tmp = Path(tempfile.gettempdir()) / f"medreminder-{task.name}.xml"
+        tmp.write_text(xml, encoding="utf-16")
+        try:
+            r = subprocess.run(
+                ["schtasks", "/create", "/f", "/tn", full_name, "/xml", str(tmp)],
+                capture_output=True, text=True,
+            )
+        finally:
+            tmp.unlink(missing_ok=True)
+        if r.returncode != 0:
             print(f"  WARNING: schtasks failed for {task.name}: {r.stderr.strip()}")
         else:
             print(f"  Registered: {full_name}  ({task.label})")
@@ -311,6 +393,7 @@ def register_windows(tasks: list, dry_run: bool) -> None:
 
     if not dry_run:
         save_registry(names)
+    return len(names)
 
 # ── Unix crontab ──────────────────────────────────────────────────────────────
 
@@ -358,6 +441,8 @@ def clear_unix(dry_run: bool) -> None:
 def register_unix(tasks: list, dry_run: bool) -> None:
     python = sys.executable
     dispatch = str(DISPATCH_FILE.resolve())
+    # Bake the resolved state path in: cron jobs don't inherit shell env vars
+    state_flag = f'--state "{STATE_FILE.resolve()}"'
 
     lines = _read_crontab()
     lines = _strip_med_reminder_block(lines)  # remove old block first
@@ -365,7 +450,7 @@ def register_unix(tasks: list, dry_run: bool) -> None:
     new_lines = [CRON_MARKER]
     for task in tasks:
         args_str = " ".join(task.args)
-        cmd = f'"{python}" "{dispatch}" {args_str}'
+        cmd = f'"{python}" "{dispatch}" {state_flag} {args_str}'
 
         if task.interval_min is not None:
             # Every N minutes: */N * * * *
@@ -380,6 +465,7 @@ def register_unix(tasks: list, dry_run: bool) -> None:
 
     new_lines.append("")  # trailing blank line
     _write_crontab(lines + new_lines, dry_run)
+    return len(tasks) if not dry_run else 0
 
 # ── Summary printer ───────────────────────────────────────────────────────────
 
@@ -449,14 +535,14 @@ def main() -> None:
 
     print(f"\nRegistering {len(tasks)} tasks ({'dry run' if args.dry_run else 'live'})...")
     if is_windows:
-        register_windows(tasks, args.dry_run)
+        registered = register_windows(tasks, args.dry_run)
     else:
-        register_unix(tasks, args.dry_run)
+        registered = register_unix(tasks, args.dry_run)
 
     if args.dry_run:
         print("\nDry run complete. No changes made.")
     else:
-        print(f"\nDone. {len(tasks)} tasks registered.")
+        print(f"\nDone. {registered}/{len(tasks)} tasks registered.")
         print("Verify in Task Scheduler: start → 'Task Scheduler' → Task Scheduler Library → MedReminder")
 
 

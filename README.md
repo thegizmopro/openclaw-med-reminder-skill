@@ -9,7 +9,7 @@ Three escalation tiers per dose: on-time reminder → late nudge → missed log.
 ## Prerequisites
 
 - Python 3.9+
-- Windows: Git Bash (for `safe-write.sh`) + Task Scheduler (built-in)
+- Windows: Task Scheduler (built-in). Git Bash only if your `send-message.sh` is a bash script — the dispatcher finds `bash.exe` in the standard Git locations even when scheduled tasks don't inherit your PATH
 - Mac/Linux: bash + crontab (built-in)
 - Chrome, Edge, or Brave (for the HTML editor — requires File System Access API)
 - OpenClaw with a messaging channel configured
@@ -96,8 +96,8 @@ python3 setup-tasks.py
 
 Re-run `setup-tasks.py` any time you add, edit, or remove a medication.
 
-**Windows:** Tasks appear in Task Scheduler Library → MedReminder.  
-**Mac/Linux:** Tasks are written to your crontab.
+**Windows:** Tasks appear in Task Scheduler Library → MedReminder. They are registered with missed-run catch-up (`StartWhenAvailable`) — if the machine was asleep at the trigger time, the task fires as soon as it wakes — and run on battery. Each task bakes in the resolved `meds-state.json` path, so shell env vars aren't needed.  
+**Mac/Linux:** Tasks are written to your crontab with the resolved state path baked in.
 
 To remove all tasks:
 ```bash

@@ -16,6 +16,7 @@ Subcommands:
 Options:
     --dose-taken TEXT          Actual dose if different from prescribed (confirm only)
     --dry-run                  Print without writing state
+    --state PATH               Path to meds-state.json (overrides MEDS_STATE_FILE)
 
 Environment:
     MEDS_STATE_FILE   Path to meds-state.json   (default: same dir as script)
@@ -35,6 +36,8 @@ SCRIPT_DIR = Path(__file__).parent.resolve()
 sys.path.insert(0, str(SCRIPT_DIR))
 
 # Import shared helpers from dispatch — no scheduler-side code brought in
+import dispatch as _dispatch_mod
+import safe_write as _safe_write_mod
 from dispatch import (
     append_history,
     compute_next_due,
@@ -184,6 +187,8 @@ def main() -> None:
     )
     parser.add_argument("--dry-run", action="store_true",
                         help="Print without writing state")
+    parser.add_argument("--state", default=None, metavar="PATH",
+                        help="Path to meds-state.json (overrides MEDS_STATE_FILE)")
 
     sub = parser.add_subparsers(dest="mode", required=True, metavar="MODE")
 
@@ -201,6 +206,10 @@ def main() -> None:
 
     args = parser.parse_args()
     setup_logging(args.dry_run)
+
+    if args.state:
+        _dispatch_mod.STATE_FILE = Path(args.state)
+        _safe_write_mod.STATE_FILE = Path(args.state)  # writer keeps its own copy
 
     if args.mode == "confirm":
         if args.confirm_all:
