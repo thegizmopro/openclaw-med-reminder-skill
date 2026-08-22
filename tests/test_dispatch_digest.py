@@ -99,3 +99,41 @@ def test_as_needed_med_shown_in_digest():
     sent, _ = run_digest(state)
     assert "Ibuprofen" in sent[0]
     assert "as needed" in sent[0]
+
+
+# ── Extra: 7-day adherence line from history ──────────────────────────────────
+
+from datetime import timedelta
+from tests.conftest import fake_now
+
+
+def run_digest_at(state, clock):
+    sent = []
+    with patch("dispatch.load_state", return_value=state), \
+         patch("dispatch.save_state"), \
+         patch("dispatch.send_message", side_effect=lambda t, dr: sent.append(t)), \
+         patch("dispatch.datetime", fake_now(clock)):
+        handle_digest(dry_run=False)
+    return sent
+
+
+def _hist(event, days_ago, hour=8):
+    return {"timestamp": iso(local_dt(hour, 0) - timedelta(days=days_ago)),
+            "event": event, "dose_prescribed": "500mg"}
+
+
+def test_digest_adherence_line_counts_last_7_days():
+    now = local_dt(12, 0)
+    med = make_med(med_id="med-001", history=[
+        _hist("taken", 1), _hist("taken", 2), _hist("taken", 6),
+        _hist("missed", 3),
+        _hist("taken", 9),   # outside the window — ignored
+    ])
+    sent = run_digest_at(make_state(meds=[med]), now)
+    assert "Last 7 days: 3/4 doses taken" in sent[0]
+
+
+def test_digest_adherence_line_omitted_without_events():
+    med = make_med(med_id="med-001", history=[])
+    sent = run_digest_at(make_state(meds=[med]), local_dt(12, 0))
+    assert "Last 7 days" not in sent[0]

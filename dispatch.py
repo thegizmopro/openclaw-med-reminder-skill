@@ -549,6 +549,24 @@ def handle_digest(dry_run: bool) -> None:
         food = " (with food)" if sched.get("with_food") else ""
         lines.append(f"{i}. {med['name']} {med['dose']}{med['unit']} | {time_str}{food}")
 
+    # 7-day adherence from history (taken vs taken+missed events)
+    since = now - timedelta(days=7)
+    taken = sum(
+        1 for med in active
+        for e in med["state"]["history"]
+        if e["event"] == "taken"
+        and datetime.fromisoformat(e["timestamp"]) >= since
+    )
+    missed_events = sum(
+        1 for med in active
+        for e in med["state"]["history"]
+        if e["event"] == "missed"
+        and datetime.fromisoformat(e["timestamp"]) >= since
+    )
+    if taken + missed_events:
+        lines.append("")
+        lines.append(f"Last 7 days: {taken}/{taken + missed_events} doses taken")
+
     lines += [
         "",
         "Reply: 'all taken' | 'skip [name]' | 'took [name]: [dose]' | 'done [name1], [name2]'",

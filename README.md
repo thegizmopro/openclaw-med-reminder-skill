@@ -115,6 +115,8 @@ Meds for Mon Apr 21:
 1. Metformin 500mg | 8:00am, 8:00pm (with food)
 2. Lisinopril 10mg | 9:00pm
 
+Last 7 days: 13/14 doses taken
+
 Reply: 'all taken' | 'skip [name]' | 'took [name]: [dose]' | 'done [name1], [name2]'
 ```
 
@@ -161,6 +163,19 @@ Options:
 
 ---
 
+## Health check
+
+Verify everything that fails silently at 3am — state validity, timezone data, sender wiring, registered tasks:
+
+```bash
+python doctor.py               # read-only checks; exit 1 on any failure
+python doctor.py --send-test   # also pipe one test message through your channel
+```
+
+Run it after first setup and any time reminders seem to have stopped.
+
+---
+
 ## State file
 
 `meds-state.json` is the only file that changes at runtime. It lives wherever you put it (default: same directory as the scripts).
@@ -202,7 +217,7 @@ pip install pytest tzdata   # one-time
 pytest tests/ -v
 ```
 
-91 tests covering escalation resolver, next-due calculation, per-dose confirmation, history trimming, digest logic, safe-write atomicity, and passport generation.
+120 tests covering escalation resolver, next-due calculation, per-dose confirmation, weekly scheduling, quiet-hours handling, task XML generation, history trimming, digest logic, safe-write atomicity, and passport generation.
 
 ---
 
@@ -218,6 +233,7 @@ med-reminder-skill/
 ├── setup-tasks.py           # registers Task Scheduler / crontab entries
 ├── safe-write.sh            # atomic validated state writer
 ├── generate-passport.py     # med passport HTML generator
+├── doctor.py                # health check: state, sender, scheduler tasks
 ├── editor.html              # browser-based state editor
 ├── send-message.sh          # YOU CREATE THIS — wires to your messaging channel
 ├── SKILL.md                 # AI interview guide and reply handler spec
