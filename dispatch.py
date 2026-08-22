@@ -43,6 +43,12 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 if sys.version_info < (3, 9):
     sys.exit(f"Python 3.9+ required — found {sys.version.split()[0]}")
 
+# Console output includes unicode (em-dashes, arrows) that cp1252 consoles
+# can't encode — degrade gracefully instead of crashing
+for _stream in (sys.stdout, sys.stderr):
+    if hasattr(_stream, "reconfigure"):
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+
 # ── Paths ─────────────────────────────────────────────────────────────────────
 
 SCRIPT_DIR = Path(__file__).parent.resolve()
@@ -141,7 +147,8 @@ def send_message(text: str, dry_run: bool) -> None:
 
     last_err = ""
     for attempt in range(1, SEND_RETRIES + 1):
-        result = subprocess.run(cmd, shell=True, input=text, capture_output=True, text=True)
+        result = subprocess.run(cmd, shell=True, input=text, capture_output=True, text=True,
+                                 encoding="utf-8", errors="replace")
         if result.returncode == 0:
             log.info("Message sent (%d chars, attempt %d)", len(text), attempt)
             return

@@ -30,12 +30,17 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Union
 
-SCRIPT_DIR   = Path(__file__).parent.resolve()
-STATE_FILE   = Path(os.environ.get("MEDS_STATE_FILE",  SCRIPT_DIR / "meds-state.json"))
-LOG_FILE     = Path(os.environ.get("MEDS_LOG_FILE",    SCRIPT_DIR / "safe-write.log"))
-LOCK_DIR     = Path(str(STATE_FILE) + ".lock")
-BACKUP_FILE  = Path(str(STATE_FILE) + ".bak")
-TMP_FILE     = Path(str(STATE_FILE) + ".tmp")
+# CLI output includes unicode (em-dashes) that cp1252 consoles can't encode
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+
+SCRIPT_DIR     = Path(__file__).parent.resolve()
+STATE_FILE     = Path(os.environ.get("MEDS_STATE_FILE",  SCRIPT_DIR / "meds-state.json"))
+LOG_FILE       = Path(os.environ.get("MEDS_LOG_FILE",    SCRIPT_DIR / "safe-write.log"))
+LOCK_DIR       = Path(str(STATE_FILE) + ".lock")
+BACKUP_FILE    = Path(str(STATE_FILE) + ".bak")
+BACKUP_OLD_FILE = Path(str(STATE_FILE) + ".bak.old")   # previous .bak generation
+TMP_FILE       = Path(str(STATE_FILE) + ".tmp")
 LOCK_TIMEOUT = 30   # seconds before declaring lock stale
 LOCK_WAIT    = 5    # seconds to wait before giving up on a live lock
 HISTORY_MAX  = 30   # must match dispatch.HISTORY_MAX
@@ -299,8 +304,11 @@ def safe_write(new_state: Union[dict, str, bytes]) -> None:
                     "Caller should re-read and retry."
                 )
 
-        # Step 7 — backup
+        # Step 7 — backup (rotate: previous .bak → .bak.old, keeping two generations
+        # so one bad write followed by another can't destroy the last good copy)
         if STATE_FILE.exists():
+            if BACKUP_FILE.exists():
+                os.replace(BACKUP_FILE, BACKUP_OLD_FILE)
             shutil.copy2(STATE_FILE, BACKUP_FILE)
 
         # Step 8 — atomic replace

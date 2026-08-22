@@ -45,20 +45,23 @@ def with_paths(tmp_path, fn):
     orig_log    = sw.LOG_FILE
     orig_lock   = sw.LOCK_DIR
     orig_backup = sw.BACKUP_FILE
+    orig_old    = sw.BACKUP_OLD_FILE
     orig_tmp    = sw.TMP_FILE
     try:
-        sw.STATE_FILE   = tmp_path / "meds-state.json"
-        sw.LOG_FILE     = tmp_path / "safe-write.log"
-        sw.LOCK_DIR     = tmp_path / "meds-state.json.lock"
-        sw.BACKUP_FILE  = tmp_path / "meds-state.json.bak"
-        sw.TMP_FILE     = tmp_path / "meds-state.json.tmp"
+        sw.STATE_FILE      = tmp_path / "meds-state.json"
+        sw.LOG_FILE        = tmp_path / "safe-write.log"
+        sw.LOCK_DIR        = tmp_path / "meds-state.json.lock"
+        sw.BACKUP_FILE     = tmp_path / "meds-state.json.bak"
+        sw.BACKUP_OLD_FILE = tmp_path / "meds-state.json.bak.old"
+        sw.TMP_FILE        = tmp_path / "meds-state.json.tmp"
         fn(tmp_path)
     finally:
-        sw.STATE_FILE   = orig_state
-        sw.LOG_FILE     = orig_log
-        sw.LOCK_DIR     = orig_lock
-        sw.BACKUP_FILE  = orig_backup
-        sw.TMP_FILE     = orig_tmp
+        sw.STATE_FILE      = orig_state
+        sw.LOG_FILE        = orig_log
+        sw.LOCK_DIR        = orig_lock
+        sw.BACKUP_FILE     = orig_backup
+        sw.BACKUP_OLD_FILE = orig_old
+        sw.TMP_FILE        = orig_tmp
 
 
 # ── Case 21: valid state → success, backup created, file updated ──────────────
@@ -123,6 +126,21 @@ def test_case_25_invalid_structure_rejected(tmp_path):
         with pytest.raises(ValueError):
             sw.safe_write(bad)
         assert sw.STATE_FILE.read_text() == original
+    with_paths(tmp_path, run)
+
+
+# ── Backup rotation: two generations survive consecutive writes ───────────────
+
+def test_backup_rotation_keeps_two_generations(tmp_path):
+    def run(d):
+        sw.safe_write(_state(1))                     # gen 1 on disk
+        first = sw.STATE_FILE.read_text(encoding="utf-8")
+        sw.safe_write(_state(2))                     # gen 1 → .bak
+        second = sw.STATE_FILE.read_text(encoding="utf-8")
+        sw.safe_write(_state(3))                     # .bak → .bak.old, gen 2 → .bak
+        assert sw.STATE_FILE.read_text(encoding="utf-8") != second
+        assert sw.BACKUP_FILE.read_text(encoding="utf-8") == second
+        assert sw.BACKUP_OLD_FILE.read_text(encoding="utf-8") == first
     with_paths(tmp_path, run)
 
 

@@ -7,6 +7,7 @@
 .env
 secrets.json
 *.bak
+*.bak.old
 meds-state.json
 meds-state.json.bak
 .registered-tasks.json

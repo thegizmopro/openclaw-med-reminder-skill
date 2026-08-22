@@ -32,6 +32,11 @@ from pathlib import Path
 if sys.version_info < (3, 9):
     sys.exit(f"Python 3.9+ required — found {sys.version.split()[0]}")
 
+# Console output includes unicode (em-dashes) that cp1252 consoles can't encode
+for _stream in (sys.stdout, sys.stderr):
+    if hasattr(_stream, "reconfigure"):
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+
 SCRIPT_DIR = Path(__file__).parent.resolve()
 sys.path.insert(0, str(SCRIPT_DIR))
 
