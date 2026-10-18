@@ -191,6 +191,7 @@ def handle_defer(med_id: str, dry_run: bool, clock: Optional[Clock] = None) -> N
 # ── CLI ────────────────────────────────────────────────────────────────────────
 
 def main() -> None:
+    _safe_write_mod.apply_process_umask()   # issue #1 §2: private files, before any are created
     parser = argparse.ArgumentParser(
         description="AI reply handler — confirm or defer a medication dose.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -221,6 +222,8 @@ def main() -> None:
     if args.state:
         _dispatch_mod.STATE_FILE = Path(args.state)
         _safe_write_mod.STATE_FILE = Path(args.state)  # writer keeps its own copy
+    _safe_write_mod.secure_private_files(
+        extra=(Path(os.environ.get("MEDS_LOG_FILE", SCRIPT_DIR / "reply.log")),))
 
     if args.mode == "confirm":
         if args.confirm_all:

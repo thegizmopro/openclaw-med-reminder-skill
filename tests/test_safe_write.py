@@ -40,28 +40,16 @@ def _state(n_meds=1):
 
 
 def with_paths(tmp_path, fn):
-    """Run fn with sw paths pointed at tmp_path."""
-    orig_state  = sw.STATE_FILE
-    orig_log    = sw.LOG_FILE
-    orig_lock   = sw.LOCK_DIR
-    orig_backup = sw.BACKUP_FILE
-    orig_old    = sw.BACKUP_OLD_FILE
-    orig_tmp    = sw.TMP_FILE
+    """Run fn with sw paths pointed at tmp_path (derived paths follow STATE_FILE)."""
+    orig_state = sw.STATE_FILE
+    orig_log   = sw.LOG_FILE
     try:
-        sw.STATE_FILE      = tmp_path / "meds-state.json"
-        sw.LOG_FILE        = tmp_path / "safe-write.log"
-        sw.LOCK_DIR        = tmp_path / "meds-state.json.lock"
-        sw.BACKUP_FILE     = tmp_path / "meds-state.json.bak"
-        sw.BACKUP_OLD_FILE = tmp_path / "meds-state.json.bak.old"
-        sw.TMP_FILE        = tmp_path / "meds-state.json.tmp"
+        sw.STATE_FILE = tmp_path / "meds-state.json"
+        sw.LOG_FILE   = tmp_path / "safe-write.log"
         fn(tmp_path)
     finally:
-        sw.STATE_FILE      = orig_state
-        sw.LOG_FILE        = orig_log
-        sw.LOCK_DIR        = orig_lock
-        sw.BACKUP_FILE     = orig_backup
-        sw.BACKUP_OLD_FILE = orig_old
-        sw.TMP_FILE        = orig_tmp
+        sw.STATE_FILE = orig_state
+        sw.LOG_FILE   = orig_log
 
 
 # ── Case 21: valid state → success, backup created, file updated ──────────────
@@ -73,8 +61,8 @@ def test_case_21_valid_write_and_backup(tmp_path):
         new = json.dumps(_state(1), indent=2)
         sw.safe_write(new)
         assert sw.STATE_FILE.read_text() == new
-        assert sw.BACKUP_FILE.exists()
-        assert sw.BACKUP_FILE.read_text() == original
+        assert sw.backup_file().exists()
+        assert sw.backup_file().read_text() == original
     with_paths(tmp_path, run)
 
 
@@ -90,18 +78,28 @@ def test_case_22_invalid_json_rejected(tmp_path):
     with_paths(tmp_path, run)
 
 
-# ── Case 23: lock held → RuntimeError ────────────────────────────────────────
+# ── Case 23: lock held by another holder → RuntimeError ──────────────────────
 
-def test_case_23_lock_held_raises(tmp_path):
+def test_case_23_lock_held_raises(tmp_path, monkeypatch):
     def run(d):
         sw.STATE_FILE.write_text(json.dumps(_state(0)), encoding="utf-8")
-        sw.LOCK_DIR.mkdir()
-        # Make it look fresh (not stale)
+        monkeypatch.setattr(sw, "LOCK_WAIT", 0.3)
+        held, release = threading.Event(), threading.Event()
+
+        def hold():
+            with sw.file_lock():
+                held.set()
+                release.wait(2)
+
+        t = threading.Thread(target=hold)
+        t.start()
         try:
+            assert held.wait(1), "holder never acquired the lock"
             with pytest.raises(RuntimeError, match="Could not acquire lock"):
                 sw.safe_write(_state(1))
         finally:
-            sw.LOCK_DIR.rmdir()
+            release.set()
+            t.join(3)
     with_paths(tmp_path, run)
 
 
@@ -112,7 +110,7 @@ def test_case_24_first_install(tmp_path):
         assert not sw.STATE_FILE.exists()
         sw.safe_write(_state(1))
         assert sw.STATE_FILE.exists()
-        assert not sw.BACKUP_FILE.exists()
+        assert not sw.backup_file().exists()
     with_paths(tmp_path, run)
 
 
@@ -139,8 +137,8 @@ def test_backup_rotation_keeps_two_generations(tmp_path):
         second = sw.STATE_FILE.read_text(encoding="utf-8")
         sw.safe_write(_state(3))                     # .bak → .bak.old, gen 2 → .bak
         assert sw.STATE_FILE.read_text(encoding="utf-8") != second
-        assert sw.BACKUP_FILE.read_text(encoding="utf-8") == second
-        assert sw.BACKUP_OLD_FILE.read_text(encoding="utf-8") == first
+        assert sw.backup_file().read_text(encoding="utf-8") == second
+        assert sw.backup_old_file().read_text(encoding="utf-8") == first
     with_paths(tmp_path, run)
 
 

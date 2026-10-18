@@ -10,6 +10,9 @@ secrets.json
 *.bak.old
 meds-state.json
 meds-state.json.bak
+meds-state.json.bak.old
+meds-state.json.lock
+history.jsonl
 .registered-tasks.json
 *.log
 med-passport.html

@@ -599,6 +599,7 @@ def handle_reset_deferred(dry_run: bool) -> None:
 # ── CLI ───────────────────────────────────────────────────────────────────────
 
 def main() -> None:
+    _safe_write_mod.apply_process_umask()   # issue #1 §2: private files, before any are created
     parser = argparse.ArgumentParser(
         description="Med reminder dispatch. Call from Task Scheduler or crontab.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -641,6 +642,8 @@ def main() -> None:
         global STATE_FILE
         STATE_FILE = Path(args.state)
         _safe_write_mod.STATE_FILE = Path(args.state)  # writer keeps its own copy
+
+    _safe_write_mod.secure_private_files(extra=(LOG_FILE,))   # after --state rebind
 
     mode = args.mode
     dr   = args.dry_run

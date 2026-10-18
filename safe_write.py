@@ -1,24 +1,35 @@
 #!/usr/bin/env python3
 """
-safe_write.py — atomic state write with structural validation and optimistic concurrency.
+safe_write.py — atomic state writes, OS file locks, and pure transactions.
 
 Pure-Python replacement for safe-write.sh. No bash / Git Bash required.
 Uses os.replace() for atomic rename (works on NTFS since Python 3.3).
 
 Usage (CLI — reads new state from stdin):
-    echo '{...}' | python3 safe_write.py
-    python3 safe_write.py < new-state.json
+    python3 safe_write.py --expected-sha256 <sha> < new-state.json
+
+    The sha256 is the version token of the file as the caller last read it
+    ('absent' when creating a new file). A stale token aborts the write, so
+    two writers outside the lock can't clobber each other (issue #1 §2).
 
 Usage (imported):
-    from safe_write import safe_write
-    safe_write(new_state_dict)          # dict
-    safe_write('{"version": ...}')      # JSON string
+    from safe_write import safe_write, transact
+    safe_write(new_state_dict)                    # whole-file write (dispatch)
+    safe_write(new_state, expected_sha256=sha)    # token-checked write
+    transact(fn, clock)                           # lock → load → pure fn →
+                                                  # validate → append events →
+                                                  # atomic write → unlock
 
 Environment overrides:
-    MEDS_STATE_FILE   path to meds-state.json   (default: same dir as this file)
-    MEDS_LOG_FILE     path to write log         (default: same dir as this file)
+    MEDS_STATE_FILE    path to meds-state.json   (default: same dir as this file)
+    MEDS_LOG_FILE      path to write log         (default: same dir as this file)
+    MEDS_HISTORY_FILE  path to history.jsonl     (default: next to the state file)
 """
 
+import argparse
+import contextlib
+import copy
+import hashlib
 import json
 import logging
 import os
@@ -30,6 +41,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Union
 
+import event_store
+from clock import get_clock
+
 # CLI output includes unicode (em-dashes) that cp1252 consoles can't encode
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -37,14 +51,33 @@ if hasattr(sys.stdout, "reconfigure"):
 SCRIPT_DIR     = Path(__file__).parent.resolve()
 STATE_FILE     = Path(os.environ.get("MEDS_STATE_FILE",  SCRIPT_DIR / "meds-state.json"))
 LOG_FILE       = Path(os.environ.get("MEDS_LOG_FILE",    SCRIPT_DIR / "safe-write.log"))
-LOCK_DIR       = Path(str(STATE_FILE) + ".lock")
-BACKUP_FILE    = Path(str(STATE_FILE) + ".bak")
-BACKUP_OLD_FILE = Path(str(STATE_FILE) + ".bak.old")   # previous .bak generation
-TMP_FILE       = Path(str(STATE_FILE) + ".tmp")
-LOCK_TIMEOUT = 30   # seconds before declaring lock stale
-LOCK_WAIT    = 5    # seconds to wait before giving up on a live lock
+
+LOCK_WAIT    = 30   # seconds to wait for the state lock before giving up
+REPLACE_TRIES = 5   # Windows os.replace PermissionError retries
+REPLACE_DELAY = 0.2  # seconds between retries
 
 log = logging.getLogger("safe_write")
+
+# ── Derived paths ──────────────────────────────────────────────────────────────
+# Computed from STATE_FILE at call time so --state overrides (which rebind
+# safe_write.STATE_FILE after import) propagate to every artifact.
+
+def lock_file() -> Path:
+    return Path(str(STATE_FILE) + ".lock")
+
+def backup_file() -> Path:
+    return Path(str(STATE_FILE) + ".bak")
+
+def backup_old_file() -> Path:
+    return Path(str(STATE_FILE) + ".bak.old")   # previous .bak generation
+
+def tmp_file() -> Path:
+    return Path(str(STATE_FILE) + ".tmp")
+
+def history_file() -> Path:
+    env = os.environ.get("MEDS_HISTORY_FILE")
+    return Path(env) if env else STATE_FILE.parent / "history.jsonl"
+
 
 # ── Logging ────────────────────────────────────────────────────────────────────
 
@@ -222,60 +255,177 @@ def validate(state: dict) -> None:
                 _die(f"{ep}.timestamp must be ISO 8601 with timezone")
 
 
-# ── Locking ────────────────────────────────────────────────────────────────────
+# ── OS file lock (issue #1 §2) ─────────────────────────────────────────────────
+#
+# fcntl.flock (POSIX) / msvcrt.locking (Windows) on <state>.lock. Both are
+# stdlib, released when the process dies, and need no stale timeout.
 
-def _acquire_lock() -> None:
-    """Acquire lock via os.mkdir (atomic on all platforms). Clears stale locks."""
-    deadline = time.monotonic() + LOCK_WAIT
-    while True:
+if sys.platform == "win32":
+    import msvcrt
+
+    def _try_lock(fh) -> bool:
         try:
-            LOCK_DIR.mkdir()
-            return
-        except FileExistsError:
-            # Check for stale lock
-            try:
-                age = time.time() - LOCK_DIR.stat().st_mtime
-                if age > LOCK_TIMEOUT:
-                    log.warning("Stale lock detected (%.0fs old) — clearing", age)
-                    LOCK_DIR.rmdir()
-                    continue
-            except OSError:
-                pass
+            fh.seek(0)
+            msvcrt.locking(fh.fileno(), msvcrt.LK_NBLCK, 1)
+            return True
+        except OSError:
+            return False
+
+    def _unlock(fh) -> None:
+        try:
+            fh.seek(0)
+            msvcrt.locking(fh.fileno(), msvcrt.LK_UNLCK, 1)
+        except OSError:
+            pass
+else:
+    import fcntl
+
+    def _try_lock(fh) -> bool:
+        try:
+            fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return True
+        except OSError:
+            return False
+
+    def _unlock(fh) -> None:
+        try:
+            fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+        except OSError:
+            pass
+
+
+@contextlib.contextmanager
+def file_lock(timeout: float = None, poll: float = 0.05, _path=None):
+    """
+    Exclusive lock on the state's lock file. Raises RuntimeError when still
+    held after `timeout` seconds (default LOCK_WAIT). A leftover lock
+    *directory* (the pre-PR1 mkdir lock) can only be stale — that
+    implementation removed it on release — so it is cleared on sight.
+    """
+    if timeout is None:
+        timeout = LOCK_WAIT
+    path = Path(_path) if _path else lock_file()
+    if path.is_dir():
+        try:
+            path.rmdir()
+        except OSError:
+            pass
+    fh = open(path, "a+b")
+    try:
+        if os.fstat(fh.fileno()).st_size == 0:
+            fh.write(b"\0")   # a byte for Windows to lock
+            fh.flush()
+        deadline = time.monotonic() + timeout
+        while not _try_lock(fh):
             if time.monotonic() >= deadline:
                 raise RuntimeError(
-                    f"Could not acquire lock after {LOCK_WAIT}s — another process may be writing"
+                    f"Could not acquire lock after {timeout}s — another process may be writing"
                 )
-            time.sleep(0.1)
+            time.sleep(poll)
+        try:
+            yield fh
+        finally:
+            _unlock(fh)
+    finally:
+        fh.close()
 
 
-def _release_lock() -> None:
+# ── Version token ──────────────────────────────────────────────────────────────
+
+def state_token(path=None) -> tuple:
+    """
+    (st_mtime_ns, sha256) of the state file — identifies the exact version a
+    writer last read ('absent' sha when the file doesn't exist yet). Guards
+    writers outside the lock (issue #1 §2).
+    """
+    p = Path(path) if path else STATE_FILE
     try:
-        LOCK_DIR.rmdir()
+        mtime_ns = p.stat().st_mtime_ns
+    except FileNotFoundError:
+        return (0, "absent")
+    with p.open("rb") as f:
+        digest = hashlib.sha256(f.read()).hexdigest()
+    return (mtime_ns, digest)
+
+
+def load_state() -> tuple:
+    """
+    (state, token) from STATE_FILE. Raises FileNotFoundError when missing —
+    dispatch.load_state owns the friendly CLI error.
+    """
+    data = STATE_FILE.read_bytes()
+    state = json.loads(data.decode("utf-8"))
+    return state, (STATE_FILE.stat().st_mtime_ns, hashlib.sha256(data).hexdigest())
+
+
+# ── File security (issue #1 §2) ────────────────────────────────────────────────
+
+def apply_process_umask() -> None:
+    """Private-by-default file creation (POSIX)."""
+    os.umask(0o077)
+
+
+def _secure(path: Path) -> None:
+    if sys.platform == "win32":
+        return  # documented no-op: Windows chmod only toggles the read-only bit
+    try:
+        if path.exists() and (path.stat().st_mode & 0o777) != 0o600:
+            path.chmod(0o600)
     except OSError:
         pass
 
 
+def secure_private_files(extra=()) -> None:
+    """chmod 600 existing state, backups, history and log (first run; POSIX)."""
+    paths = [STATE_FILE, backup_file(), backup_old_file(), history_file(), LOG_FILE]
+    paths.extend(extra)
+    for p in paths:
+        _secure(p)
+
+
 # ── Core write ─────────────────────────────────────────────────────────────────
 
-def safe_write(new_state: Union[dict, str, bytes]) -> None:
+def _atomic_write_state(state: dict) -> None:
+    """tmp (0600, fsync) → backup rotation → os.replace, with Windows retries."""
+    tmp = tmp_file()
+    payload = json.dumps(state, indent=2)
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        f.write(payload)
+        f.flush()
+        os.fsync(f.fileno())
+    try:
+        if STATE_FILE.exists():
+            if backup_file().exists():
+                os.replace(backup_file(), backup_old_file())
+            shutil.copy2(STATE_FILE, backup_file())
+        # Windows: os.replace raises PermissionError while a reader (editor,
+        # antivirus) holds the target open — retry briefly (issue #1 §2)
+        for attempt in range(REPLACE_TRIES):
+            try:
+                os.replace(tmp, STATE_FILE)
+                return
+            except PermissionError:
+                if attempt == REPLACE_TRIES - 1:
+                    raise
+                time.sleep(REPLACE_DELAY)
+    finally:
+        if tmp.exists():
+            tmp.unlink(missing_ok=True)
+
+
+def safe_write(new_state: Union[dict, str, bytes],
+               expected_sha256: str = None) -> None:
     """
     Validate and atomically write new_state to STATE_FILE.
 
-    Steps:
-      1. Parse input (dict, JSON string, or bytes)
-      2. Validate structure
-      3. Record mtime of current state (optimistic concurrency baseline)
-      4. Write to .tmp file
-      5. Acquire lockfile
-      6. Re-check mtime (abort if changed)
-      7. Backup existing state
-      8. os.replace() .tmp → STATE_FILE (atomic on NTFS + POSIX)
-      9. Release lock
-      10. Log success
+    expected_sha256 (required for CLI callers): the sha256 half of the
+    version token from when the caller last read the file, or 'absent' for a
+    new file. A mismatch aborts — the caller must re-read and retry.
     """
     _setup_logging()
 
-    # Step 1 — parse
+    # Parse input (dict, JSON string, or bytes)
     if isinstance(new_state, (str, bytes)):
         try:
             state = json.loads(new_state)
@@ -284,21 +434,20 @@ def safe_write(new_state: Union[dict, str, bytes]) -> None:
     else:
         state = new_state
 
-    # Step 2 — validate
     validate(state)
 
-    payload = json.dumps(state, indent=2)
-
-    # Step 3 — record mtime before acquiring lock
+    # Optimistic-concurrency baseline, taken before acquiring the lock
     mtime_before = STATE_FILE.stat().st_mtime if STATE_FILE.exists() else 0
 
-    # Step 4 — write to tmp
-    TMP_FILE.write_text(payload, encoding="utf-8")
+    with file_lock():
+        if expected_sha256 is not None:
+            _, current_sha = state_token()
+            if expected_sha256 != current_sha:
+                raise RuntimeError(
+                    f"Stale write token — state changed since read "
+                    f"(on disk: {current_sha[:12]}…). Re-read and retry."
+                )
 
-    # Step 5 — acquire lock
-    _acquire_lock()
-    try:
-        # Step 6 — optimistic concurrency check
         if STATE_FILE.exists():
             mtime_after = STATE_FILE.stat().st_mtime
             if mtime_after != mtime_before:
@@ -308,40 +457,102 @@ def safe_write(new_state: Union[dict, str, bytes]) -> None:
                     "Caller should re-read and retry."
                 )
 
-        # Step 7 — backup (rotate: previous .bak → .bak.old, keeping two generations
-        # so one bad write followed by another can't destroy the last good copy)
-        if STATE_FILE.exists():
-            if BACKUP_FILE.exists():
-                os.replace(BACKUP_FILE, BACKUP_OLD_FILE)
-            shutil.copy2(STATE_FILE, BACKUP_FILE)
+        _atomic_write_state(state)
 
-        # Step 8 — atomic replace
-        os.replace(TMP_FILE, STATE_FILE)
-
-    finally:
-        # Step 9 — always release lock, always clean tmp
-        _release_lock()
-        if TMP_FILE.exists():
-            TMP_FILE.unlink(missing_ok=True)
-
-    # Step 10 — log
     med_count = len(state.get("meds", []))
     ts = datetime.now(tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-    msg = f"[{ts}] [safe_write] Write OK — {med_count} med(s) — backup: {BACKUP_FILE}"
-    log.info("Write OK — %d med(s) — backup: %s", med_count, BACKUP_FILE)
+    msg = f"[{ts}] [safe_write] Write OK — {med_count} med(s) — backup: {backup_file()}"
+    log.info("Write OK — %d med(s) — backup: %s", med_count, backup_file())
     print(msg)
+
+
+# ── Pure transactions (issue #1 §2) ────────────────────────────────────────────
+
+def _mirror_into_state(state: dict, events: list) -> None:
+    """
+    Mirror legacy-representable events into each med's state.history, capped
+    at the last event_store.MIRROR_MAX entries (rollback for one release).
+    """
+    meds = {m["id"]: m for m in state.get("meds", [])}
+    for ev in events:
+        entry = event_store.mirror_entry(ev)
+        if entry is None:
+            continue
+        med = meds.get(ev.get("med_id"))
+        if not med:
+            continue  # med removed — its history lines remain in the store
+        med["state"].setdefault("history", []).append(entry)
+    for med in state.get("meds", []):
+        hist = med["state"].get("history") or []
+        if len(hist) > event_store.MIRROR_MAX:
+            med["state"]["history"] = hist[-event_store.MIRROR_MAX:]
+
+
+def transact(fn, clock=None, expected_token: tuple = None,
+             lock_timeout: float = LOCK_WAIT) -> dict:
+    """
+    Run a pure state transition under the state lock (issue #1 §2):
+
+      1. Lock.
+      2. Read state and history.
+      3. fn(state_copy, history_view) -> (new_state, events). fn is PURE —
+         no I/O, no sends. Re-running it never duplicates history.
+      4. Validate.
+      5. Append events to history.jsonl (fsync).
+      6. Mirror into state.history, write state atomically.
+      7. Unlock.
+
+    Migrates legacy state first when tick.watermark_utc is unset. Returns
+    the committed state.
+    """
+    clock = clock or get_clock()
+    _setup_logging()
+    with file_lock(timeout=lock_timeout):
+        state, token = load_state()   # FileNotFoundError when missing
+        if expected_token is not None and token != expected_token:
+            raise RuntimeError(
+                "Stale version token — state changed since read. Re-read and retry."
+            )
+        history = event_store.load_events(history_file())
+        state, migration_events = event_store.migrate_state(state, clock.now_utc())
+        base_history = history + migration_events
+
+        new_state, events = fn(copy.deepcopy(state), list(base_history))
+        events = list(events or [])
+        validate(new_state)
+
+        appended = event_store.append_events(history_file(), migration_events + events)
+        # migration events came FROM state.history — mirroring them would double
+        # it. Only new events enter the rollback mirror.
+        migration_ids = {e["id"] for e in migration_events}
+        _mirror_into_state(new_state, [e for e in appended if e["id"] not in migration_ids])
+        _atomic_write_state(new_state)
+        return new_state
 
 
 # ── CLI entry point ────────────────────────────────────────────────────────────
 
 def main() -> None:
+    apply_process_umask()
+    secure_private_files()
     _setup_logging()
+
+    parser = argparse.ArgumentParser(
+        description="Atomic, validated, token-checked state write.",
+    )
+    parser.add_argument(
+        "--expected-sha256", required=True, metavar="SHA",
+        help="sha256 of meds-state.json as you last read it, or 'absent' "
+             "when creating a new file. A mismatch aborts the write.",
+    )
+    args = parser.parse_args()
+
     content = sys.stdin.read()
     if not content.strip():
         print("ERROR: empty input", file=sys.stderr)
         sys.exit(1)
     try:
-        safe_write(content)
+        safe_write(content, expected_sha256=args.expected_sha256)
     except (ValueError, RuntimeError) as e:
         print(f"ERROR: {e}", file=sys.stderr)
         log.error("%s", e)
