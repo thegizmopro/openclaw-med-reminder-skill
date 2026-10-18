@@ -6,8 +6,9 @@ from unittest.mock import patch
 
 import pytest
 
+from clock import FakeClock
 from reply import handle_confirm, handle_confirm_all, handle_defer
-from tests.conftest import make_state, make_med, iso, local_dt, fake_now, TZ
+from tests.conftest import make_state, make_med, iso, local_dt, TZ
 
 
 def run_confirm(state, med_id, dose_taken=None):
@@ -137,10 +138,9 @@ def test_confirm_all_skips_already_confirmed():
     m2 = make_med(med_id="med-002", name="Lisinopril", status="late")
     state = make_state(meds=[m1, m2])
     saved = []
-    with patch("reply.datetime", fake_now(local_dt(8, 30))), \
-         patch("reply.load_state", return_value=state), \
+    with patch("reply.load_state", return_value=state), \
          patch("reply.save_state", side_effect=lambda s, dr: saved.append(s)):
-        handle_confirm_all(None, dry_run=False)
+        handle_confirm_all(None, dry_run=False, clock=FakeClock(local_dt(8, 30)))
     result = saved[-1]["meds"]
     assert result[0]["state"]["status"] == "confirmed"  # was already confirmed, unchanged
     assert result[1]["state"]["status"] == "confirmed"  # newly confirmed
@@ -151,10 +151,9 @@ def test_confirm_all_no_save_when_nothing_to_confirm():
                   confirmed_dose=iso(local_dt(8, 0)))
     state = make_state(meds=[m1])
     saved = []
-    with patch("reply.datetime", fake_now(local_dt(8, 30))), \
-         patch("reply.load_state", return_value=state), \
+    with patch("reply.load_state", return_value=state), \
          patch("reply.save_state", side_effect=lambda s, dr: saved.append(s)):
-        handle_confirm_all(None, dry_run=False)
+        handle_confirm_all(None, dry_run=False, clock=FakeClock(local_dt(8, 30)))
     assert len(saved) == 0
 
 

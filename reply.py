@@ -43,6 +43,7 @@ sys.path.insert(0, str(SCRIPT_DIR))
 # Import shared helpers from dispatch — no scheduler-side code brought in
 import dispatch as _dispatch_mod
 import safe_write as _safe_write_mod
+from clock import Clock, get_clock
 from dispatch import (
     append_history,
     compute_next_due,
@@ -74,10 +75,12 @@ def setup_logging(dry_run: bool) -> None:
 
 # ── Handlers ───────────────────────────────────────────────────────────────────
 
-def handle_confirm(med_id: str, dose_taken: Optional[str], dry_run: bool) -> None:
+def handle_confirm(med_id: str, dose_taken: Optional[str], dry_run: bool,
+                   clock: Optional[Clock] = None) -> None:
+    clock = clock or get_clock()
     state = load_state()
     tz    = get_tz(state)
-    now   = datetime.now(tz=tz)
+    now   = clock.now_in(tz)
     med   = find_med(state, med_id)
 
     if med.get("paused"):
@@ -108,7 +111,7 @@ def handle_confirm(med_id: str, dose_taken: Optional[str], dry_run: bool) -> Non
     nd = compute_next_due(med, covered or now, tz)
     med["state"]["next_due"] = nd.isoformat() if nd else None
 
-    append_history(med, "taken", dose_taken=dose_taken or None)
+    append_history(med, "taken", dose_taken=dose_taken or None, clock=clock)
 
     save_state(state, dry_run)
     next_str = nd.strftime("%b %d %H:%M %Z") if nd else "n/a"
@@ -118,10 +121,12 @@ def handle_confirm(med_id: str, dose_taken: Optional[str], dry_run: bool) -> Non
           f"{now.strftime('%H:%M')}. Next due: {next_str}.")
 
 
-def handle_confirm_all(dose_taken: Optional[str], dry_run: bool) -> None:
+def handle_confirm_all(dose_taken: Optional[str], dry_run: bool,
+                       clock: Optional[Clock] = None) -> None:
+    clock = clock or get_clock()
     state = load_state()
     tz    = get_tz(state)
-    now   = datetime.now(tz=tz)
+    now   = clock.now_in(tz)
 
     confirmed = []
     skipped   = []
@@ -149,7 +154,7 @@ def handle_confirm_all(dose_taken: Optional[str], dry_run: bool) -> None:
         nd = compute_next_due(med, covered or now, tz)
         med["state"]["next_due"] = nd.isoformat() if nd else None
 
-        append_history(med, "taken", dose_taken=dose_taken or None)
+        append_history(med, "taken", dose_taken=dose_taken or None, clock=clock)
         confirmed.append(med["name"])
         log.info("CONFIRM-ALL [%s] taken=%s next_due=%s",
                  med["id"], now.isoformat(), med["state"]["next_due"])
@@ -165,7 +170,8 @@ def handle_confirm_all(dose_taken: Optional[str], dry_run: bool) -> None:
         print("Nothing to confirm — no active meds found.")
 
 
-def handle_defer(med_id: str, dry_run: bool) -> None:
+def handle_defer(med_id: str, dry_run: bool, clock: Optional[Clock] = None) -> None:
+    clock = clock or get_clock()
     state = load_state()
     med   = find_med(state, med_id)
 
@@ -175,7 +181,7 @@ def handle_defer(med_id: str, dry_run: bool) -> None:
         return
 
     med["state"]["status"] = "deferred"
-    append_history(med, "deferred")
+    append_history(med, "deferred", clock=clock)
 
     save_state(state, dry_run)
     log.info("DEFER [%s]", med_id)

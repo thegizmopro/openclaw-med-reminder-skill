@@ -8,19 +8,19 @@ the quiet window.
 """
 from unittest.mock import patch
 
+from clock import FakeClock
 from dispatch import handle_miss
-from tests.conftest import make_state, make_med, local_dt, fake_now, load_setup_tasks
+from tests.conftest import make_state, make_med, local_dt, load_setup_tasks
 
 setup_tasks = load_setup_tasks()
 
 
-def run_miss(state, clock):
+def run_miss(state, now):
     sent, saved = [], []
     with patch("dispatch.load_state", return_value=state), \
          patch("dispatch.save_state", side_effect=lambda s, dr: saved.append(s)), \
-         patch("dispatch.send_message", side_effect=lambda t, dr: sent.append(t)), \
-         patch("dispatch.datetime", fake_now(clock)):
-        handle_miss("med-001", 0, dry_run=False)
+         patch("dispatch.send_message", side_effect=lambda t, dr, clock=None: sent.append(t)):
+        handle_miss("med-001", 0, dry_run=False, clock=FakeClock(now))
     return sent, saved
 
 
