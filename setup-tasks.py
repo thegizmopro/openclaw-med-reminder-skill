@@ -1,51 +1,48 @@
 #!/usr/bin/env python3
 """
-setup-tasks.py — Register system scheduler entries for med reminders.
+setup-tasks.py — register the single tick task for med reminders.
 
-Reads meds-state.json and creates one task per dose-time event:
-  fire   at dose_time                        → send initial reminder
-  check  at dose_time + late_threshold_min   → LATE nudge if unconfirmed
-  miss   at dose_time + missed_threshold_min → MISSED if still unconfirmed
+Since issue #1 PR 2 the tick engine owns all per-dose logic: dispatch.py
+`tick` evaluates every med's occurrences on each run, so exactly ONE
+repeating scheduler entry is registered per state file — keyed by a short
+hash of the resolved state path (task name, cron markers, registry), so
+two state files never collide.
 
-Plus global daily tasks:
-  digest         at global.digest_time       → daily med summary + deferred reset
-  reset-deferred at 00:00                    → midnight deferred → pending
+Register-verify-remove (issue #1 §5): the tick is registered and queried
+back BEFORE any legacy per-dose job is removed. If registration or
+verification fails this exits non-zero, prints REMINDERS ARE NOT
+SCHEDULED, and leaves every legacy job in place.
 
-Platform:
-  Windows  — Task Scheduler via schtasks + generated task XML
-             (StartWhenAvailable=true: missed runs fire on wake;
-             runs on battery; only while the user is logged on)
-  Mac/Linux — crontab
-
-Every registered command bakes in --state <resolved meds-state.json> because
-scheduled tasks don't inherit shell env vars (MEDS_STATE_FILE set in a
-profile never reaches them).
-
-Note on interval-frequency meds: only a repeating fire task is registered.
-LATE/MISSED escalation applies to time-of-day meds (once_daily, twice_daily,
-weekly) only. Interval meds re-fire on schedule; the advisory check skips
-confirmed doses.
-
-Re-runnable: previously registered tasks are removed before re-registering.
-Run this after any change to meds-state.json (add, edit, remove a med).
+Platform schedulers:
+  Windows — Task Scheduler folder \\MedReminder\\, task tick-<hash>, run
+            with pythonw.exe (no console flash), StartWhenAvailable,
+            MultipleInstancesPolicy IgnoreNew, ExecutionTimeLimit PT10M.
+            Legacy cleanup enumerates the folder via
+            `schtasks /query /fo csv /nh` — never only the registry file.
+  macOS   — launchd user agent (StartInterval; cron has a Full Disk
+            Access problem on modern macOS); cron is the fallback.
+  Linux   — cron by default; --scheduler systemd opts into a user timer
+            (OnCalendar=*:0/5, Persistent=true).
 
 Usage:
-    python3 setup-tasks.py            # register tasks
-    python3 setup-tasks.py --dry-run  # show what would be registered, no changes
-    python3 setup-tasks.py --clear    # remove all MedReminder tasks only
+    python setup-tasks.py                      # register the tick (default 5 min)
+    python setup-tasks.py --tick-minutes 1
+    python setup-tasks.py --scheduler systemd  # Linux only
+    python setup-tasks.py --clear              # remove this state's tick + legacy jobs
+    python setup-tasks.py --dry-run
 """
 
 import argparse
+import csv
+import hashlib
+import io
 import json
 import os
-import platform
 import subprocess
 import sys
 import tempfile
-from dataclasses import dataclass, field
-from datetime import datetime, timezone as tz_utc
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional
 from xml.sax.saxutils import escape as xml_escape
 
 if sys.version_info < (3, 9):
@@ -62,57 +59,52 @@ for _stream in (sys.stdout, sys.stderr):
 SCRIPT_DIR    = Path(__file__).parent.resolve()
 STATE_FILE    = Path(os.environ.get("MEDS_STATE_FILE", SCRIPT_DIR / "meds-state.json"))
 DISPATCH_FILE = SCRIPT_DIR / "dispatch.py"
-# safe-write.sh kept for users who prefer it; dispatch.py uses safe_write.py directly
-REGISTRY_FILE = SCRIPT_DIR / ".registered-tasks.json"
+LEGACY_REGISTRY_FILE = SCRIPT_DIR / ".registered-tasks.json"   # pre-PR3; deleted on migration
 
-TASK_FOLDER   = "MedReminder"   # Windows Task Scheduler subfolder
-CRON_MARKER   = "# MedReminder" # crontab section marker
+TASK_FOLDER = "MedReminder"    # Windows Task Scheduler subfolder
+CRON_MARKER = "# MedReminder"  # pre-PR3 crontab section marker (legacy)
+TICK_MINUTES_DEFAULT = 5
 
-# Day-of-week keys → cron day (0=Sun..6=Sat)
-_CRON_DAY    = {"mon": 1, "tue": 2, "wed": 3, "thu": 4,
-                "fri": 5, "sat": 6, "sun": 0}
 
-# ── Import dispatch helpers (same directory) ──────────────────────────────────
+def _run(cmd, **kw):
+    """Single seam for OS scheduler commands — tests mock this, never the OS."""
+    return subprocess.run(cmd, capture_output=True, text=True, **kw)
 
-sys.path.insert(0, str(SCRIPT_DIR))
-try:
-    from dispatch import compute_next_due, get_tz, load_state, save_state
-except ImportError as e:
-    sys.exit(f"Cannot import from dispatch.py: {e}\nEnsure dispatch.py is in the same directory.")
 
-# ── Task model ────────────────────────────────────────────────────────────────
+# ── State-file identity (issue #1 §5: two state files never collide) ─────────
 
-@dataclass
-class Task:
-    name: str                        # unique short identifier, e.g. "fire_med-001_0"
-    label: str                       # human description for dry-run output
-    args: list                       # dispatch.py subcommand + positional args
-    hhmm: Optional[str]              # HH:MM for daily-at-time trigger; None for interval
-    interval_min: Optional[int]      # repeating interval in minutes; None for daily
-    day_of_week: Optional[str] = None  # 'mon'..'sun' for weekly tasks; None for daily
+def state_hash(state_path) -> str:
+    """Short hash of the resolved state path — keys every registered name."""
+    raw = str(Path(state_path).resolve()).encode("utf-8")
+    return hashlib.sha256(raw).hexdigest()[:8]
 
-    @property
-    def full_name(self) -> str:
-        """Full task name including folder prefix."""
-        return f"{TASK_FOLDER}\\{self.name}"
+def registry_file(h: str) -> Path:
+    return SCRIPT_DIR / f".registered-tasks.{h}.json"
 
-    @property
-    def cron_name(self) -> str:
-        return f"{self.name}"
+def load_registry(h: str) -> dict:
+    try:
+        data = json.loads(registry_file(h).read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
 
-# ── Time math ─────────────────────────────────────────────────────────────────
+def save_registry(h: str, entry: dict) -> None:
+    registry_file(h).write_text(json.dumps(entry, indent=2), encoding="utf-8")
 
-def hhmm_add(hhmm: str, minutes: int) -> str:
-    """Add minutes to an HH:MM string, wrapping at midnight."""
-    h, m = map(int, hhmm.split(":"))
-    total = (h * 60 + m + minutes) % (24 * 60)
-    return f"{total // 60:02d}:{total % 60:02d}"
+def tick_task_name(h: str) -> str:
+    return f"tick-{h}"
 
-def hhmm_to_cron(hhmm: str, day_of_week: Optional[str] = None) -> str:
-    """'08:30' → '30 8' + day-of-week field (default '*' for daily)."""
-    h, m = map(int, hhmm.split(":"))
-    dow = str(_CRON_DAY[day_of_week]) if day_of_week else "*"
-    return f"{m} {h} * * {dow}"
+def tick_task_full_name(h: str) -> str:
+    return f"\\{TASK_FOLDER}\\{tick_task_name(h)}"
+
+def launchd_label(h: str) -> str:
+    return f"com.medreminder.tick.{h}"
+
+def systemd_unit(h: str) -> str:
+    return f"medreminder-tick-{h}"
+
+
+# ── Edit-time quiet-hours check (kept from v1; doctor + PR 4 add/edit use it) ─
 
 def in_quiet_window(hhmm: str, quiet: dict) -> bool:
     """True if HH:MM falls inside the quiet window (handles midnight-spanning)."""
@@ -124,212 +116,268 @@ def in_quiet_window(hhmm: str, quiet: dict) -> bool:
         return start <= t < end
     return t >= start or t < end
 
-# ── Registry (tracks registered task names for cleanup) ───────────────────────
 
-def load_registry() -> list:
-    if REGISTRY_FILE.exists():
-        return json.loads(REGISTRY_FILE.read_text(encoding="utf-8"))
-    return []
+# ── The tick command ──────────────────────────────────────────────────────────
 
-def save_registry(names: list) -> None:
-    REGISTRY_FILE.write_text(json.dumps(names, indent=2), encoding="utf-8")
+def tick_arguments(dispatch: str, state_path, tick_minutes: int) -> str:
+    """Arguments after the interpreter — the state path is baked in because
+    scheduled tasks don't inherit shell env vars (MEDS_STATE_FILE set in a
+    profile never reaches them)."""
+    return (f'"{Path(dispatch).resolve()}" --state "{Path(state_path).resolve()}" '
+            f"tick --tick-minutes {tick_minutes}")
 
-# ── Task builder ──────────────────────────────────────────────────────────────
+def cron_entry(python: str, arguments: str, tick_minutes: int) -> str:
+    return f'*/{tick_minutes} * * * * "{python}" {arguments}'
 
-def build_tasks(state: dict) -> list:
-    """Build the full task list from current state."""
-    tasks = []
-    g = state["global"]
 
-    # ── Global tasks ──────────────────────────────────────────────────────────
-    tasks.append(Task(
-        name="digest",
-        label=f"Daily med digest at {g['digest_time']}",
-        args=["digest"],
-        hhmm=g["digest_time"],
-        interval_min=None,
-    ))
-    tasks.append(Task(
-        name="reset-deferred",
-        label="Midnight deferred reset",
-        args=["reset-deferred"],
-        hhmm="00:00",
-        interval_min=None,
-    ))
+# ── crontab: BEGIN/END block + legacy strip (issue #1 §5) ─────────────────────
 
-    # ── Per-med tasks ─────────────────────────────────────────────────────────
-    for med in state["meds"]:
-        if med.get("paused"):
-            continue
+def cron_begin(h: str) -> str:
+    return f"# MedReminder BEGIN {h}"
 
-        mid   = med["id"]
-        name  = med["name"]
-        sched = med["schedule"]
-        freq  = sched["frequency"]
-        esc   = med["escalation"]
-        late  = esc["late_threshold_minutes"]
-        miss  = esc["missed_threshold_minutes"]
+def cron_end(h: str) -> str:
+    return f"# MedReminder END {h}"
 
-        if freq == "as_needed":
-            continue
+def build_cron_block(h: str, entry_line: str) -> list:
+    """The whole managed block, markers included — one per state file."""
+    return [
+        cron_begin(h),
+        "# managed by setup-tasks.py — edit there, not with crontab -e",
+        entry_line,
+        cron_end(h),
+    ]
 
-        if freq == "interval":
-            interval_min = sched["interval_hours"] * 60
-            tasks.append(Task(
-                name=f"fire_{mid}_interval",
-                label=f"{name}: fire every {sched['interval_hours']}h",
-                args=["fire", mid, "0"],
-                hhmm=None,
-                interval_min=interval_min,
-            ))
-            # LATE/MISSED escalation not supported for interval meds in v1
-            continue
-
-        # Time-of-day meds (once_daily, twice_daily, weekly)
-        if freq not in ("interval", "as_needed"):
-            for t in sched["times"]:
-                if in_quiet_window(t, g["quiet_hours"]):
-                    print(f"  WARNING: {mid} ({name}) dose at {t} is inside quiet hours "
-                          f"({g['quiet_hours']['start']}-{g['quiet_hours']['end']}) — it will "
-                          "never send a reminder. Move the dose time or adjust quiet hours.")
-        weekly_day = None
-        if freq == "weekly":
-            weekly_day = sched.get("day_of_week")
-            if not weekly_day:
-                print(f"  WARNING: {mid} ({name}) is weekly without schedule.day_of_week — "
-                      "tasks would fire daily. Set day_of_week (e.g. 'mon') and re-save.")
-        day_label = f" {weekly_day.title()}" if weekly_day else ""
-
-        for i, t in enumerate(sched["times"]):
-            check_t = hhmm_add(t, late)
-            miss_t  = hhmm_add(t, miss)
-            tasks.append(Task(
-                name=f"fire_{mid}_{i}",
-                label=f"{name}: reminder at {t}{day_label}",
-                args=["fire", mid, str(i)],
-                hhmm=t,
-                interval_min=None,
-                day_of_week=weekly_day,
-            ))
-            tasks.append(Task(
-                name=f"check_{mid}_{i}",
-                label=f"{name}: late check at {check_t} (+{late}m){day_label}",
-                args=["check", mid, str(i)],
-                hhmm=check_t,
-                interval_min=None,
-                day_of_week=weekly_day,
-            ))
-            tasks.append(Task(
-                name=f"miss_{mid}_{i}",
-                label=f"{name}: missed check at {miss_t} (+{miss}m){day_label}",
-                args=["miss", mid, str(i)],
-                hhmm=miss_t,
-                interval_min=None,
-                day_of_week=weekly_day,
-            ))
-
-    return tasks
-
-# ── next_due initialisation ───────────────────────────────────────────────────
-
-def init_next_due(state: dict, dry_run: bool) -> bool:
+def strip_crontab(lines: list, state_path, h: str) -> list:
     """
-    Set next_due for any med where it is null (fresh install or new med).
-    Returns True if state was changed.
+    Remove everything this install owns (issue #1 §5):
+      1. our delimited BEGIN/END blocks (so re-registration never duplicates),
+      2. legacy marker-only blocks: a bare '# MedReminder' through the last
+         consecutive MedReminder label/entry of the pre-PR3 format,
+      3. any stray line containing dispatch.py plus this state's --state path
+         (a per-dose job that lost its marker).
+    Foreign lines — including another state file's block — survive.
     """
-    from zoneinfo import ZoneInfo
-    tz  = get_tz(state)
-    now = datetime.now(tz=tz)
-    changed = False
+    state_flag = str(Path(state_path).resolve())
+    out, i, n = [], 0, len(lines)
+    while i < n:
+        line = lines[i]
+        s = line.strip()
 
-    for med in state["meds"]:
-        if med["state"]["next_due"] is None and med["schedule"]["frequency"] != "as_needed":
-            nd = compute_next_due(med, now, tz)
-            if nd:
-                med["state"]["next_due"] = nd.isoformat()
-                changed = True
-                print(f"  init next_due [{med['id']}] -> {nd.strftime('%Y-%m-%d %H:%M %Z')}")
+        if s == cron_begin(h):                          # rule 1
+            i += 1
+            while i < n and lines[i].strip() != cron_end(h):
+                i += 1
+            i += 1                                      # past END (or EOF if unterminated)
+            if i < n and not lines[i].strip():
+                i += 1                                  # the block's one trailing blank
+            continue
 
-    if changed and not dry_run:
-        save_state(state, dry_run=False)
+        if s == CRON_MARKER:                            # rule 2
+            i += 1
+            j, last_entry_end = i, i
+            while j < n:
+                t = lines[j].strip()
+                if "dispatch.py" in t and state_flag in t:
+                    j += 1
+                    last_entry_end = j                  # an entry confirms the block
+                elif t.startswith("#"):                 # label — block member only if
+                    j += 1                              # an entry follows it
+                else:
+                    break
+            i = last_entry_end                          # unconfirmed trailing comments survive
+            if i < n and not lines[i].strip():
+                i += 1                                  # the block's one trailing blank
+            continue
 
-    return changed
+        if "dispatch.py" in line and state_flag in line:    # rule 3
+            i += 1
+            continue
+
+        out.append(line)
+        i += 1
+    return out
+
+def _strip_own_blocks(lines: list, h: str) -> list:
+    """Remove ONLY our delimited blocks (rule 1) — registration's idempotency
+    pass. Legacy lines must survive registration untouched: they are removed
+    only after the tick verifies (issue #1 §5 register-verify-remove)."""
+    out, i, n = [], 0, len(lines)
+    while i < n:
+        s = lines[i].strip()
+        if s == cron_begin(h):
+            i += 1
+            while i < n and lines[i].strip() != cron_end(h):
+                i += 1
+            i += 1
+            if i < n and not lines[i].strip():
+                i += 1                      # the block's one trailing blank
+            continue
+        out.append(lines[i])
+        i += 1
+    return out
+
+def find_legacy_cron(lines: list, state_path, h: str) -> list:
+    """Lines this install owns that are NOT inside our delimited tick block."""
+    state_flag = str(Path(state_path).resolve())
+    legacy, inside = [], False
+    for line in lines:
+        s = line.strip()
+        if s == cron_begin(h):
+            inside = True
+            continue
+        if s == cron_end(h):
+            inside = False
+            continue
+        if inside:
+            continue
+        if s == CRON_MARKER or ("dispatch.py" in line and state_flag in line):
+            legacy.append(line)
+    return legacy
+
+def read_crontab(run=_run):
+    """Crontab lines; [] when none exists; None when unreadable."""
+    r = run(["crontab", "-l"])
+    if r.returncode == 0:
+        return (r.stdout or "").splitlines()
+    if "no crontab for" in (r.stderr or "").lower():
+        return []
+    return None
+
+def write_crontab(lines: list, run=_run) -> bool:
+    content = "\n".join(lines) + "\n" if lines else ""
+    return run(["crontab", "-"], input=content).returncode == 0
+
+def register_cron(h: str, state_path, tick_minutes: int, run=_run,
+                  dry_run: bool = False) -> bool:
+    entry = cron_entry(sys.executable, tick_arguments(DISPATCH_FILE, state_path, tick_minutes),
+                       tick_minutes)
+    if dry_run:
+        print(f"  [DRY RUN] crontab would gain:\n    " + "\n    ".join(build_cron_block(h, entry)))
+        return True
+    lines = read_crontab(run)
+    if lines is None:
+        print("Error reading crontab — cannot register.")
+        return False
+    # replace only OUR block: re-runs never duplicate, and legacy jobs stay
+    # in place until the tick verifies (issue #1 §5)
+    cleaned = _strip_own_blocks(lines, h)
+    if not write_crontab(cleaned + build_cron_block(h, entry) + [""], run):
+        print("Error writing crontab — registration failed.")
+        return False
+    print(f"  Registered crontab tick (every {tick_minutes} min, state {state_path})")
+    return True
+
+def verify_cron(h: str, run=_run) -> bool:
+    lines = read_crontab(run)
+    if lines is None:
+        return False
+    inside = False
+    for line in lines:
+        s = line.strip()
+        if s == cron_begin(h):
+            inside = True
+        elif s == cron_end(h):
+            inside = False
+        elif inside and "dispatch.py" in line and " tick --tick-minutes " in line:
+            return True
+    return False
+
+def _cron_block_entry(lines: list, h: str):
+    """The dispatch entry inside our delimited block, verbatim (or None)."""
+    inside = False
+    for line in lines:
+        s = line.strip()
+        if s == cron_begin(h):
+            inside = True
+        elif s == cron_end(h):
+            inside = False
+        elif inside and "dispatch.py" in line:
+            return line
+    return None
+
+def remove_legacy_cron(h: str, state_path, run=_run, dry_run: bool = False) -> int:
+    """
+    Remove legacy per-dose entries from the crontab. A verified cron tick
+    block is kept (re-added verbatim); when the tick lives in launchd or
+    systemd nothing cron-side is added back — one tick, one scheduler.
+    Returns the count still outstanding (0 = clean, -1 = unreadable).
+    """
+    lines = read_crontab(run)
+    if lines is None:
+        print("  WARNING: could not read crontab — legacy entries left as-is.")
+        return -1
+    legacy = find_legacy_cron(lines, state_path, h)
+    if not legacy:
+        return 0
+    if dry_run:
+        for line in legacy:
+            print(f"  [DRY RUN] crontab remove: {line.strip()}")
+        return 0
+    entry = _cron_block_entry(lines, h)                # keep the verified block …
+    cleaned = strip_crontab(lines, state_path, h)      # … ours + legacy out …
+    out = cleaned + (build_cron_block(h, entry) + [""] if entry else [])
+    if not write_crontab(out, run):
+        print("  WARNING: could not rewrite crontab — legacy entries remain.")
+        return len(legacy)
+    for line in legacy:
+        print(f"  Removed legacy crontab line: {line.strip()}")
+    return 0
+
 
 # ── Windows Task Scheduler ────────────────────────────────────────────────────
 
-def _schtasks(*args, dry_run: bool, capture: bool = True):
-    cmd = ["schtasks"] + list(args)
-    if dry_run:
-        print(f"  [DRY RUN] {' '.join(cmd)}")
-        return None
-    result = subprocess.run(cmd, capture_output=capture, text=True)
-    return result
+def _pythonw() -> str:
+    """pythonw.exe from sys.executable's directory — no console flash (issue #1 §5)."""
+    cand = Path(sys.executable).parent / "pythonw.exe"
+    return str(cand) if cand.exists() else sys.executable
 
-# Task Scheduler XML day element names
-_XML_DAY = {"mon": "Monday", "tue": "Tuesday", "wed": "Wednesday", "thu": "Thursday",
-            "fri": "Friday", "sat": "Saturday", "sun": "Sunday"}
+def parse_task_folder_names(csv_text: str) -> list:
+    """Task names inside \\MedReminder\\ parsed from `schtasks /query /fo csv /nh`."""
+    names = []
+    for row in csv.reader(io.StringIO(csv_text or "")):
+        if row:
+            name = row[0].strip()
+            if name.startswith(f"\\{TASK_FOLDER}\\"):
+                names.append(name)
+    return names
 
-def _trigger_desc(task: Task) -> str:
-    """One-line human description of a task's trigger (dry-run output)."""
-    if task.interval_min is not None:
-        return f"every {task.interval_min}m"
-    if task.day_of_week:
-        return f"weekly {task.day_of_week} at {task.hhmm}"
-    return f"daily at {task.hhmm}"
+def list_medreminder_tasks(run=_run):
+    """Enumerate the folder live — the registry file is never trusted for cleanup."""
+    r = run(["schtasks", "/query", "/fo", "csv", "/nh"])
+    if r.returncode != 0:
+        return None                                    # caller must not blind-delete
+    return parse_task_folder_names(r.stdout)
 
-def _task_xml(task: Task, python: str, dispatch: str, state_flag: str,
-              start_date: str) -> str:
+def tick_task_xml(python: str, dispatch: str, state_path, tick_minutes: int,
+                  start_date: str) -> str:
     """
-    Task Scheduler 2.0 XML for one task.
-
-    StartWhenAvailable gives missed-run catch-up: if the machine was asleep or
-    off at the trigger time, the task runs as soon as it wakes. Battery
-    settings are relaxed so laptops on battery still remind.
+    Task Scheduler 2.0 XML for the repeating tick. StartWhenAvailable gives
+    missed-run catch-up on wake; battery settings are relaxed so laptops on
+    battery still remind; IgnoreNew + the tick-instance lock make overlaps
+    harmless; PT10M kills a hung tick (60s send timeout + tick lock means
+    longer than 10 min is hung).
     """
-    if task.interval_min is not None:
-        trigger = f"""    <TimeTrigger>
-      <StartBoundary>{start_date}T00:00:00</StartBoundary>
-      <Enabled>true</Enabled>
-      <Repetition>
-        <Interval>PT{task.interval_min}M</Interval>
-        <StopAtDurationEnd>false</StopAtDurationEnd>
-      </Repetition>
-    </TimeTrigger>"""
-    elif task.day_of_week:
-        trigger = f"""    <CalendarTrigger>
-      <StartBoundary>{start_date}T{task.hhmm}:00</StartBoundary>
-      <Enabled>true</Enabled>
-      <ScheduleByWeek>
-        <WeeksInterval>1</WeeksInterval>
-        <DaysOfWeek>
-          <{_XML_DAY[task.day_of_week]}/>
-        </DaysOfWeek>
-      </ScheduleByWeek>
-    </CalendarTrigger>"""
-    else:
-        trigger = f"""    <CalendarTrigger>
-      <StartBoundary>{start_date}T{task.hhmm}:00</StartBoundary>
-      <Enabled>true</Enabled>
-      <ScheduleByDay>
-        <DaysInterval>1</DaysInterval>
-      </ScheduleByDay>
-    </CalendarTrigger>"""
-
-    arguments = f'"{dispatch}" {state_flag} {" ".join(task.args)}'
-    # Task Scheduler's XML reader requires UTF-16 (with BOM) for /xml imports
+    arguments = tick_arguments(dispatch, state_path, tick_minutes)
     return f"""<?xml version="1.0" encoding="UTF-16"?>
 <Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
   <RegistrationInfo>
-    <Description>{xml_escape(task.label)}</Description>
+    <Description>med-reminder tick every {tick_minutes} min</Description>
   </RegistrationInfo>
   <Triggers>
-{trigger}
+    <TimeTrigger>
+      <StartBoundary>{start_date}T00:00:00</StartBoundary>
+      <Enabled>true</Enabled>
+      <Repetition>
+        <Interval>PT{tick_minutes}M</Interval>
+        <StopAtDurationEnd>false</StopAtDurationEnd>
+      </Repetition>
+    </TimeTrigger>
   </Triggers>
   <Settings>
     <StartWhenAvailable>true</StartWhenAvailable>
     <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
     <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
-    <ExecutionTimeLimit>PT1H</ExecutionTimeLimit>
+    <ExecutionTimeLimit>PT10M</ExecutionTimeLimit>
     <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
     <Enabled>true</Enabled>
   </Settings>
@@ -342,209 +390,340 @@ def _task_xml(task: Task, python: str, dispatch: str, state_flag: str,
 </Task>
 """
 
-def clear_windows(dry_run: bool) -> None:
-    registered = load_registry()
-    if not registered:
-        print("No registered tasks found in .registered-tasks.json — nothing to clear.")
-        return
-    for name in registered:
-        full = f"\\{TASK_FOLDER}\\{name}"
-        r = _schtasks("/delete", "/tn", full, "/f", dry_run=dry_run)
-        if r and r.returncode == 0:
-            print(f"  Removed: {full}")
-        elif r:
-            # Task may not exist — that's fine
-            print(f"  (Not found, skipping): {full}")
-    if not dry_run:
-        save_registry([])
-        print("Registry cleared.")
-
-def register_windows(tasks: list, dry_run: bool) -> None:
-    names = []
-    python = str(Path(sys.executable).resolve())
-    dispatch = str(DISPATCH_FILE.resolve())
-    # Bake the resolved state path into every task: scheduled tasks don't
-    # inherit shell env vars, so MEDS_STATE_FILE set in a profile never
-    # reaches them and they'd silently use the default location.
-    state_flag = f'--state "{STATE_FILE.resolve()}"'
-    today = datetime.now().strftime("%Y-%m-%d")
-
-    for task in tasks:
-        full_name = f"\\{TASK_FOLDER}\\{task.name}"
-        if dry_run:
-            print(f"  [DRY RUN] schtasks /create /f /tn {full_name} /xml <generated>")
-            print(f"            {_trigger_desc(task)} | StartWhenAvailable=true")
-            continue
-        xml = _task_xml(task, python, dispatch, state_flag, today)
-        tmp = Path(tempfile.gettempdir()) / f"medreminder-{task.name}.xml"
-        tmp.write_text(xml, encoding="utf-16")
-        try:
-            r = subprocess.run(
-                ["schtasks", "/create", "/f", "/tn", full_name, "/xml", str(tmp)],
-                capture_output=True, text=True,
-            )
-        finally:
-            tmp.unlink(missing_ok=True)
-        if r.returncode != 0:
-            print(f"  WARNING: schtasks failed for {task.name}: {r.stderr.strip()}")
-        else:
-            print(f"  Registered: {full_name}  ({task.label})")
-            names.append(task.name)
-
-    if not dry_run:
-        save_registry(names)
-    return len(names)
-
-# ── Unix crontab ──────────────────────────────────────────────────────────────
-
-def _read_crontab() -> list:
-    r = subprocess.run(["crontab", "-l"], capture_output=True, text=True)
-    if r.returncode == 0:
-        return r.stdout.splitlines()
-    if "no crontab for" in r.stderr.lower():
-        return []
-    sys.exit(f"Error reading crontab: {r.stderr.strip()}")
-
-def _write_crontab(lines: list, dry_run: bool) -> None:
-    content = "\n".join(lines) + "\n"
+def register_windows(h: str, state_path, tick_minutes: int, run=_run,
+                     dry_run: bool = False) -> bool:
+    xml = tick_task_xml(_pythonw(), str(DISPATCH_FILE), state_path, tick_minutes,
+                        datetime.now().strftime("%Y-%m-%d"))
     if dry_run:
-        print(f"\n[DRY RUN] New crontab would be:\n{content}")
-        return
-    subprocess.run(["crontab", "-"], input=content, text=True, check=True)
+        print(f"  [DRY RUN] schtasks /create /f /tn {tick_task_full_name(h)} /xml <tick>")
+        return True
+    # Task Scheduler's XML reader requires UTF-16 (with BOM) for /xml imports
+    tmp = Path(tempfile.gettempdir()) / f"medreminder-tick-{h}.xml"
+    tmp.write_text(xml, encoding="utf-16")
+    try:
+        r = run(["schtasks", "/create", "/f", "/tn", tick_task_full_name(h),
+                 "/xml", str(tmp)])
+    finally:
+        tmp.unlink(missing_ok=True)
+    if r.returncode != 0:
+        print(f"  schtasks /create failed: {(r.stderr or '').strip()}")
+        return False
+    print(f"  Registered {tick_task_full_name(h)} (every {tick_minutes} min)")
+    return True
 
-def _strip_med_reminder_block(lines: list) -> list:
-    """Remove the MedReminder block (from marker to blank line after it)."""
-    result = []
-    in_block = False
-    for line in lines:
-        if line.strip() == CRON_MARKER:
-            in_block = True
+def verify_windows(h: str, run=_run) -> bool:
+    return run(["schtasks", "/query", "/tn", tick_task_full_name(h)]).returncode == 0
+
+def remove_legacy_windows(h: str, run=_run, dry_run: bool = False) -> int:
+    """
+    Delete every task in \\MedReminder\\ except this state's tick. Returns the
+    number of legacy tasks that could NOT be removed (0 = clean, -1 = the
+    folder could not be enumerated).
+    """
+    names = list_medreminder_tasks(run)
+    if names is None:
+        print("  WARNING: could not enumerate \\" + TASK_FOLDER + "\\ — legacy tasks left as-is.")
+        return -1
+    keep = {tick_task_full_name(h)}
+    remaining = 0
+    for name in names:
+        if name in keep:
             continue
-        if in_block:
-            # End of block: first non-MedReminder cron line that's non-empty
-            if line.startswith("#") or not line.strip():
-                continue
-            else:
-                in_block = False
-        result.append(line)
-    return result
-
-def clear_unix(dry_run: bool) -> None:
-    lines = _read_crontab()
-    cleaned = _strip_med_reminder_block(lines)
-    if len(cleaned) == len(lines):
-        print("No MedReminder block found in crontab.")
-        return
-    _write_crontab(cleaned, dry_run)
-    print("MedReminder crontab block removed.")
-
-def register_unix(tasks: list, dry_run: bool) -> None:
-    python = sys.executable
-    dispatch = str(DISPATCH_FILE.resolve())
-    # Bake the resolved state path in: cron jobs don't inherit shell env vars
-    state_flag = f'--state "{STATE_FILE.resolve()}"'
-
-    lines = _read_crontab()
-    lines = _strip_med_reminder_block(lines)  # remove old block first
-
-    new_lines = [CRON_MARKER]
-    for task in tasks:
-        args_str = " ".join(task.args)
-        cmd = f'"{python}" "{dispatch}" {state_flag} {args_str}'
-
-        if task.interval_min is not None:
-            # Every N minutes: */N * * * *
-            entry = f"*/{task.interval_min} * * * * {cmd}"
+        if dry_run:
+            print(f"  [DRY RUN] schtasks /delete /tn {name} /f")
+            continue
+        r = run(["schtasks", "/delete", "/tn", name, "/f"])
+        if r.returncode == 0:
+            print(f"  Removed legacy task: {name}")
         else:
-            # Daily at HH:MM, or weekly when day_of_week is set
-            entry = f"{hhmm_to_cron(task.hhmm, task.day_of_week)} {cmd}"
+            print(f"  WARNING: could not remove {name}: {(r.stderr or '').strip()}")
+            remaining += 1
+    if not dry_run:
+        LEGACY_REGISTRY_FILE.unlink(missing_ok=True)   # stale pre-PR3 registry
+    return remaining
 
-        new_lines.append(f"# {task.label}")
-        new_lines.append(entry)
-        print(f"  Registered: {task.name}  ({task.label})")
 
-    new_lines.append("")  # trailing blank line
-    _write_crontab(lines + new_lines, dry_run)
-    return len(tasks) if not dry_run else 0
+# ── macOS launchd user agent ──────────────────────────────────────────────────
 
-# ── Summary printer ───────────────────────────────────────────────────────────
+def launchd_plist_path(label: str) -> Path:
+    return Path.home() / "Library" / "LaunchAgents" / f"{label}.plist"
 
-def print_summary(tasks: list, state: dict) -> None:
-    meds = state["meds"]
-    active = [m for m in meds if not m.get("paused")]
-    paused = [m for m in meds if m.get("paused")]
+def build_plist(label: str, python: str, dispatch: str, state_path,
+                tick_minutes: int) -> str:
+    args = "".join(f"    <string>{xml_escape(a)}</string>\n" for a in (
+        python, dispatch, "--state", str(Path(state_path).resolve()),
+        "tick", "--tick-minutes", str(tick_minutes)))
+    return f"""<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>{label}</string>
+  <key>ProgramArguments</key>
+  <array>
+{args}  </array>
+  <key>StartInterval</key>
+  <integer>{tick_minutes * 60}</integer>
+</dict>
+</plist>
+"""
 
-    print(f"\nMeds: {len(active)} active, {len(paused)} paused")
-    print(f"Tasks to register: {len(tasks)}")
-    print(f"  Global: digest + reset-deferred")
-    for med in active:
-        freq = med["schedule"]["frequency"]
-        count = 1 if freq in ("interval", "as_needed") else len(med["schedule"].get("times", [])) * 3
-        if freq == "as_needed":
-            count = 0
-        label = "interval (fire only)" if freq == "interval" else f"{count} tasks"
-        print(f"  {med['id']} ({med['name']}): {label}")
-    print()
+def register_launchd(h: str, state_path, tick_minutes: int, run=_run,
+                     dry_run: bool = False) -> bool:
+    label = launchd_label(h)
+    if dry_run:
+        print(f"  [DRY RUN] launchd agent {label} (StartInterval {tick_minutes * 60}s)")
+        return True
+    plist = launchd_plist_path(label)
+    plist.parent.mkdir(parents=True, exist_ok=True)
+    plist.write_text(build_plist(label, sys.executable, str(DISPATCH_FILE),
+                                 state_path, tick_minutes), encoding="utf-8")
+    run(["launchctl", "unload", str(plist)])           # reload if it was already loaded
+    r = run(["launchctl", "load", str(plist)])
+    if r.returncode != 0:
+        print(f"  launchctl load failed: {(r.stderr or '').strip()}")
+        return False
+    print(f"  Registered launchd agent {label} (StartInterval {tick_minutes * 60}s)")
+    return True
+
+def verify_launchd(h: str, run=_run) -> bool:
+    return run(["launchctl", "list", launchd_label(h)]).returncode == 0
+
+
+# ── Linux systemd user timer (opt-in: --scheduler systemd) ────────────────────
+
+def systemd_unit_dir() -> Path:
+    return Path.home() / ".config" / "systemd" / "user"
+
+def build_service(unit: str, python: str, dispatch: str, state_path,
+                  tick_minutes: int) -> str:
+    return f"""[Unit]
+Description=med-reminder tick ({unit})
+
+[Service]
+Type=oneshot
+ExecStart={python} {dispatch} --state {Path(state_path).resolve()} tick --tick-minutes {tick_minutes}
+"""
+
+def build_timer(unit: str, tick_minutes: int) -> str:
+    return f"""[Unit]
+Description=med-reminder tick timer ({unit})
+
+[Timer]
+OnCalendar=*:0/{tick_minutes}
+Persistent=true
+Unit={unit}.service
+
+[Install]
+WantedBy=timers.target
+"""
+
+def register_systemd(h: str, state_path, tick_minutes: int, run=_run,
+                     dry_run: bool = False) -> bool:
+    unit = systemd_unit(h)
+    if dry_run:
+        print(f"  [DRY RUN] systemctl --user enable --now {unit}.timer "
+              f"(OnCalendar=*:0/{tick_minutes})")
+        return True
+    d = systemd_unit_dir()
+    d.mkdir(parents=True, exist_ok=True)
+    (d / f"{unit}.service").write_text(
+        build_service(unit, sys.executable, str(DISPATCH_FILE), state_path, tick_minutes),
+        encoding="utf-8")
+    (d / f"{unit}.timer").write_text(build_timer(unit, tick_minutes), encoding="utf-8")
+    if run(["systemctl", "--user", "daemon-reload"]).returncode != 0:
+        print("  systemctl --user daemon-reload failed")
+        return False
+    r = run(["systemctl", "--user", "enable", "--now", f"{unit}.timer"])
+    if r.returncode != 0:
+        print(f"  systemctl enable failed: {(r.stderr or '').strip()}")
+        return False
+    print(f"  Registered systemd --user {unit}.timer (OnCalendar=*:0/{tick_minutes})")
+    return True
+
+def verify_systemd(h: str, run=_run) -> bool:
+    return run(["systemctl", "--user", "is-enabled",
+                f"{systemd_unit(h)}.timer"]).returncode == 0
+
+
+# ── Register-verify-remove + clear (issue #1 §5) ──────────────────────────────
+
+def migrate(h: str, state_path, tick_minutes: int, scheduler_hint: str = "cron",
+            run=_run, dry_run: bool = False) -> int:
+    """
+    Register the tick, query it back, and only then remove legacy jobs.
+    Any registration/verification failure leaves the legacy jobs in place,
+    prints REMINDERS ARE NOT SCHEDULED and returns exit code 1.
+    """
+    is_windows = sys.platform == "win32"
+    is_mac = sys.platform == "darwin"
+
+    if dry_run:
+        if is_windows:
+            register_windows(h, state_path, tick_minutes, run, dry_run=True)
+        elif is_mac:
+            register_launchd(h, state_path, tick_minutes, run, dry_run=True)
+        elif scheduler_hint == "systemd":
+            register_systemd(h, state_path, tick_minutes, run, dry_run=True)
+        else:
+            register_cron(h, state_path, tick_minutes, run, dry_run=True)
+        print("\nDry run complete. No changes made.")
+        return 0
+
+    scheduler = task = None
+
+    if is_windows:
+        if register_windows(h, state_path, tick_minutes, run) \
+                and verify_windows(h, run):
+            scheduler, task = "windows", tick_task_full_name(h)
+    elif is_mac:
+        # launchd first (cron can't get Full Disk Access on modern macOS);
+        # cron is the fallback when launchd won't register or verify.
+        if register_launchd(h, state_path, tick_minutes, run) \
+                and verify_launchd(h, run):
+            scheduler, task = "launchd", launchd_label(h)
+        else:
+            print("launchd unavailable — falling back to cron.")
+            if register_cron(h, state_path, tick_minutes, run) \
+                    and verify_cron(h, run):
+                scheduler, task = "cron", "crontab"
+    elif scheduler_hint == "systemd":
+        if register_systemd(h, state_path, tick_minutes, run) \
+                and verify_systemd(h, run):
+            scheduler, task = "systemd", systemd_unit(h)
+    else:
+        if register_cron(h, state_path, tick_minutes, run) \
+                and verify_cron(h, run):
+            scheduler, task = "cron", "crontab"
+
+    if scheduler is None:
+        print("\nREMINDERS ARE NOT SCHEDULED")
+        print("Registration or verification failed — legacy jobs were left in place.")
+        return 1
+
+    if is_windows:
+        outstanding = remove_legacy_windows(h, run)
+    else:
+        # legacy jobs were crontab per-dose entries on every Unix flavor
+        outstanding = remove_legacy_cron(h, state_path, run)
+
+    save_registry(h, {
+        "scheduler": scheduler,
+        "task": task,
+        "tick_minutes": tick_minutes,
+        "state": str(Path(state_path).resolve()),
+        "registered_utc": datetime.now(timezone.utc).isoformat(),
+    })
+
+    if outstanding == 0:
+        print(f"\nTick scheduled every {tick_minutes} min via {scheduler} "
+              f"(state: {state_path}).")
+        print("Legacy per-dose jobs removed.")
+    elif outstanding == -1:
+        print(f"\nTick scheduled every {tick_minutes} min via {scheduler} "
+              f"(state: {state_path}).")
+        print("WARNING: legacy jobs could not be scanned — run doctor.py.")
+    else:
+        print(f"\nTick scheduled every {tick_minutes} min via {scheduler} "
+              f"(state: {state_path}).")
+        print(f"WARNING: {outstanding} legacy job(s) could not be removed — "
+              "run doctor.py.")
+    return 0
+
+
+def _other_registered_windows_tasks(h: str) -> set:
+    """Tick task names registered by OTHER state files (their registries)."""
+    out = set()
+    for p in SCRIPT_DIR.glob(".registered-tasks.*.json"):
+        if p.name == registry_file(h).name:
+            continue
+        try:
+            entry = json.loads(p.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        if entry.get("scheduler") == "windows" and entry.get("task"):
+            out.add(entry["task"])
+    return out
+
+def clear(h: str, state_path, run=_run, dry_run: bool = False) -> int:
+    """Remove this state's tick and every legacy job. Other state files'
+    ticks (found via their registries) are left alone."""
+    if sys.platform == "win32":
+        names = list_medreminder_tasks(run)
+        if names is not None:
+            protected = _other_registered_windows_tasks(h)
+            for name in names:
+                if name in protected:
+                    continue
+                if dry_run:
+                    print(f"  [DRY RUN] schtasks /delete /tn {name} /f")
+                    continue
+                if run(["schtasks", "/delete", "/tn", name, "/f"]).returncode == 0:
+                    print(f"  Removed: {name}")
+                else:
+                    print(f"  WARNING: could not remove {name}")
+    else:
+        lines = read_crontab(run)
+        if lines is None:
+            print("WARNING: crontab unreadable — cron entries left as-is.")
+        else:
+            cleaned = strip_crontab(lines, state_path, h)
+            if dry_run or write_crontab(cleaned, run):
+                if dry_run:
+                    print("  [DRY RUN] crontab: MedReminder lines removed")
+                else:
+                    print("Removed MedReminder crontab lines.")
+        # launchd / systemd registration (macOS / Linux opt-in)
+        label, unit = launchd_label(h), systemd_unit(h)
+        if not dry_run:
+            run(["launchctl", "unload", str(launchd_plist_path(label))])
+            launchd_plist_path(label).unlink(missing_ok=True)
+            run(["systemctl", "--user", "disable", "--now", f"{unit}.timer"])
+            (systemd_unit_dir() / f"{unit}.timer").unlink(missing_ok=True)
+            (systemd_unit_dir() / f"{unit}.service").unlink(missing_ok=True)
+    if not dry_run:
+        registry_file(h).unlink(missing_ok=True)
+        LEGACY_REGISTRY_FILE.unlink(missing_ok=True)   # stale pre-PR3 registry
+        print("MedReminder scheduling cleared.")
+    return 0
+
 
 # ── Entry point ───────────────────────────────────────────────────────────────
 
-def main() -> None:
+def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Register med reminder tasks in Task Scheduler or crontab.",
+        description="Register the med reminder tick task (one entry per state file).",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__,
     )
+    parser.add_argument("--tick-minutes", type=int, default=TICK_MINUTES_DEFAULT,
+                        metavar="N",
+                        help="tick cadence in minutes (default 5; 1-59, cron "
+                             "minute-field limit)")
+    parser.add_argument("--scheduler", choices=("cron", "systemd"), default="cron",
+                        help="Linux scheduler: cron (default) or a systemd user "
+                             "timer. Ignored on Windows/macOS.")
     parser.add_argument("--dry-run", action="store_true",
                         help="Show what would be registered without making changes")
     parser.add_argument("--clear", action="store_true",
-                        help="Remove all MedReminder tasks and exit")
+                        help="Remove this state's tick and all legacy jobs, then exit")
     args = parser.parse_args()
 
+    if not 1 <= args.tick_minutes <= 59:
+        sys.exit("--tick-minutes must be 1-59 (cron minute-field limit)")
     if not STATE_FILE.exists():
-        sys.exit(
-            f"State file not found: {STATE_FILE}\n"
-            "Run: cp meds-state.template.json meds-state.json"
-        )
+        sys.exit(f"State file not found: {STATE_FILE}\n"
+                 "Run: cp meds-state.template.json meds-state.json")
     if not DISPATCH_FILE.exists():
         sys.exit(f"dispatch.py not found: {DISPATCH_FILE}")
 
-    is_windows = sys.platform == "win32"
-    state = load_state()
-    tasks = build_tasks(state)
+    h = state_hash(STATE_FILE)
 
     if args.clear:
-        print(f"Clearing MedReminder tasks ({'dry run' if args.dry_run else 'live'})...")
-        if is_windows:
-            clear_windows(args.dry_run)
-        else:
-            clear_unix(args.dry_run)
-        return
-
-    print_summary(tasks, state)
-
-    # Initialize next_due for fresh meds (writes state if changed)
-    print("Checking next_due initialization...")
-    init_next_due(state, args.dry_run)
-
-    # Clear existing tasks before re-registering
-    print(f"\nClearing existing MedReminder tasks...")
-    if is_windows:
-        clear_windows(args.dry_run)
-    else:
-        clear_unix(args.dry_run)
-
-    print(f"\nRegistering {len(tasks)} tasks ({'dry run' if args.dry_run else 'live'})...")
-    if is_windows:
-        registered = register_windows(tasks, args.dry_run)
-    else:
-        registered = register_unix(tasks, args.dry_run)
-
-    if args.dry_run:
-        print("\nDry run complete. No changes made.")
-    else:
-        print(f"\nDone. {registered}/{len(tasks)} tasks registered.")
-        print("Verify in Task Scheduler: start → 'Task Scheduler' → Task Scheduler Library → MedReminder")
+        return clear(h, STATE_FILE, dry_run=args.dry_run)
+    return migrate(h, STATE_FILE, args.tick_minutes, args.scheduler,
+                   dry_run=args.dry_run)
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

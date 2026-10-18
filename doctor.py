@@ -6,7 +6,8 @@ Verifies the pieces that fail silently at 3am:
   - state file exists and passes validation
   - timezone database is importable (Windows needs `pip install tzdata`)
   - a message sender is wired up (send-message.sh or MEDS_SEND_CMD)
-  - the expected scheduler tasks actually exist (and none are stale)
+  - the tick task is registered and no legacy per-dose job survives
+    (issue #1 §5 — legacy jobs would double-fire; the tick owns all logic)
 
 Usage:
     python doctor.py               # run all checks, exit 0 healthy / 1 on FAIL
@@ -31,8 +32,6 @@ for _stream in (sys.stdout, sys.stderr):
 
 SCRIPT_DIR = Path(__file__).parent.resolve()
 STATE_FILE = Path(os.environ.get("MEDS_STATE_FILE", SCRIPT_DIR / "meds-state.json"))
-REGISTRY_FILE = SCRIPT_DIR / ".registered-tasks.json"
-TASK_FOLDER = "MedReminder"
 
 sys.path.insert(0, str(SCRIPT_DIR))
 import safe_write
@@ -46,6 +45,11 @@ def load_setup_tasks():
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
     return mod
+
+
+def _run(cmd, **kw):
+    """Single seam for OS scheduler commands — tests mock this, never the OS."""
+    return subprocess.run(cmd, capture_output=True, text=True, **kw)
 
 
 results = []  # (level, message) — level: ok | warn | fail
@@ -119,42 +123,61 @@ def check_sender() -> bool:
     return False
 
 
-def check_tasks(state: dict) -> None:
-    if not state:
-        return
+def check_scheduler() -> None:
+    """Tick registered + no legacy job left over (issue #1 §5)."""
     setup = load_setup_tasks()
-    expected = {t.name for t in setup.build_tasks(state)}
-    registered = []
-    if REGISTRY_FILE.exists():
-        try:
-            registered = json.loads(REGISTRY_FILE.read_text(encoding="utf-8"))
-        except ValueError:
-            warn("registry file unreadable — re-run setup-tasks.py")
+    h = setup.state_hash(STATE_FILE)
+    reg = setup.load_registry(h)
+    scheduler = reg.get("scheduler")
+    if not scheduler:
+        scheduler = ("windows" if sys.platform == "win32"
+                     else "launchd" if sys.platform == "darwin"
+                     else "cron")
 
-    if sys.platform == "win32":
-        missing = [n for n in expected if not _task_exists(n)]
-        if missing:
-            warn(f"{len(missing)} expected task(s) missing from Task Scheduler "
-                 f"({', '.join(sorted(missing)[:3])}...) — run: python setup-tasks.py")
-        elif expected:
-            ok(f"all {len(expected)} expected task(s) registered")
-        stale = [n for n in registered if n not in expected]
-        if stale:
-            warn(f"{len(stale)} stale task(s) from a previous config — "
-                 "re-run setup-tasks.py to clean up")
-    else:
-        r = subprocess.run(["crontab", "-l"], capture_output=True, text=True)
-        if r.returncode == 0 and "# MedReminder" in r.stdout:
-            ok("crontab block present")
+    if scheduler == "windows":
+        if setup.verify_windows(h, run=_run):
+            ok(f"tick task registered ({setup.tick_task_full_name(h)})")
         else:
-            warn("no MedReminder block in crontab — run: python setup-tasks.py")
+            fail("tick task missing — run: python setup-tasks.py")
+        names = setup.list_medreminder_tasks(run=_run)
+        if names is None:
+            warn("could not enumerate \\MedReminder\\ — check Task Scheduler manually")
+        else:
+            legacy = [n for n in names if n != setup.tick_task_full_name(h)]
+            if legacy:
+                fail(f"{len(legacy)} legacy task(s) present "
+                     f"({', '.join(sorted(legacy)[:3])}) — re-run: python setup-tasks.py")
+            else:
+                ok("no legacy scheduled tasks")
+    else:
+        if scheduler == "launchd":
+            if setup.verify_launchd(h, run=_run):
+                ok(f"launchd tick registered ({setup.launchd_label(h)})")
+            else:
+                fail("launchd tick missing — run: python setup-tasks.py")
+        elif scheduler == "systemd":
+            if setup.verify_systemd(h, run=_run):
+                ok(f"systemd tick timer enabled ({setup.systemd_unit(h)}.timer)")
+            else:
+                fail("systemd tick timer missing — "
+                     "run: python setup-tasks.py --scheduler systemd")
+        else:
+            if setup.verify_cron(h, run=_run):
+                ok("crontab tick block present")
+            else:
+                fail("crontab tick block missing — run: python setup-tasks.py")
 
-
-def _task_exists(name: str) -> bool:
-    r = subprocess.run(
-        ["schtasks", "/query", "/tn", f"\\{TASK_FOLDER}\\{name}"],
-        capture_output=True, text=True)
-    return r.returncode == 0
+        # legacy jobs were crontab per-dose entries on every Unix flavor
+        lines = setup.read_crontab(run=_run)
+        if lines is None:
+            warn("crontab unreadable — check legacy entries manually")
+        else:
+            legacy = setup.find_legacy_cron(lines, STATE_FILE, h)
+            if legacy:
+                fail(f"{len(legacy)} legacy crontab line(s) present — "
+                     "re-run: python setup-tasks.py")
+            else:
+                ok("no legacy crontab lines")
 
 
 def send_test() -> None:
@@ -179,7 +202,7 @@ def main() -> None:
     check_runtime()
     state = check_state()
     sender_ok = check_sender()
-    check_tasks(state)
+    check_scheduler()
     if args.send_test and sender_ok:
         send_test()
 
