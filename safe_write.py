@@ -81,18 +81,90 @@ def history_file() -> Path:
 
 # ── Logging ────────────────────────────────────────────────────────────────────
 
+def utc_formatter(tag: str) -> logging.Formatter:
+    """
+    Per-handler formatter whose converter is gmtime, so the trailing Z is
+    true UTC (issue #1 §7). The class-wide logging.Formatter.converter is
+    never touched — other libraries' handlers keep their own convention.
+    """
+    fmt = logging.Formatter(
+        f"%(asctime)s [{tag}] %(levelname)s %(message)s",
+        datefmt="%Y-%m-%dT%H:%M:%SZ",
+    )
+    fmt.converter = time.gmtime
+    return fmt
+
+
+def _redaction_source() -> dict:
+    """Best-effort state read for logging config — redaction must never crash a run."""
+    try:
+        data = json.loads(STATE_FILE.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def redaction_enabled() -> bool:
+    """MEDS_LOG_REDACT=1 or global.log_redact (issue #1 §7)."""
+    if os.environ.get("MEDS_LOG_REDACT") == "1":
+        return True
+    return bool(_redaction_source().get("global", {}).get("log_redact"))
+
+
+def _name_map() -> dict:
+    """med name → med id, for redacting names out of logs."""
+    out = {}
+    for med in _redaction_source().get("meds", []):
+        if isinstance(med, dict) and med.get("name") and med.get("id"):
+            out[med["name"]] = med["id"]
+    return out
+
+
+class RedactFilter(logging.Filter):
+    """
+    Rewrite rendered records with med ids in place of med names (issue #1 §7).
+    Attached per handler, so sender stderr reaching a log.warning is redacted
+    the same as any other message.
+    """
+
+    def __init__(self):
+        super().__init__()
+        self._names = _name_map()
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        if self._names:
+            msg = record.getMessage()
+            if any(n in msg for n in self._names):
+                for name, mid in self._names.items():
+                    msg = msg.replace(name, mid)
+                record.msg = msg
+                record.args = None
+        return True
+
+
+def configure_root_logging(tag: str, log_path: Path, level: int,
+                           stream=None) -> None:
+    """
+    Root logging with true-UTC formatters on every handler and optional
+    redaction. Shared by dispatch.py, reply.py and this module's CLI, so
+    their Z timestamps all mean UTC (issue #1 §7).
+    """
+    redact = redaction_enabled()
+    handlers = [
+        logging.FileHandler(log_path, encoding="utf-8"),
+        logging.StreamHandler(stream if stream is not None else sys.stdout),
+    ]
+    for h in handlers:
+        h.setFormatter(utc_formatter(tag))
+        if redact:
+            h.addFilter(RedactFilter())
+    logging.basicConfig(level=level, handlers=handlers)
+
+
 def _setup_logging() -> None:
     if log.handlers:
         return
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s [safe_write] %(levelname)s %(message)s",
-        datefmt="%Y-%m-%dT%H:%M:%SZ",
-        handlers=[
-            logging.FileHandler(LOG_FILE, encoding="utf-8"),
-            logging.StreamHandler(sys.stdout),
-        ],
-    )
+    configure_root_logging("safe_write", LOG_FILE, logging.INFO)
 
 # ── Validation (mirrors safe-write.sh inline Python) ──────────────────────────
 
@@ -146,6 +218,10 @@ def validate(state: dict) -> None:
 
     if not _HHMM.match(g["digest_time"] or ""):
         _die(f"global.digest_time must be HH:MM (24h, zero-padded)")
+
+    # Optional privacy switch (issue #1 §7): logs use med ids only
+    if not isinstance(g.get("log_redact", False), bool):
+        _die("global.log_redact must be a boolean (optional)")
 
     # Optional tick-engine bookkeeping (issue #1): watermark set by the migration
     tick = state.get("tick")
