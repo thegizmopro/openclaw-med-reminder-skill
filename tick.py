@@ -795,6 +795,11 @@ def _daily_messages(plan: Plan, state: dict, ev, idx, tz):
         key = f"digest#{today.isoformat()}"
         listed = [m for m in state.get("meds", []) if not m.get("paused")]
         if not _sent_for(idx, key, "digest") and listed:
+            # Record the listing order for --position replies (issue #1 §6):
+            # "the 2nd one" resolves against today's digest, never an older
+            # one (reply._resolve_target refuses a stale last_digest_date).
+            g["last_digest_order"] = [m["id"] for m in listed]
+            g["last_digest_date"] = today.isoformat()
             plan_send(plan, idx, GLOBAL_MED_ID,
                       Occurrence(utc=digest_due, key=key, tz=tz), 0,
                       "digest", digest_text(state, ev, tz, now))

@@ -270,6 +270,7 @@ def handle_confirm(med_id: str, dose_taken: Optional[str], dry_run: bool,
     tz = get_tz(state)
     now = clock.now_utc()
     med = _resolve_target(state, med_id, position, tz, now)
+    med_id = med["id"]                     # --position resolves to the real id
 
     if med.get("paused"):
         log.info("SKIP [confirm] %s — med is paused", med_id)
@@ -802,7 +803,339 @@ def handle_unpause(med_id: str, dry_run: bool, clock: Optional[Clock] = None,
     log.info("UNPAUSE [%s]", med["id"])
 
 
+# ── Edit-time quiet-hours checks (issue #1 §6, AC 27) ─────────────────────────
+#
+# validate() never rejects quiet-hours conflicts (AC 26 — existing state
+# must always load); add-med/edit-med/set-quiet-hours are where they're
+# refused. The boundary mirrors the engine: a nudge in the FIRST 30 min of
+# quiet hours still sends (AC 28), so only the muted part rejects.
+
+def _hhmm_mins(hhmm: str) -> int:
+    h, m = map(int, hhmm.split(":"))
+    return h * 60 + m
+
+
+def _mins_hhmm(mins: int) -> str:
+    return f"{(mins // 60) % 24:02d}:{mins % 60:02d}"
+
+
+def _in_quiet_window(t: int, quiet: dict) -> bool:
+    start, end = _hhmm_mins(quiet["start"]), _hhmm_mins(quiet["end"])
+    if start <= end:
+        return start <= t < end
+    return t >= start or t < end          # midnight-spanning
+
+
+def _in_muted_quiet(t: int, quiet: dict) -> bool:
+    """Inside quiet hours past the 30-min head — where nudges are muted."""
+    return _in_quiet_window(t, quiet) and ((t - _hhmm_mins(quiet["start"])) % 1440) >= 30
+
+
+def quiet_conflicts(med: dict, quiet: dict) -> list:
+    """
+    Edit-time conflicts for one med against a quiet window: a dose time
+    inside quiet hours, or a T+late nudge inside the muted part (with a
+    suggested fix). Interval/as-needed meds fire around the clock — their
+    optional quiet_policy field governs them, not this check.
+    """
+    sched = med.get("schedule") or {}
+    if sched.get("frequency") in ("interval", "as_needed"):
+        return []
+    late = (med.get("escalation") or {}).get("late_threshold_minutes")
+    out = []
+    for t in sched.get("times") or []:
+        tm = _hhmm_mins(t)
+        if _in_quiet_window(tm, quiet):
+            out.append(
+                f"{med.get('name')}: dose at {t} is inside quiet hours "
+                f"({quiet['start']}–{quiet['end']}) — move the dose before "
+                f"{quiet['start']} or adjust quiet hours")
+        if late is None:
+            continue
+        nudge = (tm + late) % 1440
+        if _in_muted_quiet(nudge, quiet):
+            out.append(
+                f"{med.get('name')}: the late nudge at {_mins_hhmm(nudge)} "
+                f"(T+{late}m after {t}) would be muted by quiet hours — move "
+                "the dose earlier, lower late_threshold_minutes, or start "
+                f"quiet hours from {_mins_hhmm(nudge)}")
+    return out
+
+
+def _reject_quiet_conflicts(conflicts: list) -> None:
+    if not conflicts:
+        return
+    for c in conflicts:
+        print(f"Error: {c}.")
+    raise SystemExit(EXIT_BAD_OPTION)
+
+
+def _parse_med_json(json_text: str) -> dict:
+    try:
+        med = json.loads(json_text)
+    except json.JSONDecodeError as e:
+        print(f"Error: invalid JSON for the med: {e}")
+        raise SystemExit(EXIT_BAD_OPTION)
+    if not isinstance(med, dict):
+        print("Error: expected one JSON med object.")
+        raise SystemExit(EXIT_BAD_OPTION)
+    return med
+
+
+def _validated_candidate(state: dict, meds: list) -> None:
+    """Validate a candidate state (raises ValueError) with a friendly exit."""
+    candidate = dict(state)
+    candidate["meds"] = meds
+    try:
+        _safe_write_mod.validate(candidate)
+    except ValueError as e:
+        print(f"Error: the med didn't validate: {e}")
+        raise SystemExit(EXIT_BAD_OPTION)
+
+
+def _next_med_id(state: dict) -> str:
+    nums = []
+    for m in state["meds"]:
+        try:
+            nums.append(int(m["id"].split("-", 1)[1]))
+        except (ValueError, IndexError, KeyError):
+            continue
+    return f"med-{(max(nums) + 1) if nums else 1:03d}"
+
+
+# Keys whose change re-anchors tracking (issue §3: active_since is set on a
+# schedule edit or a dose-time edit; renaming a med must not swallow pending
+# nudges).
+_SCHEDULE_KEYS = ("frequency", "times", "interval_hours", "day_of_week")
+
+
+def handle_add_med(json_text: str, dry_run: bool,
+                   clock: Optional[Clock] = None) -> None:
+    """
+    Add a med from a JSON object (stdin): validate, refuse quiet-hours
+    conflicts, set active_since_utc = now (nothing earlier is enumerated,
+    so a new med starts with no phantom misses).
+    """
+    clock = clock or get_clock()
+    now = clock.now_utc()
+    med = _parse_med_json(json_text)
+    state = load_state()
+
+    med.setdefault("state", {"status": "pending", "last_taken": None,
+                             "last_reminded": None, "next_due": None,
+                             "missed_count": 0, "history": []})
+    if med.get("id"):
+        if any(m["id"] == med["id"] for m in state["meds"]):
+            print(f"Error: a med with id {med['id']} already exists.")
+            raise SystemExit(EXIT_BAD_OPTION)
+    else:
+        med["id"] = _next_med_id(state)
+
+    _reject_quiet_conflicts(quiet_conflicts(med, state["global"]["quiet_hours"]))
+    med["active_since_utc"] = now.isoformat()
+    _validated_candidate(state, state["meds"] + [med])
+
+    if dry_run:
+        print(f"[DRY RUN] Would add {med.get('name')} ({med['id']}) — "
+              "tracking starts from now.")
+        return
+
+    outcome = {}
+
+    def fn(state_copy, history_view):
+        if any(m["id"] == med["id"] for m in state_copy["meds"]):
+            outcome["conflict"] = True
+            return state_copy, []
+        state_copy["meds"].append(copy.deepcopy(med))
+        _safe_write_mod.validate(state_copy)
+        return state_copy, []
+
+    _safe_write_mod.transact(fn, clock=clock)
+
+    if outcome.get("conflict"):
+        print(f"Error: a med with id {med['id']} was just added — re-run with "
+              "a different id.")
+        raise SystemExit(EXIT_BAD_OPTION)
+    print(f"Added {med['name']} ({med['id']}) — tracking starts now; earlier "
+          "doses aren't counted.")
+    log.info("ADD-MED [%s] %s", med["id"], med["name"])
+
+
+def handle_edit_med(med_id: str, json_text: str, dry_run: bool,
+                    clock: Optional[Clock] = None,
+                    position: Optional[int] = None) -> None:
+    """
+    Edit a med from a JSON object (stdin). The existing runtime `state`
+    block is preserved (the agent edits the prescription, never state),
+    unknown optional fields pass through, and a schedule change re-anchors
+    tracking via active_since_utc.
+    """
+    clock = clock or get_clock()
+    state = load_state()
+    tz = get_tz(state)
+    now = clock.now_utc()
+    med = _resolve_target(state, med_id, position, tz, now)
+    incoming = _parse_med_json(json_text)
+
+    if incoming.get("id") not in (None, med["id"]):
+        print(f"Error: edit-med targets {med['id']} but the JSON describes "
+              f"{incoming['id']}.")
+        raise SystemExit(EXIT_BAD_OPTION)
+
+    merged = dict(med)
+    merged.update(incoming)
+    merged["id"] = med["id"]
+    merged["state"] = med["state"]        # runtime state is never agent-writable
+
+    _reject_quiet_conflicts(quiet_conflicts(merged, state["global"]["quiet_hours"]))
+    _validated_candidate(
+        state, [merged if m["id"] == med["id"] else m for m in state["meds"]])
+
+    schedule_changed = any(
+        (med["schedule"].get(k) != merged["schedule"].get(k)) for k in _SCHEDULE_KEYS)
+
+    if dry_run:
+        print(f"[DRY RUN] Would update {merged.get('name')} ({med['id']}).")
+        return
+
+    def fn(state_copy, history_view):
+        med_c = _find_med(state_copy, med["id"])
+        if med_c is None:
+            raise ValueError(f"med {med['id']} disappeared mid-edit")
+        merged_c = copy.deepcopy(merged)
+        if schedule_changed:
+            merged_c["active_since_utc"] = now.isoformat()
+        med_c.clear()                    # keep the object identity in meds[]
+        med_c.update(merged_c)
+        _safe_write_mod.validate(state_copy)
+        return state_copy, []
+
+    _safe_write_mod.transact(fn, clock=clock)
+    note = " Schedule changed — tracking restarts from now." if schedule_changed else ""
+    print(f"Updated {merged['name']} ({med['id']}).{note}")
+    log.info("EDIT-MED [%s] %s", med["id"], merged["name"])
+
+
+def handle_set_quiet_hours(start: str, end: str, dry_run: bool,
+                           clock: Optional[Clock] = None) -> None:
+    """Change quiet hours after checking every med against the new window."""
+    clock = clock or get_clock()
+    for label, value in (("start", start), ("end", end)):
+        if not _HHMM_RE.match(value or ""):
+            print(f"Error: quiet-hours {label} must be HH:MM (got '{value}').")
+            raise SystemExit(EXIT_BAD_OPTION)
+
+    state = load_state()
+    new_quiet = {"start": start, "end": end}
+    _reject_quiet_conflicts(
+        [c for m in state["meds"] for c in quiet_conflicts(m, new_quiet)])
+
+    if dry_run:
+        print(f"[DRY RUN] Would set quiet hours to {start}–{end}.")
+        return
+
+    def fn(state_copy, history_view):
+        state_copy["global"]["quiet_hours"] = {"start": start, "end": end}
+        return state_copy, []
+
+    _safe_write_mod.transact(fn, clock=clock)
+    print(f"Quiet hours set to {start}–{end}.")
+    log.info("SET-QUIET-HOURS %s-%s", start, end)
+
+
+# ── Remove / status / show-state (issue #1 §6) ─────────────────────────────────
+
+def handle_remove(med_id: str, yes: bool, dry_run: bool,
+                  clock: Optional[Clock] = None,
+                  position: Optional[int] = None) -> None:
+    """Remove a med from state. History lines remain in history.jsonl."""
+    clock = clock or get_clock()
+    state = load_state()
+    tz = get_tz(state)
+    now = clock.now_utc()
+    med = _resolve_target(state, med_id, position, tz, now)
+
+    if not yes:
+        print(f"Refusing to remove {med['name']} — rerun with --yes to confirm.")
+        raise SystemExit(EXIT_BAD_OPTION)
+
+    if dry_run:
+        print(f"[DRY RUN] Would remove {med['name']} ({med['id']}).")
+        return
+
+    def fn(state_copy, history_view):
+        state_copy["meds"] = [m for m in state_copy["meds"] if m["id"] != med["id"]]
+        return state_copy, []
+
+    _safe_write_mod.transact(fn, clock=clock)
+    print(f"Removed {med['name']} ({med['id']}). Its history lines remain in "
+          "history.jsonl.")
+    log.info("REMOVE [%s] %s", med["id"], med["name"])
+
+
+def _last_dose_event(history, med_id: str) -> Optional[dict]:
+    best, best_ts = None, None
+    for e in history:
+        if e.get("med_id") != med_id or e.get("event") not in ("taken", "skipped", "missed"):
+            continue
+        ts = parse_instant(e["ts_utc"])
+        if best_ts is None or ts > best_ts:
+            best, best_ts = e, ts
+    return best
+
+
+def handle_status() -> None:
+    """Read-only summary for the agent to relay (issue #1 §6)."""
+    state = load_state()
+    tz = get_tz(state)
+    g = state["global"]
+    quiet = g["quiet_hours"]
+    print(f"{len(state['meds'])} med(s) | timezone {g['timezone']} | quiet hours "
+          f"{quiet['start']}–{quiet['end']} | digest {g['digest_time']}")
+    if g.get("paused"):
+        print("ALL REMINDERS PAUSED (global).")
+    history = _event_store_mod.load_events(_safe_write_mod.history_file())
+    for i, med in enumerate(state["meds"], 1):
+        sched = med["schedule"]
+        freq = sched["frequency"]
+        if freq == "interval":
+            when = f"every {sched['interval_hours']}h"
+        elif freq == "as_needed":
+            when = "as needed"
+        else:
+            day = (f"{sched['day_of_week'].title()} "
+                   if freq == "weekly" and sched.get("day_of_week") else "")
+            when = day + ", ".join(_dispatch_mod.fmt_12h(t) for t in sched["times"])
+        line = f"{i}. {med['name']} {med['dose']}{med['unit']} — {when}"
+        if med.get("paused"):
+            line += " [paused]"
+        last = _last_dose_event(history, med["id"])
+        if last is not None:
+            at = parse_instant(last["ts_utc"]).astimezone(tz)
+            line += f" | last: {last['event']} {_fmt_12h(at)}"
+        nd = med["state"].get("next_due")
+        if nd:
+            nd_local = parse_instant(nd).astimezone(tz)
+            line += f" | next due: {nd_local:%a} {_fmt_12h(nd_local)}"
+        print(line)
+    if not state["meds"]:
+        print("No meds yet — add one with: reply.py add-med --json -")
+
+
+def handle_show_state() -> None:
+    """Print the state file's sha256 — the token CLI writers must pass."""
+    load_state()
+    print(_safe_write_mod.state_token()[1])
+
+
 # ── CLI ────────────────────────────────────────────────────────────────────────
+
+def _read_json_input(src: str) -> str:
+    """'-' (or None) reads stdin; anything else is a path."""
+    if src in (None, "-"):
+        return sys.stdin.read()
+    return Path(src).read_text(encoding="utf-8")
+
 
 def main() -> None:
     _safe_write_mod.apply_process_umask()   # issue #1 §2: private files, before any are created
@@ -874,6 +1207,37 @@ def main() -> None:
         p.add_argument("--position", type=int, default=None, metavar="N",
                        help="Pick the Nth med from today's digest order (1-based)")
 
+    p_add = sub.add_parser("add-med", help="Add a med from a JSON object on stdin")
+    p_add.add_argument("--json", action="store_true",
+                       help="Read the med's JSON from stdin ('-' or a path)")
+    p_add.add_argument("json_src", nargs="?", default="-", metavar="-|PATH",
+                       help="'-' (stdin, default) or a path to the JSON file")
+
+    p_edit = sub.add_parser("edit-med", help="Edit a med from a JSON object on stdin")
+    p_edit.add_argument("med_id", nargs="?", default=None,
+                        help="Med ID, e.g. med-001 (or use --position)")
+    p_edit.add_argument("--position", type=int, default=None, metavar="N",
+                        help="Pick the Nth med from today's digest order (1-based)")
+    p_edit.add_argument("--json", action="store_true",
+                        help="Read the med's JSON from stdin ('-' or a path)")
+    p_edit.add_argument("json_src", nargs="?", default="-", metavar="-|PATH",
+                        help="'-' (stdin, default) or a path to the JSON file")
+
+    p_quiet = sub.add_parser("set-quiet-hours", help="Set the quiet-hours window")
+    p_quiet.add_argument("start", metavar="HH:MM", help="Quiet hours start")
+    p_quiet.add_argument("end", metavar="HH:MM", help="Quiet hours end")
+
+    p_remove = sub.add_parser("remove", help="Remove a med (history lines remain)")
+    p_remove.add_argument("med_id", nargs="?", default=None,
+                          help="Med ID, e.g. med-001 (or use --position)")
+    p_remove.add_argument("--position", type=int, default=None, metavar="N",
+                          help="Pick the Nth med from today's digest order (1-based)")
+    p_remove.add_argument("--yes", action="store_true",
+                          help="Confirm the removal")
+
+    sub.add_parser("status", help="Read-only summary of all meds")
+    sub.add_parser("show-state", help="Print the state sha256 for CLI writers")
+
     args = parser.parse_args()
     setup_logging(args.dry_run)
 
@@ -917,6 +1281,23 @@ def main() -> None:
         if not args.med_id and args.position is None:
             parser.error("unpause requires a med_id or --position")
         handle_unpause(args.med_id, args.dry_run, position=args.position)
+    elif args.mode == "add-med":
+        handle_add_med(_read_json_input(args.json_src), args.dry_run)
+    elif args.mode == "edit-med":
+        if not args.med_id and args.position is None:
+            parser.error("edit-med requires a med_id or --position")
+        handle_edit_med(args.med_id, _read_json_input(args.json_src), args.dry_run,
+                        position=args.position)
+    elif args.mode == "set-quiet-hours":
+        handle_set_quiet_hours(args.start, args.end, args.dry_run)
+    elif args.mode == "remove":
+        if not args.med_id and args.position is None:
+            parser.error("remove requires a med_id or --position")
+        handle_remove(args.med_id, args.yes, args.dry_run, position=args.position)
+    elif args.mode == "status":
+        handle_status()
+    elif args.mode == "show-state":
+        handle_show_state()
 
 
 if __name__ == "__main__":
