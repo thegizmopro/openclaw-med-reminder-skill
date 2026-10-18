@@ -8,10 +8,23 @@ Separate from dispatch.py (the scheduler) because these have different:
   - call patterns: invoked by the AI, not by a scheduler
   - retry semantics: agent can re-invoke; scheduler uses advisory skip
 
-Subcommands:
+Subcommands (issue #1 §6 — all writes go through transact):
     confirm <med-id>           Mark one med as taken (prescribed dose)
     confirm --all              Mark all scheduled, non-paused meds as taken
-    defer   <med-id>           Defer one med until next digest cycle
+    skip <med-id>              Skip a dose (past/current, or --dose HH:MM)
+    snooze <med-id>            Push the pending dose's reminder later
+    defer   <med-id>           Deprecated alias for snooze
+    undo <med-id>              Undo the most recent taken/skipped (24h)
+    pause/unpause <med-id>     Stop or resume reminders for one med
+    add-med --json -           Add a med from a JSON object on stdin
+    edit-med <med-id> --json - Edit a med from a JSON object on stdin
+    set-quiet-hours HH:MM HH:MM
+    remove <med-id> --yes      Remove a med (history lines remain)
+    status                     Read-only summary
+    show-state                 Print the state sha256 for CLI writers
+
+Any id-taking command accepts --position N instead of a med id: it picks
+the Nth med from today's digest order (global.last_digest_order).
 
 Options:
     --dose-taken TEXT          Actual dose if different from prescribed (confirm only)
@@ -30,8 +43,11 @@ Environment:
 """
 
 import argparse
+import copy
+import json
 import logging
 import os
+import re
 import sys
 from pathlib import Path
 
@@ -49,15 +65,14 @@ sys.path.insert(0, str(SCRIPT_DIR))
 # Import shared helpers from dispatch — no scheduler-side code brought in
 import dispatch as _dispatch_mod
 import event_store as _event_store_mod
+import occurrence as _occurrence_mod
 import safe_write as _safe_write_mod
 from clock import Clock, get_clock, parse_instant
 from dispatch import (
-    append_history,
     compute_next_due,
     find_med,
     get_tz,
     load_state,
-    save_state,
 )
 from attribution import (
     ALL_AFTER_DIGEST_WINDOW,
@@ -68,9 +83,11 @@ from attribution import (
     last_taken_before,
     min_gap,
     nearest_dose_occurrence,
+    outcome_for,
     resolve_taken_at,
 )
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
+from occurrence import Occurrence
 from secrets import token_hex
 from typing import Optional
 from zoneinfo import ZoneInfo
@@ -84,6 +101,19 @@ EXIT_BAD_OPTION = 2
 
 # A printed duplicate-override nonce is valid for this long (issue §4).
 NONCE_TTL = timedelta(minutes=10)
+
+# Snooze bounds (issue #1 §6): default 30 minutes, allowed 5–240, and never
+# more than half the gap to the next occurrence. `defer` is the deprecated
+# alias capped at min(120, half-gap).
+SNOOZE_DEFAULT = 30
+SNOOZE_MIN = 5
+SNOOZE_MAX = 240
+DEFER_MINUTES = 120
+
+# Undo only reaches the most recent taken/skipped, within 24h (issue §6).
+UNDO_WINDOW = timedelta(hours=24)
+
+_HHMM_RE = re.compile(r"^([01][0-9]|2[0-3]):[0-5][0-9]$")
 
 
 def setup_logging(dry_run: bool) -> None:
@@ -105,6 +135,37 @@ def _taken_instant(event: dict) -> datetime:
 
 def _find_med(state: dict, med_id: str) -> Optional[dict]:
     return next((m for m in state["meds"] if m["id"] == med_id), None)
+
+
+def _resolve_target(state: dict, med_id: Optional[str], position: Optional[int],
+                    tz, now: datetime) -> dict:
+    """
+    The med a reply targets: by id, or --position N into today's recorded
+    digest order (issue #1 §6). A previous day's order is refused — the
+    listing may have changed — and a position reply echoes the resolved
+    name so the user can catch a mismatch.
+    """
+    if position is not None:
+        if med_id is not None:
+            print("Error: pass either a med id or --position, not both.")
+            raise SystemExit(EXIT_BAD_OPTION)
+        g = state["global"]
+        order = g.get("last_digest_order") or []
+        recorded = g.get("last_digest_date")
+        today = now.astimezone(tz).date().isoformat()
+        if recorded != today:
+            print(f"Error: no digest order for today (last recorded "
+                  f"{recorded or 'never'}) — use the med's name or id.")
+            raise SystemExit(EXIT_BAD_OPTION)
+        if not 1 <= position <= len(order):
+            print(f"Error: --position must be 1–{len(order)} (today's digest "
+                  f"listed {len(order)} med(s)).")
+            raise SystemExit(EXIT_BAD_OPTION)
+        med_id = order[position - 1]
+    med = find_med(state, med_id)
+    if position is not None:
+        print(f"Position {position}: {med['name']} ({med['id']}).")
+    return med
 
 
 def _digest_window_open(history, now: datetime) -> bool:
@@ -202,12 +263,14 @@ def _valid_nonce(state: dict, med_id: str, nonce: str, now: datetime) -> bool:
 
 def handle_confirm(med_id: str, dose_taken: Optional[str], dry_run: bool,
                    clock: Optional[Clock] = None, dose_pin: str = None,
-                   taken_at_raw: str = None, force: str = None) -> None:
+                   taken_at_raw: str = None, force: str = None,
+                   position: Optional[int] = None) -> None:
     clock = clock or get_clock()
     state = load_state()
     tz = get_tz(state)
     now = clock.now_utc()
-    med = find_med(state, med_id)
+    med = _resolve_target(state, med_id, position, tz, now)
+    med_id = med["id"]                     # --position resolves to the real id
 
     if med.get("paused"):
         log.info("SKIP [confirm] %s — med is paused", med_id)
@@ -337,30 +400,747 @@ def handle_confirm_all(dose_taken: Optional[str], dry_run: bool,
         print("Nothing to confirm — no active meds found.")
 
 
-def handle_defer(med_id: str, dry_run: bool, clock: Optional[Clock] = None) -> None:
+# ── Snooze / defer / skip (issue #1 §6) ────────────────────────────────────────
+
+def _most_recent_occurrence(med: dict, now: datetime, tz):
+    """
+    The latest occurrence at or before `now`. Interval meds walk the anchor
+    chain (state.next_due, else active_since); as-needed meds have none.
+    """
+    sched = med["schedule"]
+    freq = sched.get("frequency")
+    if freq == "as_needed":
+        return None
+    if freq == "interval":
+        step = timedelta(hours=float(sched["interval_hours"]))
+        anchor = None
+        for raw in ((med.get("state") or {}).get("next_due"), med.get("active_since_utc")):
+            if raw:
+                anchor = parse_instant(raw)
+                break
+        if anchor is None:
+            return None
+        asof = now.astimezone(timezone.utc)
+        k = (asof - anchor) // step if asof >= anchor else -1
+        return _occurrence_mod.at_utc(anchor + k * step, tz) if k >= 0 else None
+    return _occurrence_mod.most_recent_past(sched, now, tz)
+
+
+def _next_occurrence_after(med: dict, occ, tz):
+    """The next scheduled occurrence strictly after `occ` (snooze cap)."""
+    sched = med["schedule"]
+    if sched.get("frequency") == "interval":
+        step = timedelta(hours=float(sched["interval_hours"]))
+        return _occurrence_mod.at_utc(occ.utc + step, tz)
+    nxt = compute_next_due(med, occ.utc, tz)
+    if nxt is None:
+        return None
+    return _occurrence_mod.for_instant(sched, nxt, tz)
+
+
+def _current_dose(med: dict, history, now: datetime, tz):
+    """
+    The dose a skip/snooze reply targets: the most recent occurrence at or
+    before `now` — nothing before active_since_utc was ever tracked. Returns
+    (occurrence, generation, outcome) or (None, None, None).
+    """
+    occ = _most_recent_occurrence(med, now, tz)
+    if occ is None:
+        return None, None, None
+    since = med.get("active_since_utc")
+    if since and occ.utc < parse_instant(since):
+        return None, None, None
+    gen = occurrence_generation(history, med["id"], occ.key)
+    return occ, gen, outcome_for(history, med["id"], occ.key, gen)
+
+
+def _snooze_minutes(med: dict, occ, tz, requested: Optional[int],
+                    defer_alias: bool) -> int:
+    """
+    Resolve the snooze duration: default 30, range 5–240, capped at half
+    the gap to the next occurrence (issue #1 §6). Raises SystemExit with
+    the spec's refusal when beyond the cap. `defer` uses min(120, cap).
+    """
+    nxt = _next_occurrence_after(med, occ, tz)
+    cap = ((nxt.utc - occ.utc).total_seconds() / 120.0) if nxt is not None else SNOOZE_MAX
+    minutes = SNOOZE_DEFAULT if requested is None else requested
+    if defer_alias:
+        minutes = min(DEFER_MINUTES, int(cap))
+        if minutes < SNOOZE_MIN:
+            print(f"Error: snoozing {med['name']} would run into your next "
+                  "dose; skip instead?")
+            raise SystemExit(EXIT_BAD_OPTION)
+        return minutes
+    if not SNOOZE_MIN <= minutes <= SNOOZE_MAX:
+        print(f"Error: --minutes must be {SNOOZE_MIN}–{SNOOZE_MAX} (got {minutes}).")
+        raise SystemExit(EXIT_BAD_OPTION)
+    if minutes > cap + 1e-9:
+        print(f"Error: snoozing {med['name']} for {minutes} minutes would "
+              "run into your next dose; skip instead?")
+        raise SystemExit(EXIT_BAD_OPTION)
+    return minutes
+
+
+def handle_snooze(med_id: str, minutes: Optional[int], dry_run: bool,
+                  clock: Optional[Clock] = None, position: Optional[int] = None,
+                  defer_alias: bool = False) -> None:
+    """
+    Snooze the pending dose: writes `snoozed{occurrence, until}` with the
+    wake instant in `ref` (the format tick.snooze_until_for reads). The
+    reminder re-fires at `until`, the nudge at until+late, and missed no
+    earlier than max(T+missed, until+late) — so a capped snooze can never
+    run into the next dose.
+    """
     clock = clock or get_clock()
     state = load_state()
-    med   = find_med(state, med_id)
+    tz = get_tz(state)
+    now = clock.now_utc()
+    med = _resolve_target(state, med_id, position, tz, now)
 
     if med.get("paused"):
-        log.info("SKIP [defer] %s — already paused", med_id)
-        print(f"Note: {med['name']} is already paused.")
+        print(f"Note: {med['name']} is paused — nothing to snooze.")
+        return
+    if med["schedule"]["frequency"] == "as_needed":
+        print(f"Error: {med['name']} is as-needed — there is no scheduled dose to snooze.")
+        raise SystemExit(EXIT_BAD_OPTION)
+
+    history = _event_store_mod.load_events(_safe_write_mod.history_file())
+    occ, gen, res = _current_dose(med, history, now, tz)
+    if occ is None:
+        print(f"Error: no dose of {med['name']} is due right now — nothing to snooze.")
+        raise SystemExit(EXIT_BAD_OPTION)
+    if res is not None:
+        state_desc = {"taken": "logged as taken", "skipped": "skipped",
+                      "missed": "logged missed"}[res]
+        print(f"Error: the {_fmt_12h(occ.local)} dose of {med['name']} was "
+              f"already {state_desc}.")
+        raise SystemExit(EXIT_BAD_OPTION)
+
+    minutes = _snooze_minutes(med, occ, tz, minutes, defer_alias)
+    until = now + timedelta(minutes=minutes)
+
+    if dry_run:
+        print(f"[DRY RUN] Would snooze {med['name']} until "
+              f"{_fmt_12h(until.astimezone(tz))} ({minutes} minutes).")
         return
 
-    med["state"]["status"] = "deferred"
-    append_history(med, "deferred", clock=clock)
+    outcome = {}
 
-    save_state(state, dry_run)
-    log.info("DEFER [%s]", med_id)
-    print(f"Deferred: {med['name']} — skipped until next cycle.")
+    def fn(state_copy, history_view):
+        med_c = _find_med(state_copy, med["id"])
+        if med_c is None:
+            raise ValueError(f"med {med['id']} disappeared mid-snooze")
+        # re-derive under the lock — another reply may have resolved the dose
+        occ_c, gen_c, res_c = _current_dose(med_c, history_view, now, tz)
+        if occ_c is None or occ_c.key != occ.key or res_c is not None:
+            outcome["conflict"] = True
+            return state_copy, []
+        until_c = now + timedelta(minutes=minutes)
+        outcome["ok"] = (occ_c, until_c)
+        return state_copy, [_event_store_mod.new_event(
+            med["id"], "snoozed", now, occurrence=occ_c, generation=gen_c,
+            ref=until_c.isoformat(),
+        )]
+
+    _safe_write_mod.transact(fn, clock=clock)
+
+    if outcome.get("conflict"):
+        print(f"Error: the {_fmt_12h(occ.local)} dose of {med['name']} was just "
+              "logged by another reply — nothing snoozed.")
+        raise SystemExit(EXIT_BAD_OPTION)
+
+    occ_ok, until_ok = outcome["ok"]
+    print(f"Snoozed {med['name']} until {_fmt_12h(until_ok.astimezone(tz))} "
+          f"({minutes} minutes).")
+    if defer_alias:
+        print("Note: 'defer' is deprecated — it snoozes now; use 'snooze' next time.")
+    log.info("SNOOZE [%s] %s until %s", med["id"], occ_ok.key, until_ok.isoformat())
+
+
+def handle_defer(med_id: str, dry_run: bool, clock: Optional[Clock] = None,
+                 position: Optional[int] = None) -> None:
+    """Deprecated alias for snooze, minutes = min(120, cap) (issue #1 §6)."""
+    handle_snooze(med_id, None, dry_run, clock=clock, position=position,
+                  defer_alias=True)
+
+
+def handle_skip(med_id: str, dose_pin: Optional[str], dry_run: bool,
+                clock: Optional[Clock] = None,
+                position: Optional[int] = None) -> None:
+    """
+    Skip a dose: writes `skipped` — the occurrence never becomes missed.
+    Without --dose only a past or current occurrence is targeted; a future
+    one requires --dose (the agent confirms which dose is meant).
+    """
+    clock = clock or get_clock()
+    state = load_state()
+    tz = get_tz(state)
+    now = clock.now_utc()
+    med = _resolve_target(state, med_id, position, tz, now)
+
+    if med.get("paused"):
+        print(f"Note: {med['name']} is paused — its doses aren't tracked while paused.")
+        return
+
+    history = _event_store_mod.load_events(_safe_write_mod.history_file())
+
+    if dose_pin is not None:
+        try:
+            occ = nearest_dose_occurrence(med, dose_pin, now, tz)
+        except ValueError as e:
+            print(f"Error: {e}")
+            raise SystemExit(EXIT_BAD_OPTION)
+    else:
+        occ, _, _ = _current_dose(med, history, now, tz)
+        if occ is None:
+            print(f"Error: no dose of {med['name']} is due right now — to skip "
+                  "a future dose, add --dose HH:MM.")
+            raise SystemExit(EXIT_BAD_OPTION)
+
+    gen = occurrence_generation(history, med["id"], occ.key)
+    res = outcome_for(history, med["id"], occ.key, gen)
+    if res == "taken":
+        print(f"Error: the {_fmt_12h(occ.local)} dose of {med['name']} is "
+              "already logged as taken — undo it first, or use --dose HH:MM "
+              "for a later dose.")
+        raise SystemExit(EXIT_BAD_OPTION)
+    if res == "skipped":
+        print(f"Error: the {_fmt_12h(occ.local)} dose of {med['name']} is "
+              "already skipped.")
+        raise SystemExit(EXIT_BAD_OPTION)
+
+    if dry_run:
+        print(f"[DRY RUN] Would skip {med['name']} {_fmt_12h(occ.local)} dose.")
+        return
+
+    outcome = {}
+
+    def fn(state_copy, history_view):
+        med_c = _find_med(state_copy, med["id"])
+        if med_c is None:
+            raise ValueError(f"med {med['id']} disappeared mid-skip")
+        gen_c = occurrence_generation(history_view, med["id"], occ.key)
+        if outcome_for(history_view, med["id"], occ.key, gen_c) in ("taken", "skipped"):
+            outcome["conflict"] = True
+            return state_copy, []
+        outcome["ok"] = (occ, gen_c)
+        return state_copy, [_event_store_mod.new_event(
+            med["id"], "skipped", now, occurrence=occ, generation=gen_c,
+            dose_prescribed=f"{med['dose']}{med['unit']}",
+        )]
+
+    _safe_write_mod.transact(fn, clock=clock)
+
+    if outcome.get("conflict"):
+        print(f"Error: the {_fmt_12h(occ.local)} dose of {med['name']} was just "
+              "logged by another reply — not skipped.")
+        raise SystemExit(EXIT_BAD_OPTION)
+
+    occ_ok, _ = outcome["ok"]
+    print(f"Skipped {med['name']} {_fmt_12h(occ_ok.local)} dose.")
+    log.info("SKIP [%s] %s", med["id"], occ_ok.key)
+
+
+# ── Undo (issue #1 §6) ─────────────────────────────────────────────────────────
+
+def _undoable_event(history, med_id: str, now: datetime) -> Optional[dict]:
+    """
+    The most recent `taken` or `skipped` for this med within 24h that has
+    no matching `undone` — or None. `undone{ref}` names the event it
+    undoes, so a second undo finds nothing.
+    """
+    undone_refs = {e.get("ref") for e in history
+                   if e.get("event") == "undone" and e.get("med_id") == med_id}
+    best, best_ts = None, None
+    for e in history:
+        if e.get("event") not in ("taken", "skipped") or e.get("med_id") != med_id:
+            continue
+        if e.get("id") in undone_refs:
+            continue
+        ts = parse_instant(e["ts_utc"])
+        if ts > now or ts < now - UNDO_WINDOW:
+            continue
+        if best_ts is None or ts > best_ts:
+            best, best_ts = e, ts
+    return best
+
+
+def handle_undo(med_id: str, dry_run: bool, clock: Optional[Clock] = None,
+                position: Optional[int] = None) -> None:
+    """
+    Undo the most recent taken or skipped dose (within 24h): writes
+    `undone{ref}`, bumping the occurrence's generation so it is unresolved
+    again. Before T+late the tick re-reminds; after T+missed it writes a
+    silent missed (PR 2's stage logic — nothing to do here but record).
+    """
+    clock = clock or get_clock()
+    state = load_state()
+    tz = get_tz(state)
+    now = clock.now_utc()
+    med = _resolve_target(state, med_id, position, tz, now)
+
+    history = _event_store_mod.load_events(_safe_write_mod.history_file())
+    ref_ev = _undoable_event(history, med["id"], now)
+    if ref_ev is None:
+        print(f"Error: nothing to undo for {med['name']} — no taken or "
+              "skipped dose in the last 24 hours.")
+        raise SystemExit(1)
+
+    if dry_run:
+        print(f"[DRY RUN] Would undo the {ref_ev['event']} event for "
+              f"{med['name']} from {_fmt_12h(parse_instant(ref_ev['ts_utc']).astimezone(tz))}.")
+        return
+
+    outcome = {}
+
+    def fn(state_copy, history_view):
+        med_c = _find_med(state_copy, med["id"])
+        if med_c is None:
+            raise ValueError(f"med {med['id']} disappeared mid-undo")
+        ev_c = _undoable_event(history_view, med["id"], now)
+        if ev_c is None or ev_c["id"] != ref_ev["id"]:
+            outcome["conflict"] = True
+            return state_copy, []
+        occ_c = None
+        if ev_c.get("occurrence_key"):
+            occ_c = Occurrence(utc=parse_instant(ev_c["occurrence_utc"]),
+                               key=ev_c["occurrence_key"], tz=tz)
+        # legacy status is a rollback cache — never leave it claiming confirmed
+        if ev_c["event"] == "taken" and med_c["state"].get("status") == "confirmed":
+            med_c["state"]["status"] = "pending"
+        outcome["ok"] = ev_c
+        return state_copy, [_event_store_mod.new_event(
+            med["id"], "undone", now, occurrence=occ_c,
+            generation=int(ev_c.get("generation") or 0), ref=ev_c["id"],
+        )]
+
+    _safe_write_mod.transact(fn, clock=clock)
+
+    if outcome.get("conflict"):
+        print("Error: nothing to undo — another reply just changed it.")
+        raise SystemExit(1)
+
+    ev = outcome["ok"]
+    occ = None
+    if ev.get("occurrence_key"):
+        occ = Occurrence(utc=parse_instant(ev["occurrence_utc"]),
+                         key=ev["occurrence_key"], tz=tz)
+    slot = f" {_fmt_12h(occ.local)} dose" if occ is not None else " dose"
+    if ev["event"] == "taken":
+        at = _taken_instant(ev).astimezone(tz)
+        print(f"Undid: {med['name']}{slot} — you had logged it taken at {_fmt_12h(at)}.")
+    else:
+        print(f"Undid: skipped {med['name']}{slot}.")
+    if occ is not None:
+        late = timedelta(minutes=med["escalation"]["late_threshold_minutes"])
+        missed = timedelta(minutes=med["escalation"]["missed_threshold_minutes"])
+        if now < occ.utc + late:
+            print("You'll be reminded again.")
+        elif now >= occ.utc + missed:
+            print("It's past the missed threshold — it will be logged as missed, silently.")
+        else:
+            print("You'll be nudged again.")
+    log.info("UNDO [%s] %s", med["id"], ev["id"])
+
+
+# ── Pause / unpause (issue #1 §6) ──────────────────────────────────────────────
+
+def handle_pause(med_id: str, dry_run: bool, clock: Optional[Clock] = None,
+                 position: Optional[int] = None) -> None:
+    clock = clock or get_clock()
+    state = load_state()
+    tz = get_tz(state)
+    now = clock.now_utc()
+    med = _resolve_target(state, med_id, position, tz, now)
+
+    if med.get("paused"):
+        print(f"Note: {med['name']} is already paused.")
+        return
+    if dry_run:
+        print(f"[DRY RUN] Would pause {med['name']}.")
+        return
+
+    def fn(state_copy, history_view):
+        med_c = _find_med(state_copy, med["id"])
+        if med_c is None:
+            raise ValueError(f"med {med['id']} disappeared mid-pause")
+        med_c["paused"] = True
+        return state_copy, []
+
+    _safe_write_mod.transact(fn, clock=clock)
+    print(f"Paused {med['name']} — no reminders while it's paused.")
+    log.info("PAUSE [%s]", med["id"])
+
+
+def handle_unpause(med_id: str, dry_run: bool, clock: Optional[Clock] = None,
+                   position: Optional[int] = None) -> None:
+    """Unpause re-anchors tracking (active_since_utc = now): doses during
+    the pause are never enumerated, so unpausing causes no phantom misses."""
+    clock = clock or get_clock()
+    state = load_state()
+    tz = get_tz(state)
+    now = clock.now_utc()
+    med = _resolve_target(state, med_id, position, tz, now)
+
+    if not med.get("paused"):
+        print(f"Note: {med['name']} isn't paused.")
+        return
+    if dry_run:
+        print(f"[DRY RUN] Would unpause {med['name']} (tracking restarts from now).")
+        return
+
+    def fn(state_copy, history_view):
+        med_c = _find_med(state_copy, med["id"])
+        if med_c is None:
+            raise ValueError(f"med {med['id']} disappeared mid-unpause")
+        med_c["paused"] = False
+        med_c["active_since_utc"] = now.isoformat()
+        return state_copy, []
+
+    _safe_write_mod.transact(fn, clock=clock)
+    print(f"Unpaused {med['name']} — tracking resumes from now; nothing during "
+          "the pause is logged missed.")
+    log.info("UNPAUSE [%s]", med["id"])
+
+
+# ── Edit-time quiet-hours checks (issue #1 §6, AC 27) ─────────────────────────
+#
+# validate() never rejects quiet-hours conflicts (AC 26 — existing state
+# must always load); add-med/edit-med/set-quiet-hours are where they're
+# refused. The boundary mirrors the engine: a nudge in the FIRST 30 min of
+# quiet hours still sends (AC 28), so only the muted part rejects.
+
+def _hhmm_mins(hhmm: str) -> int:
+    h, m = map(int, hhmm.split(":"))
+    return h * 60 + m
+
+
+def _mins_hhmm(mins: int) -> str:
+    return f"{(mins // 60) % 24:02d}:{mins % 60:02d}"
+
+
+def _in_quiet_window(t: int, quiet: dict) -> bool:
+    start, end = _hhmm_mins(quiet["start"]), _hhmm_mins(quiet["end"])
+    if start <= end:
+        return start <= t < end
+    return t >= start or t < end          # midnight-spanning
+
+
+def _in_muted_quiet(t: int, quiet: dict) -> bool:
+    """Inside quiet hours past the 30-min head — where nudges are muted."""
+    return _in_quiet_window(t, quiet) and ((t - _hhmm_mins(quiet["start"])) % 1440) >= 30
+
+
+def quiet_conflicts(med: dict, quiet: dict) -> list:
+    """
+    Edit-time conflicts for one med against a quiet window: a dose time
+    inside quiet hours, or a T+late nudge inside the muted part (with a
+    suggested fix). Interval/as-needed meds fire around the clock — their
+    optional quiet_policy field governs them, not this check.
+    """
+    sched = med.get("schedule") or {}
+    if sched.get("frequency") in ("interval", "as_needed"):
+        return []
+    late = (med.get("escalation") or {}).get("late_threshold_minutes")
+    out = []
+    for t in sched.get("times") or []:
+        tm = _hhmm_mins(t)
+        if _in_quiet_window(tm, quiet):
+            out.append(
+                f"{med.get('name')}: dose at {t} is inside quiet hours "
+                f"({quiet['start']}–{quiet['end']}) — move the dose before "
+                f"{quiet['start']} or adjust quiet hours")
+        if late is None:
+            continue
+        nudge = (tm + late) % 1440
+        if _in_muted_quiet(nudge, quiet):
+            out.append(
+                f"{med.get('name')}: the late nudge at {_mins_hhmm(nudge)} "
+                f"(T+{late}m after {t}) would be muted by quiet hours — move "
+                "the dose earlier, lower late_threshold_minutes, or start "
+                f"quiet hours from {_mins_hhmm(nudge)}")
+    return out
+
+
+def _reject_quiet_conflicts(conflicts: list) -> None:
+    if not conflicts:
+        return
+    for c in conflicts:
+        print(f"Error: {c}.")
+    raise SystemExit(EXIT_BAD_OPTION)
+
+
+def _parse_med_json(json_text: str) -> dict:
+    try:
+        med = json.loads(json_text)
+    except json.JSONDecodeError as e:
+        print(f"Error: invalid JSON for the med: {e}")
+        raise SystemExit(EXIT_BAD_OPTION)
+    if not isinstance(med, dict):
+        print("Error: expected one JSON med object.")
+        raise SystemExit(EXIT_BAD_OPTION)
+    return med
+
+
+def _validated_candidate(state: dict, meds: list) -> None:
+    """Validate a candidate state (raises ValueError) with a friendly exit."""
+    candidate = dict(state)
+    candidate["meds"] = meds
+    try:
+        _safe_write_mod.validate(candidate)
+    except ValueError as e:
+        print(f"Error: the med didn't validate: {e}")
+        raise SystemExit(EXIT_BAD_OPTION)
+
+
+def _next_med_id(state: dict) -> str:
+    nums = []
+    for m in state["meds"]:
+        try:
+            nums.append(int(m["id"].split("-", 1)[1]))
+        except (ValueError, IndexError, KeyError):
+            continue
+    return f"med-{(max(nums) + 1) if nums else 1:03d}"
+
+
+# Keys whose change re-anchors tracking (issue §3: active_since is set on a
+# schedule edit or a dose-time edit; renaming a med must not swallow pending
+# nudges).
+_SCHEDULE_KEYS = ("frequency", "times", "interval_hours", "day_of_week")
+
+
+def handle_add_med(json_text: str, dry_run: bool,
+                   clock: Optional[Clock] = None) -> None:
+    """
+    Add a med from a JSON object (stdin): validate, refuse quiet-hours
+    conflicts, set active_since_utc = now (nothing earlier is enumerated,
+    so a new med starts with no phantom misses).
+    """
+    clock = clock or get_clock()
+    now = clock.now_utc()
+    med = _parse_med_json(json_text)
+    state = load_state()
+
+    med.setdefault("state", {"status": "pending", "last_taken": None,
+                             "last_reminded": None, "next_due": None,
+                             "missed_count": 0, "history": []})
+    if med.get("id"):
+        if any(m["id"] == med["id"] for m in state["meds"]):
+            print(f"Error: a med with id {med['id']} already exists.")
+            raise SystemExit(EXIT_BAD_OPTION)
+    else:
+        med["id"] = _next_med_id(state)
+
+    _reject_quiet_conflicts(quiet_conflicts(med, state["global"]["quiet_hours"]))
+    med["active_since_utc"] = now.isoformat()
+    _validated_candidate(state, state["meds"] + [med])
+
+    if dry_run:
+        print(f"[DRY RUN] Would add {med.get('name')} ({med['id']}) — "
+              "tracking starts from now.")
+        return
+
+    outcome = {}
+
+    def fn(state_copy, history_view):
+        if any(m["id"] == med["id"] for m in state_copy["meds"]):
+            outcome["conflict"] = True
+            return state_copy, []
+        state_copy["meds"].append(copy.deepcopy(med))
+        _safe_write_mod.validate(state_copy)
+        return state_copy, []
+
+    _safe_write_mod.transact(fn, clock=clock)
+
+    if outcome.get("conflict"):
+        print(f"Error: a med with id {med['id']} was just added — re-run with "
+              "a different id.")
+        raise SystemExit(EXIT_BAD_OPTION)
+    print(f"Added {med['name']} ({med['id']}) — tracking starts now; earlier "
+          "doses aren't counted.")
+    log.info("ADD-MED [%s] %s", med["id"], med["name"])
+
+
+def handle_edit_med(med_id: str, json_text: str, dry_run: bool,
+                    clock: Optional[Clock] = None,
+                    position: Optional[int] = None) -> None:
+    """
+    Edit a med from a JSON object (stdin). The existing runtime `state`
+    block is preserved (the agent edits the prescription, never state),
+    unknown optional fields pass through, and a schedule change re-anchors
+    tracking via active_since_utc.
+    """
+    clock = clock or get_clock()
+    state = load_state()
+    tz = get_tz(state)
+    now = clock.now_utc()
+    med = _resolve_target(state, med_id, position, tz, now)
+    incoming = _parse_med_json(json_text)
+
+    if incoming.get("id") not in (None, med["id"]):
+        print(f"Error: edit-med targets {med['id']} but the JSON describes "
+              f"{incoming['id']}.")
+        raise SystemExit(EXIT_BAD_OPTION)
+
+    merged = dict(med)
+    merged.update(incoming)
+    merged["id"] = med["id"]
+    merged["state"] = med["state"]        # runtime state is never agent-writable
+
+    _reject_quiet_conflicts(quiet_conflicts(merged, state["global"]["quiet_hours"]))
+    _validated_candidate(
+        state, [merged if m["id"] == med["id"] else m for m in state["meds"]])
+
+    schedule_changed = any(
+        (med["schedule"].get(k) != merged["schedule"].get(k)) for k in _SCHEDULE_KEYS)
+
+    if dry_run:
+        print(f"[DRY RUN] Would update {merged.get('name')} ({med['id']}).")
+        return
+
+    def fn(state_copy, history_view):
+        med_c = _find_med(state_copy, med["id"])
+        if med_c is None:
+            raise ValueError(f"med {med['id']} disappeared mid-edit")
+        merged_c = copy.deepcopy(merged)
+        if schedule_changed:
+            merged_c["active_since_utc"] = now.isoformat()
+        med_c.clear()                    # keep the object identity in meds[]
+        med_c.update(merged_c)
+        _safe_write_mod.validate(state_copy)
+        return state_copy, []
+
+    _safe_write_mod.transact(fn, clock=clock)
+    note = " Schedule changed — tracking restarts from now." if schedule_changed else ""
+    print(f"Updated {merged['name']} ({med['id']}).{note}")
+    log.info("EDIT-MED [%s] %s", med["id"], merged["name"])
+
+
+def handle_set_quiet_hours(start: str, end: str, dry_run: bool,
+                           clock: Optional[Clock] = None) -> None:
+    """Change quiet hours after checking every med against the new window."""
+    clock = clock or get_clock()
+    for label, value in (("start", start), ("end", end)):
+        if not _HHMM_RE.match(value or ""):
+            print(f"Error: quiet-hours {label} must be HH:MM (got '{value}').")
+            raise SystemExit(EXIT_BAD_OPTION)
+
+    state = load_state()
+    new_quiet = {"start": start, "end": end}
+    _reject_quiet_conflicts(
+        [c for m in state["meds"] for c in quiet_conflicts(m, new_quiet)])
+
+    if dry_run:
+        print(f"[DRY RUN] Would set quiet hours to {start}–{end}.")
+        return
+
+    def fn(state_copy, history_view):
+        state_copy["global"]["quiet_hours"] = {"start": start, "end": end}
+        return state_copy, []
+
+    _safe_write_mod.transact(fn, clock=clock)
+    print(f"Quiet hours set to {start}–{end}.")
+    log.info("SET-QUIET-HOURS %s-%s", start, end)
+
+
+# ── Remove / status / show-state (issue #1 §6) ─────────────────────────────────
+
+def handle_remove(med_id: str, yes: bool, dry_run: bool,
+                  clock: Optional[Clock] = None,
+                  position: Optional[int] = None) -> None:
+    """Remove a med from state. History lines remain in history.jsonl."""
+    clock = clock or get_clock()
+    state = load_state()
+    tz = get_tz(state)
+    now = clock.now_utc()
+    med = _resolve_target(state, med_id, position, tz, now)
+
+    if not yes:
+        print(f"Refusing to remove {med['name']} — rerun with --yes to confirm.")
+        raise SystemExit(EXIT_BAD_OPTION)
+
+    if dry_run:
+        print(f"[DRY RUN] Would remove {med['name']} ({med['id']}).")
+        return
+
+    def fn(state_copy, history_view):
+        state_copy["meds"] = [m for m in state_copy["meds"] if m["id"] != med["id"]]
+        return state_copy, []
+
+    _safe_write_mod.transact(fn, clock=clock)
+    print(f"Removed {med['name']} ({med['id']}). Its history lines remain in "
+          "history.jsonl.")
+    log.info("REMOVE [%s] %s", med["id"], med["name"])
+
+
+def _last_dose_event(history, med_id: str) -> Optional[dict]:
+    best, best_ts = None, None
+    for e in history:
+        if e.get("med_id") != med_id or e.get("event") not in ("taken", "skipped", "missed"):
+            continue
+        ts = parse_instant(e["ts_utc"])
+        if best_ts is None or ts > best_ts:
+            best, best_ts = e, ts
+    return best
+
+
+def handle_status() -> None:
+    """Read-only summary for the agent to relay (issue #1 §6)."""
+    state = load_state()
+    tz = get_tz(state)
+    g = state["global"]
+    quiet = g["quiet_hours"]
+    print(f"{len(state['meds'])} med(s) | timezone {g['timezone']} | quiet hours "
+          f"{quiet['start']}–{quiet['end']} | digest {g['digest_time']}")
+    if g.get("paused"):
+        print("ALL REMINDERS PAUSED (global).")
+    history = _event_store_mod.load_events(_safe_write_mod.history_file())
+    for i, med in enumerate(state["meds"], 1):
+        sched = med["schedule"]
+        freq = sched["frequency"]
+        if freq == "interval":
+            when = f"every {sched['interval_hours']}h"
+        elif freq == "as_needed":
+            when = "as needed"
+        else:
+            day = (f"{sched['day_of_week'].title()} "
+                   if freq == "weekly" and sched.get("day_of_week") else "")
+            when = day + ", ".join(_dispatch_mod.fmt_12h(t) for t in sched["times"])
+        line = f"{i}. {med['name']} {med['dose']}{med['unit']} — {when}"
+        if med.get("paused"):
+            line += " [paused]"
+        last = _last_dose_event(history, med["id"])
+        if last is not None:
+            at = parse_instant(last["ts_utc"]).astimezone(tz)
+            line += f" | last: {last['event']} {_fmt_12h(at)}"
+        nd = med["state"].get("next_due")
+        if nd:
+            nd_local = parse_instant(nd).astimezone(tz)
+            line += f" | next due: {nd_local:%a} {_fmt_12h(nd_local)}"
+        print(line)
+    if not state["meds"]:
+        print("No meds yet — add one with: reply.py add-med --json -")
+
+
+def handle_show_state() -> None:
+    """Print the state file's sha256 — the token CLI writers must pass."""
+    load_state()
+    print(_safe_write_mod.state_token()[1])
 
 
 # ── CLI ────────────────────────────────────────────────────────────────────────
 
+def _read_json_input(src: str) -> str:
+    """'-' (or None) reads stdin; anything else is a path."""
+    if src in (None, "-"):
+        return sys.stdin.read()
+    return Path(src).read_text(encoding="utf-8")
+
+
 def main() -> None:
     _safe_write_mod.apply_process_umask()   # issue #1 §2: private files, before any are created
     parser = argparse.ArgumentParser(
-        description="AI reply handler — confirm or defer a medication dose.",
+        description="AI reply handler — dose confirmations and schedule replies.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__,
     )
@@ -377,6 +1157,8 @@ def main() -> None:
                                help="Med ID, e.g. med-001")
     p_confirm_grp.add_argument("--all", dest="confirm_all", action="store_true",
                                help="Confirm all pending/reminded/late meds")
+    p_confirm_grp.add_argument("--position", type=int, default=None, metavar="N",
+                               help="Pick the Nth med from today's digest order (1-based)")
     p_confirm.add_argument("--dose-taken", default="",
                            help="Actual dose if different from prescribed, e.g. '250mg'")
     p_confirm.add_argument("--dose", default=None, metavar="HH:MM",
@@ -386,8 +1168,75 @@ def main() -> None:
     p_confirm.add_argument("--force", default=None, metavar="NONCE",
                            help="Override a duplicate refusal (nonce from the exit-3 message, valid 10 min)")
 
-    p_defer = sub.add_parser("defer", help="Defer a med until next cycle")
-    p_defer.add_argument("med_id", help="Med ID, e.g. med-001")
+    p_skip = sub.add_parser("skip", help="Skip a dose (never logged missed)")
+    p_skip.add_argument("med_id", nargs="?", default=None,
+                        help="Med ID, e.g. med-001 (or use --position)")
+    p_skip.add_argument("--position", type=int, default=None, metavar="N",
+                        help="Pick the Nth med from today's digest order (1-based)")
+    p_skip.add_argument("--dose", default=None, metavar="HH:MM",
+                        help="Pin the dose being skipped (required for a future dose)")
+
+    p_snooze = sub.add_parser("snooze", help="Push the pending dose's reminder later")
+    p_snooze.add_argument("med_id", nargs="?", default=None,
+                          help="Med ID, e.g. med-001 (or use --position)")
+    p_snooze.add_argument("--position", type=int, default=None, metavar="N",
+                          help="Pick the Nth med from today's digest order (1-based)")
+    p_snooze.add_argument("--minutes", type=int, default=None, metavar="N",
+                          help=f"Snooze duration (default {SNOOZE_DEFAULT}, "
+                               f"range {SNOOZE_MIN}-{SNOOZE_MAX}, capped at half "
+                               "the gap to the next dose)")
+
+    p_defer = sub.add_parser(
+        "defer", help="Deprecated alias for snooze (min(120, cap) minutes)")
+    p_defer.add_argument("med_id", nargs="?", default=None,
+                         help="Med ID, e.g. med-001 (or use --position)")
+    p_defer.add_argument("--position", type=int, default=None, metavar="N",
+                         help="Pick the Nth med from today's digest order (1-based)")
+
+    p_undo = sub.add_parser("undo", help="Undo the most recent taken/skipped (24h)")
+    p_undo.add_argument("med_id", nargs="?", default=None,
+                        help="Med ID, e.g. med-001 (or use --position)")
+    p_undo.add_argument("--position", type=int, default=None, metavar="N",
+                        help="Pick the Nth med from today's digest order (1-based)")
+
+    for name, help_text in (("pause", "Stop reminders for one med"),
+                            ("unpause", "Resume reminders for one med")):
+        p = sub.add_parser(name, help=help_text)
+        p.add_argument("med_id", nargs="?", default=None,
+                       help="Med ID, e.g. med-001 (or use --position)")
+        p.add_argument("--position", type=int, default=None, metavar="N",
+                       help="Pick the Nth med from today's digest order (1-based)")
+
+    p_add = sub.add_parser("add-med", help="Add a med from a JSON object on stdin")
+    p_add.add_argument("--json", action="store_true",
+                       help="Read the med's JSON from stdin ('-' or a path)")
+    p_add.add_argument("json_src", nargs="?", default="-", metavar="-|PATH",
+                       help="'-' (stdin, default) or a path to the JSON file")
+
+    p_edit = sub.add_parser("edit-med", help="Edit a med from a JSON object on stdin")
+    p_edit.add_argument("med_id", nargs="?", default=None,
+                        help="Med ID, e.g. med-001 (or use --position)")
+    p_edit.add_argument("--position", type=int, default=None, metavar="N",
+                        help="Pick the Nth med from today's digest order (1-based)")
+    p_edit.add_argument("--json", action="store_true",
+                        help="Read the med's JSON from stdin ('-' or a path)")
+    p_edit.add_argument("json_src", nargs="?", default="-", metavar="-|PATH",
+                        help="'-' (stdin, default) or a path to the JSON file")
+
+    p_quiet = sub.add_parser("set-quiet-hours", help="Set the quiet-hours window")
+    p_quiet.add_argument("start", metavar="HH:MM", help="Quiet hours start")
+    p_quiet.add_argument("end", metavar="HH:MM", help="Quiet hours end")
+
+    p_remove = sub.add_parser("remove", help="Remove a med (history lines remain)")
+    p_remove.add_argument("med_id", nargs="?", default=None,
+                          help="Med ID, e.g. med-001 (or use --position)")
+    p_remove.add_argument("--position", type=int, default=None, metavar="N",
+                          help="Pick the Nth med from today's digest order (1-based)")
+    p_remove.add_argument("--yes", action="store_true",
+                          help="Confirm the removal")
+
+    sub.add_parser("status", help="Read-only summary of all meds")
+    sub.add_parser("show-state", help="Print the state sha256 for CLI writers")
 
     args = parser.parse_args()
     setup_logging(args.dry_run)
@@ -402,13 +1251,53 @@ def main() -> None:
         if args.confirm_all:
             handle_confirm_all(args.dose_taken or None, args.dry_run)
         else:
-            if not args.med_id:
-                parser.error("confirm requires a med_id or --all")
+            if not args.med_id and args.position is None:
+                parser.error("confirm requires a med_id, --all or --position")
             handle_confirm(args.med_id, args.dose_taken or None, args.dry_run,
                            dose_pin=args.dose, taken_at_raw=args.taken_at,
-                           force=args.force)
+                           force=args.force, position=args.position)
+    elif args.mode == "skip":
+        if not args.med_id and args.position is None:
+            parser.error("skip requires a med_id or --position")
+        handle_skip(args.med_id, args.dose, args.dry_run, position=args.position)
+    elif args.mode == "snooze":
+        if not args.med_id and args.position is None:
+            parser.error("snooze requires a med_id or --position")
+        handle_snooze(args.med_id, args.minutes, args.dry_run,
+                      position=args.position)
     elif args.mode == "defer":
-        handle_defer(args.med_id, args.dry_run)
+        if not args.med_id and args.position is None:
+            parser.error("defer requires a med_id or --position")
+        handle_defer(args.med_id, args.dry_run, position=args.position)
+    elif args.mode == "undo":
+        if not args.med_id and args.position is None:
+            parser.error("undo requires a med_id or --position")
+        handle_undo(args.med_id, args.dry_run, position=args.position)
+    elif args.mode == "pause":
+        if not args.med_id and args.position is None:
+            parser.error("pause requires a med_id or --position")
+        handle_pause(args.med_id, args.dry_run, position=args.position)
+    elif args.mode == "unpause":
+        if not args.med_id and args.position is None:
+            parser.error("unpause requires a med_id or --position")
+        handle_unpause(args.med_id, args.dry_run, position=args.position)
+    elif args.mode == "add-med":
+        handle_add_med(_read_json_input(args.json_src), args.dry_run)
+    elif args.mode == "edit-med":
+        if not args.med_id and args.position is None:
+            parser.error("edit-med requires a med_id or --position")
+        handle_edit_med(args.med_id, _read_json_input(args.json_src), args.dry_run,
+                        position=args.position)
+    elif args.mode == "set-quiet-hours":
+        handle_set_quiet_hours(args.start, args.end, args.dry_run)
+    elif args.mode == "remove":
+        if not args.med_id and args.position is None:
+            parser.error("remove requires a med_id or --position")
+        handle_remove(args.med_id, args.yes, args.dry_run, position=args.position)
+    elif args.mode == "status":
+        handle_status()
+    elif args.mode == "show-state":
+        handle_show_state()
 
 
 if __name__ == "__main__":

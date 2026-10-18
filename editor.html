@@ -390,6 +390,7 @@ section h2 { font-size: 14px; font-weight: 600; letter-spacing: .03em;
 let currentState = null;
 let fileHandle   = null;
 let editingId    = null; // null = add, string = edit existing
+let openedLastModified = null; // file mtime at open — M4 stale-file guard (issue #1 §2)
 
 // ── Validation ─────────────────────────────────────────────────────────────
 const HHMM  = /^([01][0-9]|2[0-3]):[0-5][0-9]$/;
@@ -524,6 +525,7 @@ async function openFile() {
       hideValErrors();
     }
     currentState = parsed;
+    openedLastModified = file.lastModified;   // M4: baseline for the stale check
     renderAll();
     document.getElementById('file-label').textContent    = file.name;
     document.getElementById('save-btn').disabled         = false;
@@ -541,14 +543,30 @@ async function writeToHandle(handle) {
   const writable = await handle.createWritable();
   await writable.write(JSON.stringify(currentState, null, 2));
   await writable.close();
-  const name = (await handle.getFile()).name;
-  document.getElementById('file-label').textContent = name;
+  const saved = await handle.getFile();
+  openedLastModified = saved.lastModified;   // our own write is the new baseline
+  document.getElementById('file-label').textContent = saved.name;
   document.getElementById('save-btn').innerHTML = 'Save';
-  setStatus('Saved to ' + name, 'ok');
+  setStatus('Saved to ' + saved.name, 'ok');
 }
 
 async function saveFile() {
   if (!currentState) return;
+  // M4 (issue #1 §2): another writer (the tick, reply.py) may have replaced
+  // the file since it was opened — refuse rather than clobber it.
+  if (fileHandle) {
+    try {
+      const cur = await fileHandle.getFile();
+      if (openedLastModified !== null && cur.lastModified !== openedLastModified) {
+        setStatus('File changed on disk since you opened it — reopen it and reapply ' +
+                  'your edits (or Save As a copy). Refusing to overwrite.', 'err');
+        return;
+      }
+    } catch (ex) {
+      setStatus('Could not re-read the file before saving: ' + ex.message, 'err');
+      return;
+    }
+  }
   syncGlobal();
   const errs = validate(currentState);
   if (errs.length) { showValErrors(errs); setStatus(errs.length + ' validation error(s) — cannot save.', 'err'); return; }
@@ -819,8 +837,10 @@ function saveMed() {
   if (errs.length) { errEl.style.display = ''; errEl.textContent = errs.join('\n'); return; }
   errEl.style.display = 'none';
 
-  // Build schedule
-  const schedule = { frequency: freq };
+  // Build schedule — start from the one being edited so optional fields the
+  // form doesn't know (quiet_policy, ...) pass through untouched (issue #1 §6)
+  const editingMed = editingId ? currentState.meds.find(m => m.id === editingId) : null;
+  const schedule = Object.assign({}, (editingMed || {}).schedule, { frequency: freq });
   if (freq === 'interval') {
     schedule.interval_hours = parseInt(document.getElementById('f-interval').value, 10);
     schedule.day_of_week = null;
