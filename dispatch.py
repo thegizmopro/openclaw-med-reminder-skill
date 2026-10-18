@@ -54,7 +54,6 @@ SCRIPT_DIR = Path(__file__).parent.resolve()
 STATE_FILE  = Path(os.environ.get("MEDS_STATE_FILE", SCRIPT_DIR / "meds-state.json"))
 LOG_FILE    = Path(os.environ.get("MEDS_LOG_FILE",   SCRIPT_DIR / "dispatch.log"))
 SEND_CMD    = os.environ.get("MEDS_SEND_CMD", "")
-HISTORY_MAX = 30
 
 # A confirm taken now credits the upcoming dose if it is due within this window
 # (e.g. 'all taken' replied to the morning digest just before the first dose).
@@ -328,10 +327,7 @@ def append_history(
     }
     if notes:
         entry["notes"] = notes
-    hist = med["state"]["history"]
-    hist.append(entry)
-    if len(hist) > HISTORY_MAX:
-        med["state"]["history"] = hist[-HISTORY_MAX:]
+    med["state"]["history"].append(entry)
 
 # ── Advisory skip logic ───────────────────────────────────────────────────────
 

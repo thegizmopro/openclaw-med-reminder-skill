@@ -21,9 +21,15 @@ import json
 import logging
 import os
 import uuid
+from copy import deepcopy
 from datetime import datetime, timezone
+from hashlib import sha256
 from pathlib import Path
 from typing import Iterable, Optional
+from zoneinfo import ZoneInfo
+
+import occurrence as _occurrence
+from clock import parse_instant
 
 log = logging.getLogger("event_store")
 
@@ -71,8 +77,10 @@ def new_event(med_id: str, event: str, ts_utc: datetime,
         ev["occurrence_key"] = occurrence.key
         ev["occurrence_utc"] = _iso(occurrence.utc)
     for key in _OPTIONAL_FIELDS:
-        if key in fields and fields[key] is not None:
-            ev[key] = fields.pop(key)
+        if key in fields:
+            val = fields.pop(key)
+            if val is not None:
+                ev[key] = val
     if "stage" in ev and ev["stage"] not in VALID_STAGES:
         raise ValueError(f"unknown stage '{ev['stage']}' (valid: {sorted(VALID_STAGES)})")
     if fields:
@@ -180,3 +188,127 @@ def outcome(events: Iterable[dict], occurrence_key: str, generation: int = 0) ->
         if rank > best_rank or (rank == best_rank and ts > best_ts):
             best, best_rank, best_ts = ev["event"], rank, ts
     return best
+
+
+# ── Keyed migration (issue §1) ─────────────────────────────────────────────────
+#
+# One-time, idempotent. state.history entries become store events keyed from
+# their timestamp and the schedule; confirmed_dose anchors the last `taken`
+# exactly. Deterministic ids (`mig-<sha256…>`) mean a crash between the
+# history append and the state write heals on the next attempt: the re-run
+# appends nothing new.
+
+# legacy state.history event → store event
+_LEGACY_EVENT_MAP = {
+    "taken": "taken",
+    "missed": "missed",
+    "late_nudge_sent": "sent",   # stage=nudge (issue §1)
+    "deferred": "skipped",
+}
+
+
+def migration_event_id(med_id: str, event: str, stage: Optional[str],
+                       occurrence_key: str, ts_utc: str) -> str:
+    raw = "|".join((med_id, event, stage or "", occurrence_key, ts_utc))
+    return "mig-" + sha256(raw.encode("utf-8")).hexdigest()[:24]
+
+
+def migrate_state(state: dict, now_utc: datetime) -> tuple:
+    """
+    Migrate legacy state into events. Returns (new_state, events); events is
+    empty when the watermark is already set. Sets
+    state.tick.watermark_utc = now_utc (the migration instant — nothing
+    before it is ever enumerated, so migration day produces no phantom
+    misses). The input state is not mutated.
+    """
+    if (state.get("tick") or {}).get("watermark_utc"):
+        return state, []
+    tz = ZoneInfo(state["global"]["timezone"])
+    events = []
+    for med in state.get("meds", []):
+        events.extend(_migration_events_for_med(med, tz))
+    new_state = deepcopy(state)
+    new_state.setdefault("tick", {})["watermark_utc"] = _iso(now_utc)
+    return new_state, events
+
+
+def _migration_events_for_med(med: dict, tz: ZoneInfo) -> list:
+    mstate = med.get("state") or {}
+    hist = mstate.get("history") or []
+    cd_raw = mstate.get("confirmed_dose")
+    confirmed = parse_instant(cd_raw) if cd_raw else None
+    if not hist and confirmed is None:
+        return []
+    sched = med.get("schedule") or {}
+    last_taken_i = None
+    for i in range(len(hist) - 1, -1, -1):
+        if hist[i].get("event") == "taken":
+            last_taken_i = i
+            break
+
+    events = []
+    for i, entry in enumerate(hist):
+        legacy = entry.get("event")
+        event = _LEGACY_EVENT_MAP.get(legacy)
+        if event is None:
+            continue  # unknown legacy event — left behind, not invented
+        ts = parse_instant(entry["timestamp"])
+        stage = "nudge" if legacy == "late_nudge_sent" else None
+        if legacy == "taken":
+            if i == last_taken_i and confirmed is not None:
+                occ = _occurrence.for_instant(sched, confirmed, tz)
+            else:
+                occ = (_occurrence.covered_occurrence(sched, ts, tz)
+                       or _occurrence.at_utc(ts, tz))
+        else:
+            # a miss/nudge/defer logged at T refers to the most recent dose
+            occ = (_occurrence.most_recent_past(sched, ts, tz)
+                   or _occurrence.at_utc(ts, tz))
+        events.append(new_event(
+            med["id"], event, ts,
+            id=migration_event_id(med["id"], event, stage, occ.key, _iso(ts)),
+            occurrence=occ, stage=stage,
+            dose_prescribed=entry.get("dose_prescribed"),
+            dose_taken=entry.get("dose_taken"),
+        ))
+
+    if confirmed is not None and last_taken_i is None:
+        # confirmed status whose taken entry was trimmed away — anchor it anyway
+        occ = _occurrence.for_instant(sched, confirmed, tz)
+        events.append(new_event(
+            med["id"], "taken", confirmed,
+            id=migration_event_id(med["id"], "taken", None, occ.key, _iso(confirmed)),
+            occurrence=occ,
+            dose_prescribed=f"{med.get('dose', '')}{med.get('unit', '')}" or None,
+        ))
+    return events
+
+
+# ── state.history mirror (one release, for rollback) ──────────────────────────
+#
+# The last MIRROR_MAX events are mirrored into state.history in legacy format
+# so pre-PR2 code keeps reading consistent state. Only legacy-representable
+# events are mirrored; new code never writes `deferred` (issue §1).
+
+MIRROR_MAX = 30
+
+_MIRROR_EVENT_MAP = {"taken": "taken", "missed": "missed"}
+
+
+def mirror_entry(event: dict) -> Optional[dict]:
+    """Legacy state.history entry for a store event, or None if unrepresentable."""
+    ev = event.get("event")
+    if ev == "sent" and event.get("stage") == "nudge":
+        legacy = "late_nudge_sent"
+    elif ev in _MIRROR_EVENT_MAP:
+        legacy = _MIRROR_EVENT_MAP[ev]
+    else:
+        return None
+    entry = {
+        "timestamp": event.get("ts_utc"),
+        "event": legacy,
+        "dose_prescribed": event.get("dose_prescribed") or "",
+    }
+    if event.get("dose_taken") is not None:
+        entry["dose_taken"] = event["dose_taken"]
+    return entry

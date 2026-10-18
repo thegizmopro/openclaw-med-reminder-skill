@@ -43,7 +43,6 @@ BACKUP_OLD_FILE = Path(str(STATE_FILE) + ".bak.old")   # previous .bak generatio
 TMP_FILE       = Path(str(STATE_FILE) + ".tmp")
 LOCK_TIMEOUT = 30   # seconds before declaring lock stale
 LOCK_WAIT    = 5    # seconds to wait before giving up on a live lock
-HISTORY_MAX  = 30   # must match dispatch.HISTORY_MAX
 
 log = logging.getLogger("safe_write")
 
@@ -69,6 +68,7 @@ _ISO  = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?(Z|[+-]\d{2}:\d
 
 _VALID_TYPES    = {"pill","liquid","injection","patch","inhaler","other"}
 _VALID_FREQS    = {"once_daily","twice_daily","interval","weekly","as_needed"}
+# `deferred` stays readable forever; new code never writes it (issue #1 §1)
 _VALID_STATUSES = {"pending","reminded","confirmed","late","missed","deferred"}
 _VALID_EVENTS   = {"taken","missed","late_nudge_sent","deferred"}
 _VALID_DAYS     = {"mon","tue","wed","thu","fri","sat","sun"}
@@ -113,6 +113,13 @@ def validate(state: dict) -> None:
 
     if not _HHMM.match(g["digest_time"] or ""):
         _die(f"global.digest_time must be HH:MM (24h, zero-padded)")
+
+    # Optional tick-engine bookkeeping (issue #1): watermark set by the migration
+    tick = state.get("tick")
+    if tick is not None:
+        wm = tick.get("watermark_utc")
+        if wm is not None and not _ISO.match(str(wm)):
+            _die("tick.watermark_utc must be ISO 8601 with timezone or null")
 
     seen_ids: set = set()
     for i, med in enumerate(state["meds"]):
@@ -193,9 +200,6 @@ def validate(state: dict) -> None:
 
         if not isinstance(mstate["history"], list):
             _die(f"{p}.state.history must be an array")
-
-        if len(mstate["history"]) > HISTORY_MAX:
-            _die(f"{p}.state.history has {len(mstate['history'])} entries (max {HISTORY_MAX})")
 
         for field in ("last_taken", "last_reminded", "next_due"):
             val = mstate[field]
