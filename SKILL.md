@@ -1,3 +1,8 @@
+---
+name: med-reminder
+description: Send medication reminders over the user's messaging channel — interview once to build meds-state.json, then handle dose replies (took / took-at / snooze / skip / undo) through reply.py.
+---
+
 # Med Reminder Skill — Interview Guide
 
 This file tells the AI how to interview a user and produce a valid `meds-state.json`.
@@ -50,6 +55,22 @@ what app they're using.
 - If the user doesn't know: `quiet_hours.start = "22:00"`, `quiet_hours.end = "07:00"`,
   `digest_time = "07:30"`
 
+**Quiet-hours rules (re-checked by `reply.py` at write time):**
+
+Quiet hours mute escalations, not dose-time reminders (the user chose the dose
+time, so it always sends). Because of that, a dose scheduled *inside* the quiet
+window would nudge and log missed while muted — so at interview time:
+
+- **No dose time inside the quiet window.** If the user asks for one, refuse and
+  offer the fix: move the dose before `quiet_hours.start`, or shift quiet hours
+  later. Explain why: "its late nudges would be muted while you sleep."
+- **No dose whose T+late nudge lands in the muted part of quiet hours** (more
+  than 30 min after quiet start). Nudges may still land in the first 30 min.
+  Offer the same fix: move the dose or adjust the window.
+- Never silently accept a conflicting time to "sort it out later."
+- `reply.py add-med` / `edit-med` / `set-quiet-hours` enforce both rules and
+  refuse with a suggested fix. Relay that suggestion verbatim, re-ask, re-run.
+
 ---
 
 ## Section 2 — Medication list
@@ -98,6 +119,21 @@ Infer from context:
 it reminders fire every day. `schedule.notes` stays free-text ("Every Monday at
 breakfast" is fine, but the machine-readable day lives in `day_of_week`).
 
+### schedule.quiet_policy — interval meds only
+Interval meds fire around the clock, so the §1 rules can't place their doses.
+Ask each interval med's owner once:
+
+> "Should [name] still remind during quiet hours, or hold reminders until
+> quiet hours end?"
+
+- "remind anyway" / "yes, always" → `schedule.quiet_policy: "ignore"`
+- "hold" / "wait until morning" / "not at night" → `schedule.quiet_policy: "shift"`
+- If the user doesn't care: set `"ignore"` silently (the default — omit the
+  field and the schema treats it as `ignore`).
+
+Do not ask this for scheduled-time meds (`once_daily`, `twice_daily`, `weekly`)
+or `as_needed` — the field is interval-only.
+
 ### schedule.times — asking for times
 Only ask for times if `frequency` is `once_daily`, `twice_daily`, or `weekly`.
 Ask:
@@ -142,6 +178,12 @@ Always `false` for new meds. Never ask.
 
 **Silent defaults:** `late_threshold_minutes: 30`, `missed_threshold_minutes: 90`
 
+**T+late vs quiet hours:** thresholds are the last input, so the §1 cross-check
+happens here: for every scheduled-time med, compute dose time + `late_threshold_minutes`
+and refuse or move any dose whose nudge lands in the muted part of quiet hours
+(more than 30 min after quiet start), exactly as §1 describes. `reply.py add-med`
+enforces this when the med is written — relay its suggested fix verbatim.
+
 ### Messages
 Do not ask. Generate from templates and fill in the med's name/dose/unit:
 
@@ -177,8 +219,61 @@ Reminders: nudge after 30min, log missed after 90min.
 Does this look right? Say 'yes' to save, or tell me what to fix.
 ```
 
-**On "yes":** write the state file and run `setup-tasks.py`.
+**On "yes":** create or update the state through the safe paths below, then
+register the scheduler. Never compose and write the full state yourself.
 **On correction:** apply the change, re-read the affected line only, ask again.
+
+1. **If `meds-state.json` already exists:** never rewrite it. Apply the changes
+   with `reply.py` commands only (`set-quiet-hours`, `add-med`, `edit-med`, `remove`).
+
+2. **If it does not exist yet:** create it once with the global answers only —
+   no meds, no runtime state:
+
+   ```bash
+   python3 - << 'EOF' | python3 safe_write.py --expected-sha256 absent
+   {
+     "version": "1",
+     "global": {
+       "timezone": "America/Los_Angeles",
+       "quiet_hours": { "start": "22:00", "end": "07:00" },
+       "paused": false,
+       "digest_time": "07:30",
+       "delivery_channel": "telegram"
+     },
+     "meds": []
+   }
+   EOF
+   ```
+
+   This is the only write that doesn't go through `reply.py`, and it is safe
+   because the `absent` token means the file must not exist yet and the content
+   has nothing that can go stale. Fill the values from the interview;
+   `delivery_channel` comes from context (never ask).
+
+3. **Add every med through Section 7's `add-med`** so validation, id assignment
+   and the §1/§3 quiet-hours checks run per med:
+
+   ```bash
+   python3 reply.py add-med --json - << 'EOF'
+   {
+     "name": "Metformin", "type": "pill", "dose": "500", "unit": "mg",
+     "paused": false,
+     "schedule": { "frequency": "twice_daily", "times": ["08:00", "20:00"] },
+     "escalation": { "late_threshold_minutes": 30,
+                     "missed_threshold_minutes": 90,
+                     "late_message": "Hey — still need to take your {name} ({dose}{unit}).",
+                     "missed_message": "Missed your {name} dose. Logged." }
+   }
+   EOF
+   ```
+
+   (`id`, `state` and tracking anchors are filled in by the command. A failed
+   add-med prints why — relay it, fix the med, re-run.)
+
+4. **Register the scheduler once:** `python3 setup-tasks.py --dry-run` to
+   preview, then `python3 setup-tasks.py`. One repeating tick task is
+   registered per state file; later `add-med` / `edit-med` / `remove` /
+   `pause` need no re-run — the tick picks up changes on its next run.
 
 ---
 
@@ -223,7 +318,7 @@ Confirm with: "Med passport saved to med-passport.html — open it in a browser 
 ## Section 7 — Reply handler
 
 This section governs every inbound message that is **not** a setup interview or passport
-command. It covers dose confirmations, deferrals, and status queries.
+command. It covers dose confirmations, snoozes, skips, undos, med edits, and status queries.
 
 This is the most load-bearing part of the skill. An incorrect write corrupts state.
 Follow the protocol below exactly for every reply that mutates state.
@@ -232,41 +327,60 @@ Follow the protocol below exactly for every reply that mutates state.
 
 ### Write protocol (mandatory for all state mutations)
 
-Every reply that changes state must follow these four steps in order. Do not skip any.
+Every state change is a single `reply.py` invocation. The command itself reads
+fresh state under a lock, validates, writes atomically, and appends history.
+The agent never reads-then-writes `meds-state.json`, never composes full-state
+JSON, never calls `dispatch.py` (scheduler-era; its old confirm/defer writers
+are gone), and never calls `safe-write.sh` (a deprecated shim around
+`safe_write.py`).
 
-**Step 1 — Read fresh state**
-Before computing anything, read the current `meds-state.json`. Never use state from
-earlier in the conversation — another process may have written since then.
+**Step 1 — Resolve the med name**
+Map the user's words to a med ID or digest position using the fuzzy match rules
+below. If the match is ambiguous: ask before proceeding. Never guess.
 
-**Step 2 — Resolve med names**
-Map the user's words to med IDs using the fuzzy match rules below.
-If the match is ambiguous: ask before proceeding. Never guess.
+**Step 2 — Run one `reply.py` command**
+Exactly one per reply. Do not chain a write behind a failed command.
 
-**Step 3 — Compute updated state in memory**
-Build the full updated state object. Do not call `safe-write.sh` until the state
-is complete and you are certain it is correct.
-
-**Step 4 — Call dispatch.py**
-Use the appropriate subcommand. `dispatch.py` validates, writes atomically via
-`safe-write.sh`, recomputes `next_due`, and appends history. Do not write
-`meds-state.json` directly — always go through `dispatch.py`.
+**Step 3 — Relay the command's output verbatim**
+It names the med and the dose credited ("Logged as your 8:00am dose."). Never
+fabricate a summary, never invent a next-dose time.
 
 ```bash
-# Confirm one med as taken (prescribed dose):
+# Took the prescribed dose, just now:
 python3 reply.py confirm med-001
 
-# Confirm one med with a different actual dose:
+# …by position in today's digest ("took the second one"):
+python3 reply.py confirm --position 2
+
+# Different actual dose:
 python3 reply.py confirm med-001 --dose-taken 250mg
 
-# Confirm all pending/reminded/late meds at once:
+# "took it at 8" — credit a specific past time:
+python3 reply.py confirm med-001 --taken-at 08:00
+
+# Pin which scheduled dose (after an exit-4 ambiguity):
+python3 reply.py confirm med-001 --dose 20:00
+
+# Everything pending at once (skips paused and as-needed meds):
 python3 reply.py confirm --all
 
-# Defer one med until next digest cycle:
-python3 reply.py defer med-001
+# Not yet / remind me later (default 30 min):
+python3 reply.py snooze med-001 --minutes 30
+
+# Skip this dose entirely (logged skipped, never missed):
+python3 reply.py skip med-001
+
+# Undo the last taken/skipped for this med (within 24h):
+python3 reply.py undo med-001
 ```
 
-After the command runs, report the result to the user using the output printed by
-`dispatch.py` (it prints a confirmation line). Do not fabricate a summary.
+### Exit codes — confirm
+
+| Exit | Meaning | Agent action |
+|------|---------|--------------|
+| 0 | Written | Relay the credited-dose line |
+| 3 | Duplicate: already logged within the med's minimum gap, nothing written | Relay the "You logged X at …" warning and ask. Only if the user insists they really took it again, re-run once with the printed nonce: `--force <nonce>`. Never pass the nonce without an explicit user OK |
+| 4 | Ambiguous which dose, nothing written | The command prints both candidate doses and "Reply with the time you took it". Ask the user, then re-run with `--dose HH:MM` (which scheduled dose) or `--taken-at HH:MM` (when it was taken) |
 
 ---
 
@@ -289,62 +403,70 @@ Never write state based on an ambiguous match. Always confirm with the user firs
 
 ### Reply intent map
 
-| User says | Intent | Action |
-|-----------|--------|--------|
-| `yes`, `done`, `all taken`, `took them all` | Confirm all | `dispatch.py confirm --all` |
-| `took metformin`, `done met`, `met done` | Confirm one | `dispatch.py confirm <id>` |
-| `took met: 250mg`, `metformin 250` | Confirm one, different dose | `dispatch.py confirm <id> --dose-taken 250mg` |
-| `skip metformin`, `skip 2`, `not yet met` | Defer one | `dispatch.py defer <id>` |
-| `status`, `what's due`, `my meds` | Info only | Read state, reply with summary — no write |
-| `pause metformin` | Pause one med | Edit `med.paused = true` → `safe-write.sh` (see below) |
-| `unpause metformin` | Unpause one med | Edit `med.paused = false` → `safe-write.sh` (see below) |
-| `add a med`, `new med` | Start interview | Begin Section 2 interview flow |
-| `remove metformin`, `delete met` | Delete a med | Confirm name, confirm deletion, then edit state |
+| User says | Intent | Command |
+|-----------|--------|---------|
+| `yes`, `done`, `all taken`, `took them all` | Confirm all | `reply.py confirm --all` |
+| `took metformin`, `done met`, `met done` | Confirm one | `reply.py confirm <id>` |
+| `took met: 250mg`, `metformin 250` | Confirm one, different dose | `reply.py confirm <id> --dose-taken 250mg` |
+| `took it at 8`, `met at 8am`, `took met this morning` | Confirm with a time | `reply.py confirm <id> --taken-at 08:00` |
+| `snooze met`, `later`, `not yet met`, `remind me in 30` | Snooze | `reply.py snooze <id> [--minutes N]` |
+| `skip metformin`, `skip 2` | Skip a dose | `reply.py skip <id>` |
+| `undo`, `undo met`, `I didn't take it after all` | Undo last taken/skipped | `reply.py undo <id>` |
+| `status`, `what's due`, `my meds` | Info only | `reply.py status` — relay output, no write |
+| `pause metformin` | Pause one med | `reply.py pause <id>` (confirm with the user first) |
+| `unpause metformin` | Unpause one med | `reply.py unpause <id>` |
+| `add a med`, `new med` | Start interview | Section 2 flow, written via `reply.py add-med --json -` |
+| `change met to 9pm`, `met is now 1000mg` | Edit a med | `reply.py edit-med <id> --json -` |
+| `quiet hours 11 to 8` | Change quiet hours | `reply.py set-quiet-hours 23:00 08:00` |
+| `remove metformin`, `delete met` | Delete a med | Confirm name + deletion with the user, then `reply.py remove <id> --yes` |
+
+Any `<id>` may be replaced by `--position N` (the Nth med in **today's** digest
+order; a stale yesterday's order is refused and the resolved name is echoed).
 
 ---
 
-### Pause / unpause (direct state edit)
+### Pause / unpause
 
-`dispatch.py` does not have a pause subcommand. For pause/unpause, edit the state
-directly following the write protocol:
+Confirm the action with the user first: *"Pause Metformin — correct? It won't
+receive reminders until you unpause it."* Then:
 
-1. Read `meds-state.json`
-2. Resolve the med name (fuzzy match + confirm if ambiguous)
-3. Confirm the action with the user: *"Pause Metformin — correct? It won't receive
-   reminders until you unpause it."*
-4. Set `med.paused = true` (or `false`)
-5. Write via `safe-write.sh`: `echo <updated-json> | bash safe-write.sh`
-6. Re-run `setup-tasks.py` to re-register (paused meds are excluded from scheduler)
+```bash
+python3 reply.py pause med-001
+python3 reply.py unpause med-001
+```
+
+Unpause restarts tracking from now — doses during the pause aren't counted as
+missed. No `setup-tasks.py` re-run is needed: one tick task covers all meds,
+paused or not.
 
 ---
 
 ### Status query (no write)
 
-When the user asks what's due, read state and reply with a compact summary.
-Do not write anything.
+When the user asks what's due, run the read-only summary and relay it:
 
-Template:
-```
-Your meds right now:
-• Metformin 500mg — confirmed at 8:14am ✓
-• Lisinopril 10mg — due at 9:00pm (pending)
-• Vitamin D 2000IU — missed (logged)
+```bash
+python3 reply.py status
 ```
 
-Use ✓ for confirmed, ⏳ for pending/reminded, ⚠️ for late, ✗ for missed, ⏸ for paused.
+It prints one line per med with schedule, last dose, and current stage
+(✓ taken, ⏳ pending/reminded, ⚠️ late, ✗ missed, ⏸ paused), plus quiet hours
+and digest time. Write nothing.
 
 ---
 
 ### After a reply — what to say back
 
-After every successful write, give a one-line confirmation that includes:
+After every successful write, give a one-line confirmation built from the
+command's own output:
 - Med name(s) affected
-- What happened (taken / skipped / paused)
-- Next due time if relevant (taken from `dispatch.py` output)
+- What happened (taken / skipped / snoozed / undone / paused) and, for confirms,
+  which scheduled dose was credited
+- Next due time only if the command printed one
 
 Example:
-> Metformin 500mg marked as taken. Next dose: 8:00pm.
-> Lisinopril 10mg skipped — I'll reset it at midnight.
+> Metformin 500mg — logged as your 8:00am dose.
+> Lisinopril 10mg — snoozed 30 min.
 
 Do not recap fields the user didn't ask about. Do not show internal IDs.
 
@@ -354,12 +476,16 @@ Do not recap fields the user didn't ask about. Do not show internal IDs.
 
 | Situation | Action |
 |-----------|--------|
-| `dispatch.py` exits non-zero | Show the error output verbatim, do not retry automatically |
+| `reply.py` exits 1 | Show the error output verbatim, do not retry automatically |
+| `reply.py confirm` exits 3 (duplicate) | Relay the "You logged X at …" warning; only re-run with `--force <nonce>` if the user explicitly confirms a second dose |
+| `reply.py confirm` exits 4 (ambiguous) | Relay the two candidate doses it printed; re-run with `--dose` or `--taken-at` once the user answers |
 | Fuzzy match is ambiguous | Ask for clarification before any write |
-| User says "undo" after a confirm | Explain that the log entry can't be deleted, but you can re-run confirm with the correct dose |
-| User names a paused med in "all taken" | `dispatch.py confirm --all` skips paused meds automatically — inform the user |
-| User confirms an `as_needed` med | Run `dispatch.py confirm <id>` — it works for as_needed; no next_due is set |
-| State file not found | Tell the user and give the path from `MEDS_STATE_FILE` env or the script directory |
+| User says "undo" after a confirm | Run `reply.py undo <id>` — works within 24h of the last taken/skipped and echoes what was undone |
+| User names a paused med in "all taken" | `confirm --all` skips paused (and as-needed) meds automatically — inform the user |
+| User confirms an `as_needed` med | Run `reply.py confirm <id>` — it works for as_needed; no next_due is set |
+| `add-med` / `edit-med` / `set-quiet-hours` refuses a quiet-hours conflict | Relay the suggested fix verbatim; move the dose or adjust quiet hours, then re-run |
+| `--position N` refused as stale | The digest order is from a previous day — resolve the med by name instead |
+| State file not found | Tell the user; the command's error prints the fix (`cp meds-state.template.json meds-state.json`) and the path from `MEDS_STATE_FILE` |
 
 ---
 
