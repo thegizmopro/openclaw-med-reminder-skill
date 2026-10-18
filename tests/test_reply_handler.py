@@ -1,31 +1,328 @@
 """
-Reply handler tests — reply.py confirm and defer subcommands.
+Reply handler tests — reply.py confirm (rewritten for issue #1 PR 2 §4)
+and defer subcommands.
+
+Confirm now goes through transact + the event store: taken events carry
+the credited occurrence key/generation and taken_at_utc; duplicates exit
+3 with a single-use --force nonce; ambiguity exits 4 without writing.
 """
-from datetime import datetime, timedelta
+import json
+import re
+from datetime import timedelta
 from unittest.mock import patch
 
 import pytest
 
-from clock import FakeClock
+import dispatch
+import event_store
+import safe_write as sw
+from clock import FakeClock, parse_instant
+from occurrence import at_local
 from reply import handle_confirm, handle_confirm_all, handle_defer
 from tests.conftest import make_state, make_med, iso, local_dt, TZ
 
+import datetime as dtmod
 
-def run_confirm(state, med_id, dose_taken=None):
-    saved = []
-    with patch("reply.load_state", return_value=state), \
-         patch("reply.save_state", side_effect=lambda s, dr: saved.append(s)):
-        handle_confirm(med_id, dose_taken, dry_run=False)
-    return saved
+TUE = dtmod.date(2026, 4, 21)
+MON = dtmod.date(2026, 4, 20)
 
 
-def run_confirm_all(state, dose_taken=None):
-    saved = []
-    with patch("reply.load_state", return_value=state), \
-         patch("reply.save_state", side_effect=lambda s, dr: saved.append(s)):
-        handle_confirm_all(dose_taken, dry_run=False)
-    return saved
+@pytest.fixture
+def state_file(tmp_path, monkeypatch):
+    sf = tmp_path / "meds-state.json"
+    monkeypatch.setattr(dispatch, "STATE_FILE", sf)
+    monkeypatch.setattr(sw, "STATE_FILE", sf)
+    monkeypatch.setattr(sw, "LOG_FILE", tmp_path / "sw.log")
+    return sf
 
+
+def write_state(sf, meds=None, **kw):
+    sf.write_text(json.dumps(make_state(meds=meds if meds is not None else [], **kw)),
+                  encoding="utf-8")
+
+
+def events(sf):
+    return event_store.load_events(sw.history_file())
+
+
+def on_disk(sf):
+    return json.loads(sf.read_text(encoding="utf-8"))
+
+
+# ── confirm: event, legacy fields, output ─────────────────────────────────────
+
+def test_confirm_writes_keyed_taken_event_and_legacy_fields(state_file):
+    med = make_med(med_id="med-001", frequency="once_daily", times=["08:00"])
+    write_state(state_file, meds=[med])
+
+    handle_confirm("med-001", None, dry_run=False, clock=FakeClock(local_dt(8, 14)))
+
+    evs = events(state_file)
+    assert len(evs) == 1 and evs[0]["event"] == "taken"
+    assert evs[0]["occurrence_key"] == "2026-04-21T08:00#0"
+    assert evs[0]["taken_at_utc"] is not None
+    st = on_disk(state_file)["meds"][0]["state"]
+    assert st["status"] == "confirmed"
+    assert st["confirmed_dose"] == at_local(TUE, "08:00", TZ, 0).utc.isoformat()
+    nd = at_local(TUE + dtmod.timedelta(days=1), "08:00", TZ, 0).utc
+    assert parse_instant(st["next_due"]) == nd
+    # rollback mirror in state.history
+    assert st["history"][-1]["event"] == "taken"
+
+
+def test_confirm_prints_credited_dose(state_file, capsys):
+    med = make_med(med_id="med-001", frequency="twice_daily", times=["08:00", "20:00"])
+    write_state(state_file, meds=[med])
+    handle_confirm("med-001", None, dry_run=False, clock=FakeClock(local_dt(14, 30)))
+    assert "Logged as your 8:00am dose." in capsys.readouterr().out
+
+
+def test_ac1_midday_confirm_keeps_evening_reminder(state_file):
+    # AC 1: the 20:00 occurrence stays unresolved — the tick will still remind
+    med = make_med(med_id="med-001", frequency="twice_daily", times=["08:00", "20:00"])
+    write_state(state_file, meds=[med])
+    handle_confirm("med-001", None, dry_run=False, clock=FakeClock(local_dt(14, 30)))
+    keys = [e["occurrence_key"] for e in events(state_file)]
+    assert "2026-04-21T08:00#0" in keys
+    assert "2026-04-21T20:00#1" not in keys
+
+
+def test_confirm_unattributed_says_so(state_file, capsys):
+    med = make_med(med_id="med-001", frequency="as_needed")
+    write_state(state_file, meds=[med])
+    handle_confirm("med-001", None, dry_run=False, clock=FakeClock(local_dt(12, 0)))
+    out = capsys.readouterr().out
+    assert "without a schedule slot" in out
+    evs = events(state_file)
+    assert evs[0]["event"] == "taken" and "occurrence_key" not in evs[0]
+
+
+def test_confirm_interval_credits_anchor_and_reanchors(state_file):
+    med = make_med(med_id="med-001", frequency="interval", interval_hours=8,
+                   next_due=local_dt(8, 0).isoformat())
+    write_state(state_file, meds=[med])
+    handle_confirm("med-001", None, dry_run=False, clock=FakeClock(local_dt(9, 0)))
+    evs = events(state_file)
+    # occurrence keyed by the UTC instant 08:00 PDT = 15:00Z
+    assert evs[0]["occurrence_key"] == "2026-04-21T15:00:00Z"
+    st = on_disk(state_file)["meds"][0]["state"]
+    assert parse_instant(st["next_due"]) == local_dt(17, 0).astimezone(dtmod.timezone.utc)
+
+
+def test_confirm_interval_without_anchor_is_unattributed_but_reanchors(state_file):
+    med = make_med(med_id="med-001", frequency="interval", interval_hours=8)
+    write_state(state_file, meds=[med])
+    handle_confirm("med-001", None, dry_run=False, clock=FakeClock(local_dt(9, 0)))
+    evs = events(state_file)
+    assert evs[0]["event"] == "taken" and "occurrence_key" not in evs[0]
+    st = on_disk(state_file)["meds"][0]["state"]
+    assert parse_instant(st["next_due"]) == local_dt(17, 0).astimezone(dtmod.timezone.utc)
+
+
+def test_confirm_stores_dose_taken(state_file):
+    med = make_med(med_id="med-001", frequency="once_daily", times=["08:00"])
+    write_state(state_file, meds=[med])
+    handle_confirm("med-001", "250mg", dry_run=False, clock=FakeClock(local_dt(8, 14)))
+    evs = events(state_file)
+    assert evs[0]["dose_taken"] == "250mg"
+    assert evs[0]["dose_prescribed"] == "500mg"
+
+
+def test_confirm_skips_paused_med(state_file, capsys):
+    med = make_med(med_id="med-001", paused=True)
+    write_state(state_file, meds=[med])
+    handle_confirm("med-001", None, dry_run=False, clock=FakeClock(local_dt(8, 14)))
+    assert events(state_file) == []
+    assert "paused" in capsys.readouterr().out
+
+
+def test_confirm_dry_run_writes_nothing(state_file, capsys):
+    med = make_med(med_id="med-001", frequency="once_daily", times=["08:00"])
+    write_state(state_file, meds=[med])
+    before = state_file.read_text(encoding="utf-8")
+    handle_confirm("med-001", None, dry_run=True, clock=FakeClock(local_dt(8, 14)))
+    assert state_file.read_text(encoding="utf-8") == before
+    assert events(state_file) == []
+
+
+# ── AC 3/4: ambiguity and --dose ──────────────────────────────────────────────
+
+def test_ac3_ambiguous_exits_4_and_writes_nothing(state_file, capsys):
+    med = make_med(med_id="med-001", frequency="twice_daily", times=["08:00", "09:30"])
+    write_state(state_file, meds=[med])
+    before = state_file.read_text(encoding="utf-8")
+    with pytest.raises(SystemExit) as e:
+        handle_confirm("med-001", None, dry_run=False, clock=FakeClock(local_dt(8, 40)))
+    assert e.value.code == 4
+    assert state_file.read_text(encoding="utf-8") == before
+    assert events(state_file) == []
+    out = capsys.readouterr().out
+    assert "8:00am" in out and "9:30am" in out
+
+
+def test_ac4_dose_pin_credits_evening_dose(state_file):
+    med = make_med(med_id="med-001", frequency="twice_daily", times=["08:00", "20:00"])
+    write_state(state_file, meds=[med])
+    handle_confirm("med-001", None, dry_run=False, clock=FakeClock(local_dt(14, 30)),
+                   dose_pin="20:00")
+    assert events(state_file)[0]["occurrence_key"] == "2026-04-21T20:00#1"
+
+
+def test_ac4_dose_pin_rejects_unscheduled_time(state_file):
+    med = make_med(med_id="med-001", frequency="twice_daily", times=["08:00", "20:00"])
+    write_state(state_file, meds=[med])
+    with pytest.raises(SystemExit) as e:
+        handle_confirm("med-001", None, dry_run=False, clock=FakeClock(local_dt(14, 30)),
+                       dose_pin="09:00")
+    assert e.value.code != 0 and e.value.code != 4
+    assert events(state_file) == []
+
+
+# ── AC 5: --taken-at ──────────────────────────────────────────────────────────
+
+def test_ac5_taken_at_records_yesterday_23(state_file):
+    med = make_med(med_id="med-001", frequency="once_daily", times=["23:00"])
+    write_state(state_file, meds=[med])
+    # wall clock says Wed 00:30; the dose was taken Tue 23:00
+    handle_confirm("med-001", None, dry_run=False,
+                   clock=FakeClock(local_dt(0, 30) + dtmod.timedelta(days=1)),
+                   taken_at_raw="23:00")
+    evs = events(state_file)
+    assert evs[0]["occurrence_key"] == "2026-04-21T23:00#0"
+    assert evs[0]["taken_at_utc"] == local_dt(23, 0).astimezone(dtmod.timezone.utc).isoformat()
+    # attribution used taken_at, so the credited dose is yesterday's 23:00
+    st = on_disk(state_file)["meds"][0]["state"]
+    assert st["last_taken"] == local_dt(23, 0).astimezone(dtmod.timezone.utc).isoformat()
+
+
+def test_taken_at_bad_value_exits_nonzero(state_file):
+    med = make_med(med_id="med-001")
+    write_state(state_file, meds=[med])
+    with pytest.raises(SystemExit) as e:
+        handle_confirm("med-001", None, dry_run=False, clock=FakeClock(local_dt(12, 0)),
+                       taken_at_raw="25:99")
+    assert e.value.code != 0
+
+
+# ── AC 6: duplicate refusal, nonce, --force ───────────────────────────────────
+
+def confirm(med_id, now, **kw):
+    handle_confirm(med_id, None, dry_run=False, clock=FakeClock(now), **kw)
+
+
+def test_ac6_duplicate_exits_3_with_nonce_and_no_taken_event(state_file, capsys):
+    med = make_med(med_id="med-001", frequency="once_daily", times=["08:00"])
+    write_state(state_file, meds=[med])
+    confirm("med-001", local_dt(8, 5))
+    assert len(events(state_file)) == 1
+
+    with pytest.raises(SystemExit) as e:
+        confirm("med-001", local_dt(14, 0))     # 5.75h later, gap is 12h
+    assert e.value.code == 3
+    out = capsys.readouterr().out
+    assert "Already logged" in out and "8:05am" in out
+    nonce = re.search(r"--force ([0-9a-f]+)", out).group(1)
+    assert len(events(state_file)) == 1, "no taken event may be written on refusal"
+
+    # wrong nonce still refused
+    with pytest.raises(SystemExit) as e:
+        confirm("med-001", local_dt(14, 2), force="deadbeef")
+    assert e.value.code == 3
+    capsys.readouterr()
+
+    # right nonce succeeds once…
+    confirm("med-001", local_dt(14, 4), force=nonce)
+    assert len(events(state_file)) == 2
+
+    # …and cannot be replayed
+    capsys.readouterr()
+    with pytest.raises(SystemExit) as e:
+        confirm("med-001", local_dt(14, 6), force=nonce)
+    assert e.value.code == 3
+
+
+def test_ac6_nonce_expires_after_10_minutes(state_file, capsys):
+    med = make_med(med_id="med-001", frequency="once_daily", times=["08:00"])
+    write_state(state_file, meds=[med])
+    confirm("med-001", local_dt(8, 5))
+    with pytest.raises(SystemExit):
+        confirm("med-001", local_dt(9, 0))      # offer created at 09:00
+    nonce = re.search(r"--force ([0-9a-f]+)", capsys.readouterr().out).group(1)
+    with pytest.raises(SystemExit) as e:
+        confirm("med-001", local_dt(9, 30), force=nonce)   # 30 min later
+    assert e.value.code == 3
+
+
+def test_second_dose_outside_gap_is_logged(state_file):
+    # 08:00/20:00 med, gap 6h: morning at 08:14, evening at 20:30 is fine
+    med = make_med(med_id="med-001", frequency="twice_daily", times=["08:00", "20:00"])
+    write_state(state_file, meds=[med])
+    confirm("med-001", local_dt(8, 14))
+    confirm("med-001", local_dt(20, 30))
+    assert len(events(state_file)) == 2
+
+
+def test_early_confirm_anchors_next_due_past_covered_dose(state_file):
+    # 'all taken' at 07:32 credits the 08:00 dose; next_due is 20:00,
+    # not the 08:00 just covered (regression: old code re-anchored on now)
+    med = make_med(med_id="med-001", frequency="twice_daily", times=["08:00", "20:00"])
+    write_state(state_file, meds=[med])
+    confirm("med-001", local_dt(7, 32))
+    assert events(state_file)[0]["occurrence_key"] == "2026-04-21T08:00#0"
+    st = on_disk(state_file)["meds"][0]["state"]
+    assert parse_instant(st["next_due"]) == local_dt(20, 0).astimezone(dtmod.timezone.utc)
+
+
+# ── confirm --all ─────────────────────────────────────────────────────────────
+
+def test_confirm_all_marks_all_scheduled(state_file):
+    m1 = make_med(med_id="med-001", name="Metformin", frequency="once_daily", times=["08:00"])
+    m2 = make_med(med_id="med-002", name="Lisinopril", frequency="once_daily", times=["21:00"])
+    write_state(state_file, meds=[m1, m2])
+    handle_confirm_all(None, dry_run=False, clock=FakeClock(local_dt(12, 0)))
+    taken = [e for e in events(state_file) if e["event"] == "taken"]
+    assert {e["med_id"] for e in taken} == {"med-001", "med-002"}
+
+
+def test_confirm_all_skips_paused_and_as_needed(state_file, capsys):
+    active = make_med(med_id="med-001", name="Metformin", frequency="once_daily", times=["08:00"])
+    paused = make_med(med_id="med-002", name="Lisinopril", paused=True,
+                      frequency="once_daily", times=["08:00"])
+    prn = make_med(med_id="med-003", name="Ibuprofen", frequency="as_needed")
+    write_state(state_file, meds=[active, paused, prn])
+    handle_confirm_all(None, dry_run=False, clock=FakeClock(local_dt(12, 0)))
+    ids = {e["med_id"] for e in events(state_file)}
+    assert ids == {"med-001"}
+    out = capsys.readouterr().out
+    assert "Lisinopril" in out and "Ibuprofen" in out
+
+
+def test_confirm_all_uses_6h_window_after_digest(state_file):
+    # 'all taken' at 07:32 for an 11:00 dose: only the 6h window credits it
+    med = make_med(med_id="med-001", frequency="once_daily", times=["11:00"])
+    write_state(state_file, meds=[med])
+    digest_sent = event_store.new_event("__global__", "sent", local_dt(7, 30),
+                                        stage="digest", occurrence_key="digest#2026-04-21")
+    event_store.append_events(sw.history_file(), [digest_sent])
+
+    handle_confirm_all(None, dry_run=False, clock=FakeClock(local_dt(7, 32)))
+    assert events(state_file)[-1]["occurrence_key"] == "2026-04-21T11:00#0"
+
+
+def test_confirm_all_outside_digest_grace_uses_90min_window(state_file):
+    # digest sent 3h ago — outside the 60-min grace, so the 90-min window
+    # applies and the 11:00 dose is too far off; yesterday's dose is credited
+    med = make_med(med_id="med-001", frequency="once_daily", times=["11:00"])
+    write_state(state_file, meds=[med])
+    digest_sent = event_store.new_event("__global__", "sent", local_dt(4, 30),
+                                        stage="digest", occurrence_key="digest#2026-04-21")
+    event_store.append_events(sw.history_file(), [digest_sent])
+
+    handle_confirm_all(None, dry_run=False, clock=FakeClock(local_dt(7, 32)))
+    assert events(state_file)[-1]["occurrence_key"] == "2026-04-20T11:00#0"
+
+
+# ── defer (unchanged legacy command, PR 4 replaces it) ─────────────────────────
 
 def run_defer(state, med_id):
     saved = []
@@ -35,159 +332,22 @@ def run_defer(state, med_id):
     return saved
 
 
-# ── confirm: status and last_taken ────────────────────────────────────────────
-
-def test_confirm_sets_status_confirmed():
-    med   = make_med(med_id="med-001", status="reminded")
-    state = make_state(meds=[med])
-    saved = run_confirm(state, "med-001")
-    assert saved[-1]["meds"][0]["state"]["status"] == "confirmed"
-
-
-def test_confirm_sets_last_taken_to_now():
-    med   = make_med(med_id="med-001", status="reminded")
-    state = make_state(meds=[med])
-    before = datetime.now(tz=TZ)
-    saved  = run_confirm(state, "med-001")
-    after  = datetime.now(tz=TZ)
-    last_taken = datetime.fromisoformat(saved[-1]["meds"][0]["state"]["last_taken"])
-    assert before <= last_taken <= after
-
-
-# ── confirm: next_due is advanced ─────────────────────────────────────────────
-
-def test_confirm_advances_next_due_once_daily():
-    med   = make_med(med_id="med-001", frequency="once_daily", times=["08:00"],
-                     next_due=iso(local_dt(8, 0)))
-    state = make_state(meds=[med])
-    saved = run_confirm(state, "med-001")
-    nd    = saved[-1]["meds"][0]["state"]["next_due"]
-    assert nd is not None
-    nd_dt = datetime.fromisoformat(nd)
-    assert nd_dt > datetime.now(tz=TZ), "next_due must be in the future"
-
-
-def test_confirm_sets_next_due_none_for_as_needed():
-    med   = make_med(med_id="med-001", frequency="as_needed", status="pending")
-    state = make_state(meds=[med])
-    saved = run_confirm(state, "med-001")
-    assert saved[-1]["meds"][0]["state"]["next_due"] is None
-
-
-# ── confirm: history entry ─────────────────────────────────────────────────────
-
-def test_confirm_appends_taken_history():
-    med   = make_med(med_id="med-001")
-    state = make_state(meds=[med])
-    saved = run_confirm(state, "med-001")
-    hist  = saved[-1]["meds"][0]["state"]["history"]
-    assert len(hist) == 1
-    assert hist[-1]["event"] == "taken"
-
-
-def test_confirm_stores_dose_taken_when_provided():
-    med   = make_med(med_id="med-001", dose="500", unit="mg")
-    state = make_state(meds=[med])
-    saved = run_confirm(state, "med-001", dose_taken="250mg")
-    assert saved[-1]["meds"][0]["state"]["history"][-1]["dose_taken"] == "250mg"
-
-
-def test_confirm_dose_taken_none_when_not_provided():
-    med   = make_med(med_id="med-001")
-    state = make_state(meds=[med])
-    saved = run_confirm(state, "med-001")
-    assert saved[-1]["meds"][0]["state"]["history"][-1]["dose_taken"] is None
-
-
-# ── confirm: paused med is skipped ────────────────────────────────────────────
-
-def test_confirm_skips_paused_med():
-    med   = make_med(med_id="med-001", paused=True)
-    state = make_state(meds=[med])
-    saved = run_confirm(state, "med-001")
-    assert len(saved) == 0, "No state write should occur for a paused med"
-
-
-# ── confirm --all ─────────────────────────────────────────────────────────────
-
-def test_confirm_all_marks_all_pending():
-    m1 = make_med(med_id="med-001", name="Metformin",  status="reminded")
-    m2 = make_med(med_id="med-002", name="Lisinopril", status="late")
-    state = make_state(meds=[m1, m2])
-    saved = run_confirm_all(state)
-    result = saved[-1]["meds"]
-    assert result[0]["state"]["status"] == "confirmed"
-    assert result[1]["state"]["status"] == "confirmed"
-
-
-def test_confirm_all_skips_paused():
-    active = make_med(med_id="med-001", name="Metformin",  paused=False, status="reminded")
-    paused = make_med(med_id="med-002", name="Lisinopril", paused=True,  status="reminded")
-    state  = make_state(meds=[active, paused])
-    saved  = run_confirm_all(state)
-    result = saved[-1]["meds"]
-    assert result[0]["state"]["status"] == "confirmed"
-    assert result[1]["state"]["status"] == "reminded"  # unchanged
-
-
-def test_confirm_all_skips_already_confirmed():
-    # Skipped only when the confirm would re-credit the same occurrence —
-    # at 08:30 the covered occurrence for an 08:00 med is 08:00.
-    m1 = make_med(med_id="med-001", name="Metformin",  status="confirmed",
-                  confirmed_dose=iso(local_dt(8, 0)))
-    m2 = make_med(med_id="med-002", name="Lisinopril", status="late")
-    state = make_state(meds=[m1, m2])
-    saved = []
-    with patch("reply.load_state", return_value=state), \
-         patch("reply.save_state", side_effect=lambda s, dr: saved.append(s)):
-        handle_confirm_all(None, dry_run=False, clock=FakeClock(local_dt(8, 30)))
-    result = saved[-1]["meds"]
-    assert result[0]["state"]["status"] == "confirmed"  # was already confirmed, unchanged
-    assert result[1]["state"]["status"] == "confirmed"  # newly confirmed
-
-
-def test_confirm_all_no_save_when_nothing_to_confirm():
-    m1 = make_med(med_id="med-001", status="confirmed",
-                  confirmed_dose=iso(local_dt(8, 0)))
-    state = make_state(meds=[m1])
-    saved = []
-    with patch("reply.load_state", return_value=state), \
-         patch("reply.save_state", side_effect=lambda s, dr: saved.append(s)):
-        handle_confirm_all(None, dry_run=False, clock=FakeClock(local_dt(8, 30)))
-    assert len(saved) == 0
-
-
-# ── defer ─────────────────────────────────────────────────────────────────────
-
 def test_defer_sets_status_deferred():
-    med   = make_med(med_id="med-001", status="reminded")
+    med = make_med(med_id="med-001", status="reminded")
     state = make_state(meds=[med])
     saved = run_defer(state, "med-001")
     assert saved[-1]["meds"][0]["state"]["status"] == "deferred"
 
 
 def test_defer_appends_deferred_history():
-    med   = make_med(med_id="med-001")
+    med = make_med(med_id="med-001")
     state = make_state(meds=[med])
     saved = run_defer(state, "med-001")
-    hist  = saved[-1]["meds"][0]["state"]["history"]
+    hist = saved[-1]["meds"][0]["state"]["history"]
     assert hist[-1]["event"] == "deferred"
 
 
 def test_defer_paused_med_does_not_write():
-    med   = make_med(med_id="med-001", paused=True)
+    med = make_med(med_id="med-001", paused=True)
     state = make_state(meds=[med])
-    saved = run_defer(state, "med-001")
-    assert len(saved) == 0
-
-
-# ── dry-run: no save called ───────────────────────────────────────────────────
-
-def test_confirm_dry_run_does_not_call_save():
-    med   = make_med(med_id="med-001")
-    state = make_state(meds=[med])
-    saved = []
-    with patch("reply.load_state", return_value=state), \
-         patch("reply.save_state", side_effect=lambda s, dr: saved.append(s) if not dr else None):
-        handle_confirm("med-001", None, dry_run=True)
-    assert len(saved) == 0
+    assert run_defer(state, "med-001") == []

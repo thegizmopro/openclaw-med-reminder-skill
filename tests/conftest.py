@@ -1,4 +1,5 @@
 """Shared fixtures for med reminder tests."""
+import json
 import sys
 from pathlib import Path
 
@@ -91,8 +92,101 @@ def local_dt(hour, minute=0, second=0, tz=TZ,
     return datetime(year, month, day, hour, minute, second, tzinfo=tz)
 
 
+# ── Tick engine fixture (issue #1 PR 2) ───────────────────────────────────────
+
+def make_tick_env(tmp_path, monkeypatch):
+    """
+    Wire a real state file + the fake sender into dispatch/safe_write.
+
+    Returns a small helper object: write(state), run(now), sent(), events(),
+    state(), plus sender switches (fail/heal/sleep). `run` normalizes `now`
+    to UTC — pass aware datetimes in any timezone.
+    """
+    import dispatch
+    import event_store
+    import safe_write as sw
+    import tick
+    from clock import FakeClock
+
+    sf = tmp_path / "meds-state.json"
+    monkeypatch.setattr(sw, "STATE_FILE", sf)
+    monkeypatch.setattr(sw, "LOG_FILE", tmp_path / "sw.log")
+    monkeypatch.setattr(dispatch, "STATE_FILE", sf)
+    monkeypatch.setattr(dispatch, "LOG_FILE", tmp_path / "dispatch.log")
+
+    out = tmp_path / "sent.txt"
+    fail_flag = tmp_path / "sender-fail"
+    sleep_flag = tmp_path / "sender-sleep"
+    monkeypatch.setattr(
+        dispatch, "SEND_CMD",
+        f'"{sys.executable}" "{Path(__file__).parent / "fake_sender.py"}"')
+    monkeypatch.setenv("FAKE_SEND_OUT", str(out))
+    monkeypatch.setenv("FAKE_SEND_FAIL", str(fail_flag))
+    monkeypatch.setenv("FAKE_SEND_SLEEP", str(sleep_flag))
+
+    class Env:
+        state_file = sf
+        sent_file = out
+
+        def write(self, meds=None, digest_time="01:37", **kw):
+            # digest_time parked outside test hours by default so digest
+            # messages don't pollute stage assertions; digest tests override
+            sf.write_text(json.dumps(make_state(meds=meds if meds is not None else [],
+                                                digest_time=digest_time, **kw)),
+                          encoding="utf-8")
+
+        def run(self, now, tick_minutes=5, dry_run=False):
+            return tick.run_tick(dry_run=dry_run, clock=FakeClock(now),
+                                 tick_minutes=tick_minutes)
+
+        def sent(self):
+            if not out.exists():
+                return []
+            return [m for m in out.read_text(encoding="utf-8").split("\n---\n") if m]
+
+        def sent_count(self, needle=None):
+            msgs = self.sent()
+            return len(msgs) if needle is None else sum(1 for m in msgs if needle in m)
+
+        def events(self, kind=None):
+            evs = event_store.load_events(sw.history_file())
+            return [e for e in evs if e.get("event") == kind] if kind else evs
+
+        def seed(self, events):
+            event_store.append_events(sw.history_file(), events)
+
+        def state(self):
+            return json.loads(sf.read_text(encoding="utf-8"))
+
+        def med_state(self, i=0):
+            return self.state()["meds"][i]["state"]
+
+        def heartbeat(self):
+            return json.loads((tmp_path / "tick-heartbeat.json").read_text(encoding="utf-8"))
+
+        def fail_sends(self):
+            fail_flag.write_text("1", encoding="utf-8")
+
+        def heal_sends(self):
+            fail_flag.unlink(missing_ok=True)
+
+        def sleep_sends(self, seconds):
+            sleep_flag.write_text(str(seconds), encoding="utf-8")
+
+        def wake_sends(self):
+            sleep_flag.unlink(missing_ok=True)
+
+    return Env()
+
+
 def iso(dt):
     return dt.isoformat()
+
+
+def utc(local):
+    """Normalize an aware datetime to UTC — every tick comparison runs there."""
+    from datetime import timezone
+    return local.astimezone(timezone.utc)
 
 
 def load_setup_tasks():
