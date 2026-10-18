@@ -1,138 +1,139 @@
 """
-Cases 18-20: handle_digest() — daily summary and deferred reset.
+Digest tests against the tick engine (issue #1 §3.7 — the digest is a
+stage keyed by local date: once/day, skipped if more than 4h late).
 """
-from unittest.mock import patch, call
-from datetime import datetime
-from zoneinfo import ZoneInfo
-
-from clock import FakeClock
-from dispatch import handle_digest
-from tests.conftest import make_state, make_med, iso, local_dt, TZ
-
-
-def run_digest(state):
-    """Run handle_digest with mocked I/O. Returns (sent_messages, saved_states)."""
-    sent    = []
-    saved   = []
-    with patch("dispatch.load_state", return_value=state), \
-         patch("dispatch.save_state",   side_effect=lambda s, dr: saved.append(s)), \
-         patch("dispatch.send_message", side_effect=lambda t, dr, clock=None: sent.append(t)):
-        handle_digest(dry_run=False)
-    return sent, saved
-
-
-# ── Case 18: digest includes all non-paused meds ─────────────────────────────
-
-def test_case_18_digest_includes_active_meds():
-    met = make_med(med_id="med-001", name="Metformin",
-                   frequency="once_daily", times=["08:00"])
-    lis = make_med(med_id="med-002", name="Lisinopril",
-                   frequency="once_daily", times=["21:00"])
-    state = make_state(meds=[met, lis])
-
-    sent, _ = run_digest(state)
-
-    assert len(sent) == 1, "Digest should send exactly one message"
-    msg = sent[0]
-    assert "Metformin" in msg
-    assert "Lisinopril" in msg
-
-
-# ── Case 19: paused med excluded from digest ──────────────────────────────────
-
-def test_case_19_paused_med_excluded_from_digest():
-    active = make_med(med_id="med-001", name="Metformin",
-                      frequency="once_daily", times=["08:00"], paused=False)
-    paused = make_med(med_id="med-002", name="Lisinopril",
-                      frequency="once_daily", times=["21:00"], paused=True)
-    state = make_state(meds=[active, paused])
-
-    sent, _ = run_digest(state)
-
-    assert len(sent) == 1
-    msg = sent[0]
-    assert "Metformin"  in msg
-    assert "Lisinopril" not in msg
-
-
-# ── Case 20: deferred meds reset to pending when digest fires ─────────────────
-
-def test_case_20_deferred_reset_to_pending_on_digest():
-    deferred = make_med(med_id="med-001", name="Metformin",
-                        frequency="once_daily", times=["08:00"],
-                        status="deferred")
-    state = make_state(meds=[deferred])
-
-    _, saved = run_digest(state)
-
-    assert saved, "State should have been saved after resetting deferred med"
-    final_state = saved[-1]
-    assert final_state["meds"][0]["state"]["status"] == "pending", \
-        "Deferred med should be reset to pending after digest"
-
-
-# ── Extra: global pause skips digest entirely ─────────────────────────────────
-
-def test_global_pause_skips_digest():
-    met   = make_med(med_id="med-001", name="Metformin",
-                     frequency="once_daily", times=["08:00"])
-    state = make_state(paused=True, meds=[met])
-
-    sent, saved = run_digest(state)
-
-    assert len(sent) == 0,  "No message should be sent when globally paused"
-    assert len(saved) == 0, "State should not be written when globally paused"
-
-
-# ── Extra: empty meds list → no message, no save ─────────────────────────────
-
-def test_empty_meds_no_message():
-    state = make_state(meds=[])
-    sent, saved = run_digest(state)
-    assert len(sent) == 0
-
-
-# ── Extra: as_needed meds appear in digest ────────────────────────────────────
-
-def test_as_needed_med_shown_in_digest():
-    med   = make_med(med_id="med-001", name="Ibuprofen", frequency="as_needed")
-    state = make_state(meds=[med])
-    sent, _ = run_digest(state)
-    assert "Ibuprofen" in sent[0]
-    assert "as needed" in sent[0]
-
-
-# ── Extra: 7-day adherence line from history ──────────────────────────────────
-
+import datetime as dtmod
 from datetime import timedelta
 
+import event_store
+from occurrence import at_local, at_utc
+from tests.conftest import local_dt, make_med, make_tick_env, TZ, utc
 
-def run_digest_at(state, now):
-    sent = []
-    with patch("dispatch.load_state", return_value=state), \
-         patch("dispatch.save_state"), \
-         patch("dispatch.send_message", side_effect=lambda t, dr, clock=None: sent.append(t)):
-        handle_digest(dry_run=False, clock=FakeClock(now))
-    return sent
+import pytest
 
-
-def _hist(event, days_ago, hour=8):
-    return {"timestamp": iso(local_dt(hour, 0) - timedelta(days=days_ago)),
-            "event": event, "dose_prescribed": "500mg"}
+TUE = dtmod.date(2026, 4, 21)
 
 
-def test_digest_adherence_line_counts_last_7_days():
-    now = local_dt(12, 0)
-    med = make_med(med_id="med-001", history=[
-        _hist("taken", 1), _hist("taken", 2), _hist("taken", 6),
-        _hist("missed", 3),
-        _hist("taken", 9),   # outside the window — ignored
-    ])
-    sent = run_digest_at(make_state(meds=[med]), now)
-    assert "Last 7 days: 3/4 doses taken" in sent[0]
+@pytest.fixture
+def env(tmp_path, monkeypatch):
+    return make_tick_env(tmp_path, monkeypatch)
 
 
-def test_digest_adherence_line_omitted_without_events():
-    med = make_med(med_id="med-001", history=[])
-    sent = run_digest_at(make_state(meds=[med]), local_dt(12, 0))
-    assert "Last 7 days" not in sent[0]
+def digest_msgs(env):
+    return [m for m in env.sent() if "Meds for" in m]
+
+
+def test_digest_sent_at_first_tick_after_digest_time(env):
+    env.write(meds=[make_med(med_id="med-001", frequency="once_daily",
+                             times=["08:00"])],
+              digest_time="07:30")
+    env.run(local_dt(7, 0))
+    env.run(local_dt(7, 32))
+    msgs = digest_msgs(env)
+    assert len(msgs) == 1
+    assert "Metformin 500mg | 8:00am" in msgs[0]
+
+
+def test_digest_once_per_local_date(env):
+    env.write(meds=[make_med(med_id="med-001", frequency="once_daily",
+                             times=["08:00"])],
+              digest_time="07:30")
+    env.run(local_dt(7, 0))
+    env.run(local_dt(7, 32))
+    env.run(local_dt(9, 0))
+    env.run(local_dt(11, 0))
+    assert len(digest_msgs(env)) == 1
+
+
+def test_digest_skipped_when_more_than_4h_late(env):
+    env.write(meds=[make_med(med_id="med-001", frequency="once_daily",
+                             times=["20:00"])],
+              digest_time="08:00")
+    env.run(local_dt(7, 0))
+    env.run(local_dt(12, 30))               # 4.5h after digest_time
+    assert digest_msgs(env) == []
+
+
+def test_digest_lists_active_meds_and_excludes_paused(env):
+    met = make_med(med_id="med-001", name="Metformin", frequency="once_daily",
+                   times=["08:00"])
+    lis = make_med(med_id="med-002", name="Lisinopril", paused=True,
+                   frequency="once_daily", times=["21:00"])
+    env.write(meds=[met, lis], digest_time="07:30")
+    env.run(local_dt(7, 0))
+    env.run(local_dt(7, 32))
+    msg = digest_msgs(env)[0]
+    assert "Metformin" in msg and "Lisinopril" not in msg
+
+
+def test_as_needed_med_shown_in_digest(env):
+    env.write(meds=[make_med(med_id="med-001", name="Ibuprofen",
+                             frequency="as_needed")],
+              digest_time="07:30")
+    env.run(local_dt(7, 0))
+    env.run(local_dt(7, 32))
+    msg = digest_msgs(env)[0]
+    assert "Ibuprofen" in msg and "as needed" in msg
+
+
+def test_digest_lists_weekly_day(env):
+    env.write(meds=[make_med(med_id="med-001", frequency="weekly",
+                             times=["09:00"], day_of_week="mon")],
+              digest_time="07:30")
+    env.run(local_dt(7, 0))
+    env.run(local_dt(7, 32))
+    assert "Mon 9:00am" in digest_msgs(env)[0]
+
+
+def test_digest_adherence_from_history_store(env):
+    # 3 taken + 1 missed in the last 7 days; one taken-overrides-missed pair
+    med = make_med(med_id="med-001", frequency="once_daily", times=["08:00"])
+    env.write(meds=[med], digest_time="07:30")
+    evs = []
+    for days_ago in (1, 2, 6):
+        day = TUE - dtmod.timedelta(days=days_ago)
+        occ = at_local(day, "08:00", TZ, 0)
+        evs.append(event_store.new_event(
+            "med-001", "taken", local_dt(8, 10) - dtmod.timedelta(days=days_ago),
+            occurrence=occ, taken_at_utc=utc(local_dt(8, 10) - dtmod.timedelta(days=days_ago)).isoformat()))
+    day3 = TUE - dtmod.timedelta(days=3)
+    occ3 = at_local(day3, "08:00", TZ, 0)
+    evs.append(event_store.new_event("med-001", "missed", local_dt(9, 30) - dtmod.timedelta(days=3), occurrence=occ3))
+    evs.append(event_store.new_event("med-001", "taken", local_dt(10, 0) - dtmod.timedelta(days=3),
+                                     occurrence=occ3))     # late taken overrides
+    evs.append(event_store.new_event("med-001", "missed", local_dt(9, 30) - dtmod.timedelta(days=5),
+                                     occurrence=at_local(TUE - dtmod.timedelta(days=5), "08:00", TZ, 0)))
+    env.seed(evs)
+    env.run(local_dt(7, 0))
+    env.run(local_dt(7, 32))
+    msg = digest_msgs(env)[0]
+    # taken late counts as taken: 4 taken of 5 (the 5-days-ago miss is
+    # outside the 7-day window anchored at the 07:32 digest… 5 days is
+    # inside; 6-days-ago taken is inside too)
+    assert "Last 7 days: 4/5 doses taken" in msg
+
+
+def test_digest_adherence_omitted_without_events(env):
+    env.write(meds=[make_med(med_id="med-001", frequency="once_daily",
+                             times=["08:00"])],
+              digest_time="07:30")
+    env.run(local_dt(7, 0))
+    env.run(local_dt(7, 32))
+    assert "Last 7 days" not in digest_msgs(env)[0]
+
+
+def test_globally_paused_skips_digest(env):
+    env.write(meds=[make_med(med_id="med-001", frequency="once_daily",
+                             times=["08:00"])],
+              digest_time="07:30", paused=True)
+    env.run(local_dt(7, 0))
+    env.run(local_dt(7, 32))
+    assert digest_msgs(env) == []
+    assert env.sent() == []
+
+
+def test_empty_meds_no_digest(env):
+    env.write(meds=[], digest_time="07:30")
+    env.run(local_dt(7, 0))
+    env.run(local_dt(7, 32))
+    assert env.sent() == []

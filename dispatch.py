@@ -1,20 +1,20 @@
 #!/usr/bin/env python3
 """
-dispatch.py — Med reminder dispatch engine (Python 3.9+, stdlib only)
+dispatch.py — Med reminder dispatch entry point (Python 3.9+, stdlib only)
 
-Called by Task Scheduler / crontab with a mode subcommand. Advisory scheduling:
-each mode checks current state first and exits silently if the dose was already
-confirmed or deferred — no cancellation of registered tasks needed.
+Called by Task Scheduler / crontab. Since issue #1 PR 2 the only engine is
+`tick` (see tick.py): every run evaluates each med's occurrences and acts on
+the highest due stage. The legacy subcommands are thin wrappers that just run
+the tick — no logic of their own — so leftover scheduled jobs are harmless.
+They are kept for one release.
 
 Subcommands:
-    fire  <med-id> <dose-index>   Send initial dose reminder (at dose time)
-    check <med-id> <dose-index>   Send LATE nudge if unconfirmed
-    miss  <med-id> <dose-index>   Log as MISSED if still unconfirmed
-    digest                         Send daily med summary, reset deferred
-    reset-deferred                 Midnight reset: deferred → pending
+    tick [--tick-minutes N]     Run one tick (default interval 5 minutes)
+    fire/check/miss <id> <i>    Legacy wrappers → tick
+    digest / reset-deferred     Legacy wrappers → tick
 
 Flags:
-    --dry-run    Print without sending or writing state
+    --dry-run    Print actions without sending messages or writing state
     --state PATH Path to meds-state.json (overrides MEDS_STATE_FILE;
                  baked into registered tasks by setup-tasks.py)
 
@@ -54,10 +54,6 @@ SCRIPT_DIR = Path(__file__).parent.resolve()
 STATE_FILE  = Path(os.environ.get("MEDS_STATE_FILE", SCRIPT_DIR / "meds-state.json"))
 LOG_FILE    = Path(os.environ.get("MEDS_LOG_FILE",   SCRIPT_DIR / "dispatch.log"))
 SEND_CMD    = os.environ.get("MEDS_SEND_CMD", "")
-
-# A confirm taken now credits the upcoming dose if it is due within this window
-# (e.g. 'all taken' replied to the morning digest just before the first dose).
-EARLY_CONFIRM_WINDOW = timedelta(hours=6)
 
 sys.path.insert(0, str(SCRIPT_DIR))
 import safe_write as _safe_write_mod
@@ -103,9 +99,13 @@ def save_state(state: dict, dry_run: bool) -> None:
     log.debug("State saved OK")
 
 # ── Messaging ─────────────────────────────────────────────────────────────────
+#
+# Sends are at-least-once with leases (issue #1 §3.6): the tick writes a
+# send_intent under transact, sends ONCE here outside the lock with a hard
+# timeout, and records sent/send_failed in a second transact. Retries happen
+# on later ticks — never as an in-process sleep loop.
 
-SEND_RETRIES = 3
-SEND_RETRY_DELAY = 5  # seconds between attempts
+SEND_TIMEOUT_DEFAULT = 60  # seconds per send subprocess
 
 
 def _bash_executable() -> str:
@@ -124,42 +124,49 @@ def _bash_executable() -> str:
     return "bash"  # let the shell's own error speak
 
 
-def send_message(text: str, dry_run: bool, clock: Optional[Clock] = None) -> None:
-    if dry_run:
-        print(f"\n{'-' * 56}\n[DRY RUN] Message:\n{text}\n{'-' * 56}\n")
-        return
-    clock = clock or get_clock()
-
+def _resolve_send_cmd() -> str:
     send_helper = SCRIPT_DIR / "send-message.sh"
     if SEND_CMD:
-        cmd = SEND_CMD
-    elif send_helper.exists():
-        cmd = f'"{_bash_executable()}" "{send_helper}"'
-    else:
-        cmd = ""
+        return SEND_CMD
+    if send_helper.exists():
+        return f'"{_bash_executable()}" "{send_helper}"'
+    return ""
 
+
+def send_once(text: str, timeout: int = SEND_TIMEOUT_DEFAULT,
+              dry_run: bool = False) -> tuple:
+    """
+    One send attempt through MEDS_SEND_CMD / send-message.sh (message on
+    stdin, exit 0 = delivered). Returns (ok, stderr). A hung sender is
+    killed at `timeout` seconds and counts as a failure.
+    """
+    if dry_run:
+        print(f"\n{'-' * 56}\n[DRY RUN] Message:\n{text}\n{'-' * 56}\n")
+        return True, ""
+    cmd = _resolve_send_cmd()
     if not cmd:
-        sys.exit(
-            "No message sender configured.\n"
-            "Set MEDS_SEND_CMD env var or create send-message.sh in the skill directory.\n"
-            "send-message.sh receives the message text on stdin."
-        )
+        log.error("No message sender configured")
+        return False, "no sender configured"
+    try:
+        result = subprocess.run(cmd, shell=True, input=text, capture_output=True,
+                                text=True, encoding="utf-8", errors="replace",
+                                timeout=timeout)
+    except subprocess.TimeoutExpired:
+        log.warning("Send timed out after %ss (%d chars)", timeout, len(text))
+        return False, f"sender timed out after {timeout}s"
+    if result.returncode == 0:
+        log.info("Message sent (%d chars)", len(text))
+        return True, ""
+    err = (result.stderr or "").strip()
+    log.warning("Send failed (exit %d): %s", result.returncode, err)
+    return False, err or f"sender exited {result.returncode}"
 
-    last_err = ""
-    for attempt in range(1, SEND_RETRIES + 1):
-        result = subprocess.run(cmd, shell=True, input=text, capture_output=True, text=True,
-                                 encoding="utf-8", errors="replace")
-        if result.returncode == 0:
-            log.info("Message sent (%d chars, attempt %d)", len(text), attempt)
-            return
-        last_err = result.stderr.strip()
-        log.warning("Send attempt %d/%d failed (exit %d): %s",
-                    attempt, SEND_RETRIES, result.returncode, last_err)
-        if attempt < SEND_RETRIES:
-            clock.sleep(SEND_RETRY_DELAY)
 
-    log.error("Send failed after %d attempts: %s", SEND_RETRIES, last_err)
-    sys.exit(1)
+def send_message(text: str, dry_run: bool, clock: Optional[Clock] = None) -> None:
+    """Compatibility wrapper (doctor --send-test): one attempt, exit 1 on failure."""
+    ok, err = send_once(text, dry_run=dry_run)
+    if not ok:
+        sys.exit(f"Send failed: {err}")
 
 # ── Timezone ──────────────────────────────────────────────────────────────────
 
@@ -186,13 +193,6 @@ def parse_hhmm(hhmm: str, tz: ZoneInfo, base: datetime) -> datetime:
     local = base.astimezone(tz)
     return local.replace(hour=h, minute=m, second=0, microsecond=0)
 
-def most_recent_dose_time(times: list, dose_index: int, tz: ZoneInfo, now: datetime) -> datetime:
-    """Most recent past occurrence of times[dose_index] relative to now."""
-    t = parse_hhmm(times[dose_index], tz, now)
-    if t > now:
-        t -= timedelta(days=1)
-    return t
-
 # Day-of-week keys for weekly meds, in Python weekday() order (mon=0)
 DAY_KEYS = ("mon", "tue", "wed", "thu", "fri", "sat", "sun")
 
@@ -204,40 +204,6 @@ def most_recent_weekly_time(day: str, hhmm: str, tz: ZoneInfo, now: datetime) ->
     if t > now:
         t -= timedelta(days=7)
     return t
-
-def covered_dose_occurrence(med: dict, now: datetime, tz: ZoneInfo) -> Optional[datetime]:
-    """
-    The scheduled dose occurrence a confirm taken at `now` credits (per-dose
-    bookkeeping). Compare against state.confirmed_dose to tell whether a given
-    scheduled event was already confirmed.
-
-    Credits the next upcoming occurrence when it is due within
-    EARLY_CONFIRM_WINDOW and is nearer than the most recent past occurrence;
-    otherwise credits the most recent past occurrence (a late or out-of-cycle
-    dose). Returns None for interval and as_needed meds — no per-dose tracking.
-    """
-    sched = med["schedule"]
-    freq  = sched["frequency"]
-    if freq in ("as_needed", "interval"):
-        return None
-    period = timedelta(days=7 if freq == "weekly" else 1)
-    day = sched.get("day_of_week") if freq == "weekly" else None
-    pasts, futures = [], []
-    for t in sched["times"]:
-        if day:
-            p = most_recent_weekly_time(day, t, tz, now)
-        else:
-            p = parse_hhmm(t, tz, now)
-            if p > now:
-                p -= period
-        pasts.append(p)
-        futures.append(p + period)
-    nearest_past  = max(pasts)   # most recent scheduled occurrence
-    next_future   = min(futures) # soonest upcoming scheduled occurrence
-    until_future  = next_future - now
-    if until_future <= EARLY_CONFIRM_WINDOW and until_future < (now - nearest_past):
-        return next_future
-    return nearest_past
 
 def in_quiet_hours(now: datetime, quiet: dict, tz: ZoneInfo) -> bool:
     """True if now is inside the quiet window. Handles midnight-spanning windows."""
@@ -329,49 +295,6 @@ def append_history(
         entry["notes"] = notes
     med["state"]["history"].append(entry)
 
-# ── Advisory skip logic ───────────────────────────────────────────────────────
-
-def already_confirmed(med: dict, dose_time: datetime) -> bool:
-    """
-    True if the dose occurrence at dose_time was confirmed (per-dose check).
-
-    Primary: state.confirmed_dose holds the scheduled occurrence credited by
-    the last confirm — the dose is confirmed only on an exact match. This keeps
-    an early confirm ('all taken' before the dose fires) and a same-day second
-    dose from being conflated.
-    Legacy fallback for state files written before confirmed_dose existed:
-    last_taken >= dose_time.
-    """
-    cd = med["state"].get("confirmed_dose")
-    if cd:
-        return datetime.fromisoformat(cd) == dose_time
-    last = med["state"].get("last_taken")
-    if not last:
-        return False
-    return datetime.fromisoformat(last) >= dose_time
-
-def skip_if_needed(state: dict, med: dict, dose_time: datetime, mode: str,
-                   tz: ZoneInfo, now: datetime) -> bool:
-    """Return True and log reason if this event should be skipped."""
-    if state["global"]["paused"]:
-        log.info("SKIP [%s] %s — global pause active", mode, med["id"])
-        return True
-    if med.get("paused"):
-        log.info("SKIP [%s] %s — med paused", mode, med["id"])
-        return True
-    if med["state"]["status"] == "deferred":
-        log.info("SKIP [%s] %s — med deferred until next digest", mode, med["id"])
-        return True
-    sched = med["schedule"]
-    if (sched["frequency"] == "weekly" and sched.get("day_of_week")
-            and DAY_KEYS.index(sched["day_of_week"]) != now.astimezone(tz).weekday()):
-        log.info("SKIP [%s] %s — weekly dose day is %s, not today", mode, med["id"], sched["day_of_week"])
-        return True
-    if already_confirmed(med, dose_time):
-        log.info("SKIP [%s] %s — already confirmed (dose occurrence credited)", mode, med["id"])
-        return True
-    return False
-
 # ── Med lookup ────────────────────────────────────────────────────────────────
 
 def find_med(state: dict, med_id: str) -> dict:
@@ -381,220 +304,46 @@ def find_med(state: dict, med_id: str) -> dict:
     known = [m["id"] for m in state["meds"]]
     sys.exit(f"Med '{med_id}' not found. Known IDs: {known}")
 
-def dose_time_for(med: dict, dose_index: int, tz: ZoneInfo, now: datetime) -> datetime:
-    """Reference dose time for advisory checks. Interval meds use next_due."""
-    sched = med["schedule"]
-    if sched["frequency"] == "interval":
-        nd = med["state"].get("next_due")
-        return datetime.fromisoformat(nd) if nd else now
-    if sched["frequency"] == "weekly" and sched.get("day_of_week"):
-        return most_recent_weekly_time(sched["day_of_week"], sched["times"][dose_index], tz, now)
-    return most_recent_dose_time(sched["times"], dose_index, tz, now)
+# ── Tick (issue #1 §3) ────────────────────────────────────────────────────────
+#
+# The tick engine lives in tick.py (imported lazily to avoid a cycle: tick
+# imports this module for the sender and shared helpers). The legacy
+# subcommands below are thin wrappers that only call the tick, with no logic
+# of their own, so any leftover scheduled job is harmless (kept one release).
 
-# ── Mode handlers ─────────────────────────────────────────────────────────────
+def handle_tick(dry_run: bool, tick_minutes: int = 5,
+                clock: Optional[Clock] = None) -> int:
+    import tick
+    return tick.run_tick(dry_run=dry_run, clock=clock or get_clock(),
+                         tick_minutes=tick_minutes)
+
 
 def handle_fire(med_id: str, dose_index: int, dry_run: bool,
                 clock: Optional[Clock] = None) -> None:
-    """
-    Fire at the scheduled dose time. Send the initial reminder.
-    Advisory: exits silently if dose already confirmed or deferred.
-    """
-    clock = clock or get_clock()
-    state = load_state()
-    tz    = get_tz(state)
-    now   = clock.now_in(tz)
-    med   = find_med(state, med_id)
-    dose_time = dose_time_for(med, dose_index, tz, now)
-
-    if in_quiet_hours(now, state["global"]["quiet_hours"], tz):
-        log.info("SKIP [fire] %s — quiet hours", med_id)
-        return
-
-    if skip_if_needed(state, med, dose_time, "fire", tz, now):
-        return
-
-    msg = f"Reminder: {med['name']} {med['dose']}{med['unit']}"
-    if med["schedule"].get("with_food"):
-        msg += " — take with food"
-    if med["schedule"].get("notes"):
-        msg += f"\n{med['schedule']['notes']}"
-
-    send_message(msg, dry_run, clock)
-
-    med["state"]["status"]       = "reminded"
-    med["state"]["last_reminded"] = now.isoformat()
-    save_state(state, dry_run)
-    log.info("FIRE [%s] reminder sent at %s", med_id, now.isoformat())
+    """Legacy wrapper (kept one release) — the tick owns reminders now."""
+    handle_tick(dry_run, clock=clock)
 
 
 def handle_check(med_id: str, dose_index: int, dry_run: bool,
                  clock: Optional[Clock] = None) -> None:
-    """
-    LATE check at dose_time + late_threshold. Send nudge if not yet confirmed.
-    Advisory: exits silently if confirmed since the reminder was sent.
-    """
-    clock = clock or get_clock()
-    state = load_state()
-    tz    = get_tz(state)
-    now   = clock.now_in(tz)
-    med   = find_med(state, med_id)
-    dose_time = dose_time_for(med, dose_index, tz, now)
-
-    if in_quiet_hours(now, state["global"]["quiet_hours"], tz):
-        log.info("SKIP [check] %s — quiet hours", med_id)
-        return
-
-    if skip_if_needed(state, med, dose_time, "check", tz, now):
-        return
-
-    send_message(expand(med["escalation"]["late_message"], med), dry_run, clock)
-
-    med["state"]["status"]       = "late"
-    med["state"]["last_reminded"] = now.isoformat()
-    append_history(med, "late_nudge_sent", clock=clock)
-    save_state(state, dry_run)
-    log.info("CHECK [%s] late nudge sent at %s", med_id, now.isoformat())
+    """Legacy wrapper (kept one release) — the tick owns nudges now."""
+    handle_tick(dry_run, clock=clock)
 
 
 def handle_miss(med_id: str, dose_index: int, dry_run: bool,
                 clock: Optional[Clock] = None) -> None:
-    """
-    MISSED at dose_time + missed_threshold. Log as missed, advance next_due.
-    Advisory: exits silently if confirmed.
-    The missed log is always written; the outbound message is suppressed
-    during quiet hours (no 3am pings) — unlike fire/check, skipping the whole
-    event would lose the log and leave next_due stale.
-    """
-    clock = clock or get_clock()
-    state = load_state()
-    tz    = get_tz(state)
-    now   = clock.now_in(tz)
-    med   = find_med(state, med_id)
-    dose_time = dose_time_for(med, dose_index, tz, now)
-
-    if skip_if_needed(state, med, dose_time, "miss", tz, now):
-        return
-
-    if in_quiet_hours(now, state["global"]["quiet_hours"], tz):
-        log.info("MISS [%s] — quiet hours: logging without message", med_id)
-    else:
-        send_message(expand(med["escalation"]["missed_message"], med), dry_run, clock)
-
-    med["state"]["status"]       = "missed"
-    med["state"]["missed_count"] += 1
-    append_history(med, "missed", clock=clock)
-
-    # Advance next_due past the missed dose so the schedule stays correct
-    nd = compute_next_due(med, dose_time, tz)
-    med["state"]["next_due"] = nd.isoformat() if nd else None
-
-    save_state(state, dry_run)
-    log.info(
-        "MISS [%s] logged at %s — missed_count=%d, next_due=%s",
-        med_id, now.isoformat(), med["state"]["missed_count"], med["state"]["next_due"],
-    )
+    """Legacy wrapper (kept one release) — the tick owns missed logging now."""
+    handle_tick(dry_run, clock=clock)
 
 
 def handle_digest(dry_run: bool, clock: Optional[Clock] = None) -> None:
-    """
-    Send the daily med summary. Reset all deferred meds to pending.
-    Skips if global pause is active.
-    """
-    clock = clock or get_clock()
-    state = load_state()
-    tz    = get_tz(state)
-    now   = clock.now_in(tz)
-
-    if state["global"]["paused"]:
-        log.info("SKIP [digest] — global pause active")
-        return
-
-    # Reset deferred meds before building the message
-    reset_count = sum(
-        1 for med in state["meds"]
-        if med["state"]["status"] == "deferred"
-        and not (med.get("paused") or state["global"]["paused"])
-    )
-    for med in state["meds"]:
-        if med["state"]["status"] == "deferred":
-            med["state"]["status"] = "pending"
-    if reset_count:
-        log.info("DIGEST reset %d deferred med(s) to pending", reset_count)
-
-    active = [m for m in state["meds"] if not m.get("paused")]
-
-    if not active:
-        log.info("DIGEST — no active meds, skipping message")
-        if reset_count:
-            save_state(state, dry_run)
-        return
-
-    # Build digest message
-    date_str = now.strftime("%a %b ") + str(now.day)  # "Mon Apr 21" (cross-platform)
-    lines = [f"Meds for {date_str}:"]
-
-    for i, med in enumerate(active, 1):
-        sched = med["schedule"]
-        freq  = sched["frequency"]
-
-        if freq == "interval":
-            time_str = f"every {sched['interval_hours']}h"
-        elif freq == "as_needed":
-            time_str = "as needed"
-        else:
-            day = sched.get("day_of_week") if freq == "weekly" else None
-            prefix = f"{day.title()} " if day else ""
-            time_str = prefix + ", ".join(fmt_12h(t) for t in sched["times"])
-
-        food = " (with food)" if sched.get("with_food") else ""
-        lines.append(f"{i}. {med['name']} {med['dose']}{med['unit']} | {time_str}{food}")
-
-    # 7-day adherence from history (taken vs taken+missed events)
-    since = now - timedelta(days=7)
-    taken = sum(
-        1 for med in active
-        for e in med["state"]["history"]
-        if e["event"] == "taken"
-        and datetime.fromisoformat(e["timestamp"]) >= since
-    )
-    missed_events = sum(
-        1 for med in active
-        for e in med["state"]["history"]
-        if e["event"] == "missed"
-        and datetime.fromisoformat(e["timestamp"]) >= since
-    )
-    if taken + missed_events:
-        lines.append("")
-        lines.append(f"Last 7 days: {taken}/{taken + missed_events} doses taken")
-
-    lines += [
-        "",
-        "Reply: 'all taken' | 'skip [name]' | 'took [name]: [dose]' | 'done [name1], [name2]'",
-    ]
-
-    send_message("\n".join(lines), dry_run, clock)
-    save_state(state, dry_run)
-    log.info("DIGEST sent (%d active med(s))", len(active))
+    """Legacy wrapper (kept one release) — the tick owns the digest now."""
+    handle_tick(dry_run, clock=clock)
 
 
 def handle_reset_deferred(dry_run: bool) -> None:
-    """
-    Midnight reset: all deferred meds → pending.
-    Registered by setup-tasks.py at 00:00 daily.
-    """
-    state = load_state()
-    changed = False
-    for med in state["meds"]:
-        if med["state"]["status"] == "deferred":
-            med["state"]["status"] = "pending"
-            changed = True
-            log.info("RESET-DEFERRED [%s] → pending", med["id"])
-
-    if changed:
-        save_state(state, dry_run)
-        log.info("RESET-DEFERRED complete")
-    else:
-        log.debug("RESET-DEFERRED — nothing to reset")
+    """Legacy wrapper (kept one release) — deferred is dead state to the tick."""
+    handle_tick(dry_run)
 
 # ── CLI ───────────────────────────────────────────────────────────────────────
 
@@ -619,20 +368,25 @@ def main() -> None:
 
     sub = parser.add_subparsers(dest="mode", required=True, metavar="MODE")
 
-    p_fire = sub.add_parser("fire", help="Send initial dose reminder")
+    p_tick = sub.add_parser("tick", help="Run one tick: evaluate every med's stages")
+    p_tick.add_argument("--tick-minutes", type=int, default=5, metavar="N",
+                        help="Scheduled tick interval in minutes (default 5); "
+                             "widens the fresh-missed message window")
+
+    p_fire = sub.add_parser("fire", help="Legacy (kept one release): runs the tick")
     p_fire.add_argument("med_id",    help="Med ID, e.g. med-001")
     p_fire.add_argument("dose_index", type=int, help="Index into schedule.times[] (0-based)")
 
-    p_check = sub.add_parser("check", help="Send LATE nudge if unconfirmed")
+    p_check = sub.add_parser("check", help="Legacy (kept one release): runs the tick")
     p_check.add_argument("med_id")
     p_check.add_argument("dose_index", type=int)
 
-    p_miss = sub.add_parser("miss", help="Log as MISSED if still unconfirmed")
+    p_miss = sub.add_parser("miss", help="Legacy (kept one release): runs the tick")
     p_miss.add_argument("med_id")
     p_miss.add_argument("dose_index", type=int)
 
-    sub.add_parser("digest",         help="Send daily med summary, reset deferred")
-    sub.add_parser("reset-deferred", help="Midnight: reset deferred meds to pending")
+    sub.add_parser("digest",         help="Legacy (kept one release): runs the tick")
+    sub.add_parser("reset-deferred", help="Legacy (kept one release): runs the tick")
     # confirm / defer live in reply.py — use: python3 reply.py confirm <med-id>
 
     args = parser.parse_args()
@@ -648,7 +402,9 @@ def main() -> None:
     mode = args.mode
     dr   = args.dry_run
 
-    if mode == "fire":
+    if mode == "tick":
+        sys.exit(handle_tick(dr, tick_minutes=args.tick_minutes))
+    elif mode == "fire":
         handle_fire(args.med_id, args.dose_index, dr)
     elif mode == "check":
         handle_check(args.med_id, args.dose_index, dr)

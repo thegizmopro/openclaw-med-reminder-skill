@@ -1,51 +1,15 @@
 """
-Quiet-hours tests for handle_miss and the setup-tasks dose-in-quiet warning.
+Quiet-hours tests (issue #1 §3.4).
 
-Regression: handle_miss used to ignore quiet hours entirely — a 'You missed
-your dose' message could land at 3am. Now the miss is always logged (state,
-history, next_due stay correct) but the outbound message is suppressed inside
-the quiet window.
+The tick-side quiet rules — reminder exempt, nudge muted except the
+first 30 min of quiet hours, missed always logged with the message
+muted, overnight summary after quiet end — live in tests/test_tick.py
+(AC 26-28). This file keeps the setup-tasks edit-time checks.
 """
-from unittest.mock import patch
-
-from clock import FakeClock
-from dispatch import handle_miss
-from tests.conftest import make_state, make_med, local_dt, load_setup_tasks
+from tests.conftest import make_state, make_med, load_setup_tasks
 
 setup_tasks = load_setup_tasks()
 
-
-def run_miss(state, now):
-    sent, saved = [], []
-    with patch("dispatch.load_state", return_value=state), \
-         patch("dispatch.save_state", side_effect=lambda s, dr: saved.append(s)), \
-         patch("dispatch.send_message", side_effect=lambda t, dr, clock=None: sent.append(t)):
-        handle_miss("med-001", 0, dry_run=False, clock=FakeClock(now))
-    return sent, saved
-
-
-# ── handle_miss message suppression ────────────────────────────────────────────
-
-def test_miss_during_quiet_hours_logs_without_message():
-    med = make_med(med_id="med-001", status="reminded")   # unconfirmed
-    state = make_state(meds=[med])
-    sent, saved = run_miss(state, local_dt(23, 30))       # inside 22:00–07:00
-    assert sent == [], "no outbound message during quiet hours"
-    st = saved[-1]["meds"][0]["state"]
-    assert st["status"] == "missed"
-    assert st["missed_count"] == 1
-    assert st["history"][-1]["event"] == "missed"
-
-
-def test_miss_outside_quiet_hours_sends_message():
-    med = make_med(med_id="med-001", status="reminded")
-    state = make_state(meds=[med])
-    sent, saved = run_miss(state, local_dt(12, 0))        # noon, dose was 08:00
-    assert len(sent) == 1 and "Missed" in sent[0]
-    assert saved[-1]["meds"][0]["state"]["status"] == "missed"
-
-
-# ── setup-tasks: warn when a dose time sits inside quiet hours ────────────────
 
 def test_in_quiet_window_matches():
     q = {"start": "22:00", "end": "07:00"}
