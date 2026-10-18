@@ -133,12 +133,31 @@ def _resolve_send_cmd() -> str:
     return ""
 
 
+def _kill_tree(popen) -> None:
+    """
+    Kill a shell=True subprocess and its children. On Windows run()'s
+    timeout only kills cmd.exe — the sender grandchild inherits the pipes,
+    so communicate() would block until it exits on its own. A tree kill
+    actually cancels a hung sender.
+    """
+    try:
+        if os.name == "nt":
+            subprocess.run(["taskkill", "/F", "/T", "/PID", str(popen.pid)],
+                           capture_output=True)
+        else:
+            import signal
+            os.killpg(os.getpgid(popen.pid), signal.SIGKILL)
+    except (OSError, PermissionError, ProcessLookupError):
+        popen.kill()
+
+
 def send_once(text: str, timeout: int = SEND_TIMEOUT_DEFAULT,
               dry_run: bool = False) -> tuple:
     """
     One send attempt through MEDS_SEND_CMD / send-message.sh (message on
     stdin, exit 0 = delivered). Returns (ok, stderr). A hung sender is
-    killed at `timeout` seconds and counts as a failure.
+    killed — tree, not just the shell — at `timeout` seconds and counts
+    as a failure.
     """
     if dry_run:
         print(f"\n{'-' * 56}\n[DRY RUN] Message:\n{text}\n{'-' * 56}\n")
@@ -147,19 +166,29 @@ def send_once(text: str, timeout: int = SEND_TIMEOUT_DEFAULT,
     if not cmd:
         log.error("No message sender configured")
         return False, "no sender configured"
+    kwargs = {}
+    if os.name != "nt":
+        kwargs["start_new_session"] = True   # own process group → killable tree
+    p = subprocess.Popen(cmd, shell=True, stdin=subprocess.PIPE,
+                         stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                         text=True, encoding="utf-8", errors="replace",
+                         **kwargs)
     try:
-        result = subprocess.run(cmd, shell=True, input=text, capture_output=True,
-                                text=True, encoding="utf-8", errors="replace",
-                                timeout=timeout)
+        _, stderr = p.communicate(input=text, timeout=timeout)
     except subprocess.TimeoutExpired:
+        _kill_tree(p)
+        try:
+            p.communicate(timeout=5)
+        except Exception:
+            pass
         log.warning("Send timed out after %ss (%d chars)", timeout, len(text))
         return False, f"sender timed out after {timeout}s"
-    if result.returncode == 0:
+    if p.returncode == 0:
         log.info("Message sent (%d chars)", len(text))
         return True, ""
-    err = (result.stderr or "").strip()
-    log.warning("Send failed (exit %d): %s", result.returncode, err)
-    return False, err or f"sender exited {result.returncode}"
+    err = (stderr or "").strip()
+    log.warning("Send failed (exit %d): %s", p.returncode, err)
+    return False, err or f"sender exited {p.returncode}"
 
 
 def send_message(text: str, dry_run: bool, clock: Optional[Clock] = None) -> None:

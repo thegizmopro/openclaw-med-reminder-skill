@@ -257,6 +257,7 @@ class Plan:
         self.pending_floor = None  # oldest T still inside its escalation window
         self.watermark = now       # where the watermark advances to this tick
         self.capped = False        # 72h catch-up cap engaged this tick
+        self.queued_rank = {}      # (med, key, gen) → highest stage queued this tick
 
     @property
     def noop(self) -> bool:
@@ -590,6 +591,11 @@ def _log_missed(plan: Plan, state: dict, med: dict, occ: Occurrence, gen: int, t
 
 # ── Sending decisions ──────────────────────────────────────────────────────────
 
+# Stage precedence per occurrence: only the highest due stage acts, so a
+# retry of a lower stage is dropped when a higher one fires this tick.
+_STAGE_RANK = {"reminder": 1, "snooze_reminder": 2, "nudge": 3, "catchup": 4}
+
+
 def plan_send(plan: Plan, idx, med: dict, occ: Occurrence, gen: int,
               stage: str, text: str, occurrence_utc=None):
     """
@@ -645,6 +651,11 @@ def queue_send(plan: Plan, med_id: str, key: str, gen: int, stage: str,
                            stage=stage, attempt=attempt, text=text,
                            intent_id=iid))
     plan.handled.add((med_id, key, gen, stage))
+    if med_id != GLOBAL_MED_ID:
+        occ_key = (med_id, key, gen)
+        rank = _STAGE_RANK.get(stage, 0)
+        if rank > plan.queued_rank.get(occ_key, 0):
+            plan.queued_rank[occ_key] = rank
 
 
 def _retry_scan(plan: Plan, state: dict, ev, idx, tz):
@@ -661,6 +672,10 @@ def _retry_scan(plan: Plan, state: dict, ev, idx, tz):
         med_id, key, gen, stage = k4
         lease = tr.intent.get("lease_until_utc")
         if lease and parse_instant(lease) > plan.now:
+            continue
+        # a higher stage firing this tick supersedes the lower one's retry
+        if med_id != GLOBAL_MED_ID and \
+                _STAGE_RANK.get(stage, 0) < plan.queued_rank.get((med_id, key, gen), 0):
             continue
         med = meds.get(med_id)
         if med_id != GLOBAL_MED_ID and (med is None or med.get("paused")):
@@ -953,8 +968,10 @@ def run_tick(dry_run: bool = False, clock: Optional[Clock] = None,
     try:
         lock.__enter__()
     except RuntimeError:
+        # Another tick is running: exit 0 WITHOUT touching the heartbeat —
+        # a skipped tick must not advance the watermark (it did no work, and
+        # the live tick writes its own heartbeat).
         log.info("tick: another tick is running — exiting")
-        write_heartbeat(started, clock.now_utc(), watermark, errors)
         return 0
     try:
         watermark, errors = _tick_locked(dry_run, clock, tick_minutes)
@@ -1106,6 +1123,9 @@ def _read_sender_down():
 
 
 def _mark_sender_down(now):
+    """Write the marker once per outage — it keeps the outage START."""
+    if sender_down_file().exists():
+        return
     try:
         sender_down_file().write_text(
             json.dumps({"since_utc": now.isoformat()}), encoding="utf-8")

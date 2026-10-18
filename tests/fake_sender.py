@@ -5,9 +5,12 @@ Appends each message to $FAKE_SEND_OUT as "<text>\\n---\\n" so tests can
 count and inspect sends. Behavior switches via marker files:
 
   $FAKE_SEND_FAIL exists   → exit 1, nothing appended
-  $FAKE_SEND_SLEEP exists  → sleep float(file contents) seconds first
-  $FAKE_SEND_TRIP exists   → append, then hang (killed by the 60s timeout;
-                             used to simulate a dead process mid-send)
+  $FAKE_SEND_SLEEP exists  → sleep float(file contents) seconds BEFORE
+                             delivering (hung-sender timeout tests)
+  $FAKE_SEND_TRIP exists   → deliver, THEN sleep float(file contents)
+                             (simulates a process that dies mid-send:
+                             the caller sees the delivery but the tick
+                             never gets to record it)
 """
 import os
 import sys
@@ -31,3 +34,7 @@ if os.path.exists(os.environ.get("FAKE_SEND_FAIL", "")):
 
 with open(out, "a", encoding="utf-8") as f:
     f.write(text + "\n---\n")
+
+if os.path.exists(os.environ.get("FAKE_SEND_TRIP", "")):
+    with open(os.environ["FAKE_SEND_TRIP"]) as f:
+        time.sleep(float(f.read() or "30"))
