@@ -5,6 +5,7 @@ from unittest.mock import patch, call
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
+from clock import FakeClock
 from dispatch import handle_digest
 from tests.conftest import make_state, make_med, iso, local_dt, TZ
 
@@ -15,7 +16,7 @@ def run_digest(state):
     saved   = []
     with patch("dispatch.load_state", return_value=state), \
          patch("dispatch.save_state",   side_effect=lambda s, dr: saved.append(s)), \
-         patch("dispatch.send_message", side_effect=lambda t, dr: sent.append(t)):
+         patch("dispatch.send_message", side_effect=lambda t, dr, clock=None: sent.append(t)):
         handle_digest(dry_run=False)
     return sent, saved
 
@@ -104,16 +105,14 @@ def test_as_needed_med_shown_in_digest():
 # ── Extra: 7-day adherence line from history ──────────────────────────────────
 
 from datetime import timedelta
-from tests.conftest import fake_now
 
 
-def run_digest_at(state, clock):
+def run_digest_at(state, now):
     sent = []
     with patch("dispatch.load_state", return_value=state), \
          patch("dispatch.save_state"), \
-         patch("dispatch.send_message", side_effect=lambda t, dr: sent.append(t)), \
-         patch("dispatch.datetime", fake_now(clock)):
-        handle_digest(dry_run=False)
+         patch("dispatch.send_message", side_effect=lambda t, dr, clock=None: sent.append(t)):
+        handle_digest(dry_run=False, clock=FakeClock(now))
     return sent
 
 

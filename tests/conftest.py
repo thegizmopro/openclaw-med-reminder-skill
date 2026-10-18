@@ -95,15 +95,6 @@ def iso(dt):
     return dt.isoformat()
 
 
-def fake_now(fixed):
-    """A datetime stand-in whose .now() always returns `fixed` (tz-aware)."""
-    class FakeDateTime(datetime):
-        @classmethod
-        def now(cls, tz=None):
-            return fixed
-    return FakeDateTime
-
-
 def load_setup_tasks():
     """Import setup-tasks.py (hyphenated filename) by path."""
     import importlib.util

@@ -16,6 +16,17 @@
       "type": "array",
       "items": { "$ref": "#/definitions/medication" },
       "description": "All tracked medications. One object per med."
+    },
+    "tick": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Optional tick-engine bookkeeping (issue #1). watermark_utc is set once by the history migration; occurrences before it are never enumerated.",
+      "properties": {
+        "watermark_utc": {
+          "$ref": "#/definitions/isoDatetime",
+          "description": "UTC instant of the last completed tick (initially the migration instant)."
+        }
+      }
     }
   },
   "definitions": {

@@ -7,6 +7,7 @@ Fixture date 2026-04-21 is a Tuesday; Monday is 2026-04-20.
 from datetime import timedelta
 from unittest.mock import patch
 
+from clock import FakeClock
 from dispatch import (
     covered_dose_occurrence,
     compute_next_due,
@@ -15,7 +16,7 @@ from dispatch import (
     most_recent_weekly_time,
     skip_if_needed,
 )
-from tests.conftest import make_state, make_med, local_dt, iso, fake_now, load_setup_tasks, TZ
+from tests.conftest import make_state, make_med, local_dt, iso, load_setup_tasks, TZ
 
 setup_tasks = load_setup_tasks()
 build_tasks, hhmm_to_cron = setup_tasks.build_tasks, setup_tasks.hhmm_to_cron
@@ -116,7 +117,6 @@ def test_digest_lists_weekly_day():
     sent = []
     with patch("dispatch.load_state", return_value=state), \
          patch("dispatch.save_state"), \
-         patch("dispatch.send_message", side_effect=lambda t, dr: sent.append(t)), \
-         patch("dispatch.datetime", fake_now(tuesday(12))):
-        handle_digest(dry_run=False)
+         patch("dispatch.send_message", side_effect=lambda t, dr, clock=None: sent.append(t)):
+        handle_digest(dry_run=False, clock=FakeClock(tuesday(12)))
     assert any("Mon 9:00am" in t for t in sent)

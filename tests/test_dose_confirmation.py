@@ -14,6 +14,7 @@ confirms to the scheduled occurrence they credit (state.confirmed_dose).
 from datetime import timedelta
 from unittest.mock import patch
 
+from clock import FakeClock
 from dispatch import (
     already_confirmed,
     covered_dose_occurrence,
@@ -22,7 +23,7 @@ from dispatch import (
     skip_if_needed,
 )
 from reply import handle_confirm
-from tests.conftest import make_state, make_med, local_dt, iso, fake_now, TZ
+from tests.conftest import make_state, make_med, local_dt, iso, TZ
 
 
 def covered(med, now):
@@ -126,20 +127,18 @@ def test_handle_fire_after_early_confirm_sends_nothing_and_writes_nothing():
     sent, saved = [], []
     with patch("dispatch.load_state", return_value=state), \
          patch("dispatch.save_state", side_effect=lambda s, dr: saved.append(s)), \
-         patch("dispatch.send_message", side_effect=lambda t, dr: sent.append(t)), \
-         patch("dispatch.datetime", fake_now(local_dt(8, 0))):
-        handle_fire("med-001", 0, dry_run=True)
+         patch("dispatch.send_message", side_effect=lambda t, dr, clock=None: sent.append(t)):
+        handle_fire("med-001", 0, dry_run=True, clock=FakeClock(local_dt(8, 0)))
     assert sent == [] and saved == []
 
 
 # ── Bug #4 regression: same-day second dose stays loggable ─────────────────────
 
-def run_confirm(state, clock):
+def run_confirm(state, now):
     saved = []
     with patch("reply.load_state", return_value=state), \
-         patch("reply.save_state", side_effect=lambda s, dr: saved.append(s)), \
-         patch("reply.datetime", fake_now(clock)):
-        handle_confirm("med-001", None, dry_run=False)
+         patch("reply.save_state", side_effect=lambda s, dr: saved.append(s)):
+        handle_confirm("med-001", None, dry_run=False, clock=FakeClock(now))
     return saved
 
 

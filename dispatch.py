@@ -32,8 +32,7 @@ import os
 import shutil
 import subprocess
 import sys
-import time
-from datetime import datetime, timedelta, timezone as tz_fixed
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Optional
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -55,7 +54,6 @@ SCRIPT_DIR = Path(__file__).parent.resolve()
 STATE_FILE  = Path(os.environ.get("MEDS_STATE_FILE", SCRIPT_DIR / "meds-state.json"))
 LOG_FILE    = Path(os.environ.get("MEDS_LOG_FILE",   SCRIPT_DIR / "dispatch.log"))
 SEND_CMD    = os.environ.get("MEDS_SEND_CMD", "")
-HISTORY_MAX = 30
 
 # A confirm taken now credits the upcoming dose if it is due within this window
 # (e.g. 'all taken' replied to the morning digest just before the first dose).
@@ -63,6 +61,7 @@ EARLY_CONFIRM_WINDOW = timedelta(hours=6)
 
 sys.path.insert(0, str(SCRIPT_DIR))
 import safe_write as _safe_write_mod
+from clock import Clock, get_clock
 from safe_write import safe_write as _safe_write_fn
 
 log = logging.getLogger("dispatch")
@@ -125,10 +124,11 @@ def _bash_executable() -> str:
     return "bash"  # let the shell's own error speak
 
 
-def send_message(text: str, dry_run: bool) -> None:
+def send_message(text: str, dry_run: bool, clock: Optional[Clock] = None) -> None:
     if dry_run:
         print(f"\n{'-' * 56}\n[DRY RUN] Message:\n{text}\n{'-' * 56}\n")
         return
+    clock = clock or get_clock()
 
     send_helper = SCRIPT_DIR / "send-message.sh"
     if SEND_CMD:
@@ -156,7 +156,7 @@ def send_message(text: str, dry_run: bool) -> None:
         log.warning("Send attempt %d/%d failed (exit %d): %s",
                     attempt, SEND_RETRIES, result.returncode, last_err)
         if attempt < SEND_RETRIES:
-            time.sleep(SEND_RETRY_DELAY)
+            clock.sleep(SEND_RETRY_DELAY)
 
     log.error("Send failed after %d attempts: %s", SEND_RETRIES, last_err)
     sys.exit(1)
@@ -254,12 +254,6 @@ def fmt_12h(hhmm: str) -> str:
     suffix = "am" if h < 12 else "pm"
     return f"{h % 12 or 12}:{m:02d}{suffix}"
 
-def now_utc() -> datetime:
-    return datetime.now(tz=tz_fixed.utc)
-
-def now_iso() -> str:
-    return now_utc().isoformat()
-
 # ── Next-due calculation ──────────────────────────────────────────────────────
 
 def compute_next_due(med: dict, after: datetime, tz: ZoneInfo) -> Optional[datetime]:
@@ -322,19 +316,18 @@ def append_history(
     event: str,
     dose_taken: Optional[str] = None,
     notes: str = "",
+    clock: Optional[Clock] = None,
 ) -> None:
+    clock = clock or get_clock()
     entry: dict = {
-        "timestamp": now_iso(),
+        "timestamp": clock.now_iso(),
         "event": event,
         "dose_prescribed": f"{med['dose']}{med['unit']}",
         "dose_taken": dose_taken,
     }
     if notes:
         entry["notes"] = notes
-    hist = med["state"]["history"]
-    hist.append(entry)
-    if len(hist) > HISTORY_MAX:
-        med["state"]["history"] = hist[-HISTORY_MAX:]
+    med["state"]["history"].append(entry)
 
 # ── Advisory skip logic ───────────────────────────────────────────────────────
 
@@ -400,14 +393,16 @@ def dose_time_for(med: dict, dose_index: int, tz: ZoneInfo, now: datetime) -> da
 
 # ── Mode handlers ─────────────────────────────────────────────────────────────
 
-def handle_fire(med_id: str, dose_index: int, dry_run: bool) -> None:
+def handle_fire(med_id: str, dose_index: int, dry_run: bool,
+                clock: Optional[Clock] = None) -> None:
     """
     Fire at the scheduled dose time. Send the initial reminder.
     Advisory: exits silently if dose already confirmed or deferred.
     """
+    clock = clock or get_clock()
     state = load_state()
     tz    = get_tz(state)
-    now   = datetime.now(tz=tz)
+    now   = clock.now_in(tz)
     med   = find_med(state, med_id)
     dose_time = dose_time_for(med, dose_index, tz, now)
 
@@ -424,7 +419,7 @@ def handle_fire(med_id: str, dose_index: int, dry_run: bool) -> None:
     if med["schedule"].get("notes"):
         msg += f"\n{med['schedule']['notes']}"
 
-    send_message(msg, dry_run)
+    send_message(msg, dry_run, clock)
 
     med["state"]["status"]       = "reminded"
     med["state"]["last_reminded"] = now.isoformat()
@@ -432,14 +427,16 @@ def handle_fire(med_id: str, dose_index: int, dry_run: bool) -> None:
     log.info("FIRE [%s] reminder sent at %s", med_id, now.isoformat())
 
 
-def handle_check(med_id: str, dose_index: int, dry_run: bool) -> None:
+def handle_check(med_id: str, dose_index: int, dry_run: bool,
+                 clock: Optional[Clock] = None) -> None:
     """
     LATE check at dose_time + late_threshold. Send nudge if not yet confirmed.
     Advisory: exits silently if confirmed since the reminder was sent.
     """
+    clock = clock or get_clock()
     state = load_state()
     tz    = get_tz(state)
-    now   = datetime.now(tz=tz)
+    now   = clock.now_in(tz)
     med   = find_med(state, med_id)
     dose_time = dose_time_for(med, dose_index, tz, now)
 
@@ -450,16 +447,17 @@ def handle_check(med_id: str, dose_index: int, dry_run: bool) -> None:
     if skip_if_needed(state, med, dose_time, "check", tz, now):
         return
 
-    send_message(expand(med["escalation"]["late_message"], med), dry_run)
+    send_message(expand(med["escalation"]["late_message"], med), dry_run, clock)
 
     med["state"]["status"]       = "late"
     med["state"]["last_reminded"] = now.isoformat()
-    append_history(med, "late_nudge_sent")
+    append_history(med, "late_nudge_sent", clock=clock)
     save_state(state, dry_run)
     log.info("CHECK [%s] late nudge sent at %s", med_id, now.isoformat())
 
 
-def handle_miss(med_id: str, dose_index: int, dry_run: bool) -> None:
+def handle_miss(med_id: str, dose_index: int, dry_run: bool,
+                clock: Optional[Clock] = None) -> None:
     """
     MISSED at dose_time + missed_threshold. Log as missed, advance next_due.
     Advisory: exits silently if confirmed.
@@ -467,9 +465,10 @@ def handle_miss(med_id: str, dose_index: int, dry_run: bool) -> None:
     during quiet hours (no 3am pings) — unlike fire/check, skipping the whole
     event would lose the log and leave next_due stale.
     """
+    clock = clock or get_clock()
     state = load_state()
     tz    = get_tz(state)
-    now   = datetime.now(tz=tz)
+    now   = clock.now_in(tz)
     med   = find_med(state, med_id)
     dose_time = dose_time_for(med, dose_index, tz, now)
 
@@ -479,11 +478,11 @@ def handle_miss(med_id: str, dose_index: int, dry_run: bool) -> None:
     if in_quiet_hours(now, state["global"]["quiet_hours"], tz):
         log.info("MISS [%s] — quiet hours: logging without message", med_id)
     else:
-        send_message(expand(med["escalation"]["missed_message"], med), dry_run)
+        send_message(expand(med["escalation"]["missed_message"], med), dry_run, clock)
 
     med["state"]["status"]       = "missed"
     med["state"]["missed_count"] += 1
-    append_history(med, "missed")
+    append_history(med, "missed", clock=clock)
 
     # Advance next_due past the missed dose so the schedule stays correct
     nd = compute_next_due(med, dose_time, tz)
@@ -496,14 +495,15 @@ def handle_miss(med_id: str, dose_index: int, dry_run: bool) -> None:
     )
 
 
-def handle_digest(dry_run: bool) -> None:
+def handle_digest(dry_run: bool, clock: Optional[Clock] = None) -> None:
     """
     Send the daily med summary. Reset all deferred meds to pending.
     Skips if global pause is active.
     """
+    clock = clock or get_clock()
     state = load_state()
     tz    = get_tz(state)
-    now   = datetime.now(tz=tz)
+    now   = clock.now_in(tz)
 
     if state["global"]["paused"]:
         log.info("SKIP [digest] — global pause active")
@@ -572,7 +572,7 @@ def handle_digest(dry_run: bool) -> None:
         "Reply: 'all taken' | 'skip [name]' | 'took [name]: [dose]' | 'done [name1], [name2]'",
     ]
 
-    send_message("\n".join(lines), dry_run)
+    send_message("\n".join(lines), dry_run, clock)
     save_state(state, dry_run)
     log.info("DIGEST sent (%d active med(s))", len(active))
 
@@ -599,6 +599,7 @@ def handle_reset_deferred(dry_run: bool) -> None:
 # ── CLI ───────────────────────────────────────────────────────────────────────
 
 def main() -> None:
+    _safe_write_mod.apply_process_umask()   # issue #1 §2: private files, before any are created
     parser = argparse.ArgumentParser(
         description="Med reminder dispatch. Call from Task Scheduler or crontab.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -641,6 +642,8 @@ def main() -> None:
         global STATE_FILE
         STATE_FILE = Path(args.state)
         _safe_write_mod.STATE_FILE = Path(args.state)  # writer keeps its own copy
+
+    _safe_write_mod.secure_private_files(extra=(LOG_FILE,))   # after --state rebind
 
     mode = args.mode
     dr   = args.dry_run
