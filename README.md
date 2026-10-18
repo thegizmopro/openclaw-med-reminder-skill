@@ -290,7 +290,7 @@ pip install -r requirements-dev.txt   # one-time
 python -m pytest -q
 ```
 
-401 tests covering the tick engine and DST edges, attribution, the event store, locking and transactions, scheduler migration on all three OSes, reply commands, quiet-hours rules, logging/privacy, the editor wiring, and the passport generator.
+413 tests covering the tick engine and DST edges, attribution, the event store, locking and transactions, scheduler migration on all three OSes, reply commands, quiet-hours rules, logging/privacy, the editor wiring, the SKILL.md contract, and the passport generator.
 
 ---
 
