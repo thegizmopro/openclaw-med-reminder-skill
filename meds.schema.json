@@ -20,11 +20,27 @@
     "tick": {
       "type": "object",
       "additionalProperties": false,
-      "description": "Optional tick-engine bookkeeping (issue #1). watermark_utc is set once by the history migration; occurrences before it are never enumerated.",
+      "description": "Optional tick-engine bookkeeping (issue #1). watermark_utc is set once by the history migration; occurrences before it are never enumerated. The tick advances it only past done work and mirrors it into tick-heartbeat.json.",
       "properties": {
         "watermark_utc": {
           "$ref": "#/definitions/isoDatetime",
           "description": "UTC instant of the last completed tick (initially the migration instant)."
+        },
+        "last_good_timezone": {
+          "type": "string",
+          "description": "Last timezone that resolved successfully; used as a fallback (with an alert) when global.timezone goes bad."
+        },
+        "tz_alert_date": {
+          "type": "string",
+          "description": "Local date (YYYY-MM-DD) of the last bad-timezone alert — one alert per day."
+        },
+        "schedule_alerts": {
+          "type": "object",
+          "description": "med id → local date (YYYY-MM-DD) of that med's last 'can't process schedule' alert — one alert per failing med per day."
+        },
+        "force_nonces": {
+          "type": "object",
+          "description": "Duplicate-override nonces offered by confirm's exit 3: nonce → {med_id, taken_at_utc, expires_utc}. Single-use, 10-minute TTL."
         }
       }
     }
@@ -98,6 +114,15 @@
         "paused": {
           "type": "boolean",
           "description": "Per-med pause. When true, dispatch skips this med only."
+        },
+        "active_since_utc": {
+          "$ref": "#/definitions/isoDatetime",
+          "description": "UTC instant the med became active (add, unpause, schedule or timezone edit). Occurrences before it are never enumerated — no phantom misses. Set by reply.py's add/edit commands."
+        },
+        "min_gap_hours": {
+          "type": "number",
+          "exclusiveMinimum": 0,
+          "description": "Override for the duplicate-confirm window (issue #1 §4). Default is half the shortest scheduled gap."
         },
         "schedule": { "$ref": "#/definitions/schedule" },
         "escalation": { "$ref": "#/definitions/escalation" },

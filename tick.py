@@ -1090,11 +1090,20 @@ def _execute_sends(plan: Plan, clock: Clock) -> int:
                     generation=s.generation, stage=s.stage,
                     id=s.intent_id + ":sent"))
                 med = meds.get(s.med_id)
-                if med is not None and s.stage in ("reminder", "snooze_reminder"):
-                    med["state"]["status"] = "reminded"
-                    med["state"]["last_reminded"] = recorded.isoformat()
-                elif med is not None and s.stage == "nudge":
-                    med["state"]["status"] = "late"
+                resolved = (s.med_id == GLOBAL_MED_ID or
+                            event_store.outcome(history_view, s.occurrence_key,
+                                                s.generation, med_id=s.med_id)
+                            in ("taken", "skipped"))
+                # legacy status is rollback-only — never clobber a confirm
+                # that landed while the send was in flight (AC 31)
+                if med is not None and not resolved:
+                    if s.stage in ("reminder", "snooze_reminder"):
+                        med["state"]["status"] = "reminded"
+                        med["state"]["last_reminded"] = recorded.isoformat()
+                    elif s.stage == "nudge":
+                        med["state"]["status"] = "late"
+                        med["state"]["last_reminded"] = recorded.isoformat()
+                elif med is not None:
                     med["state"]["last_reminded"] = recorded.isoformat()
             else:
                 events.append(event_store.new_event(
