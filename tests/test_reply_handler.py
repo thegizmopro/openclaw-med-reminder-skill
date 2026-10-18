@@ -9,7 +9,6 @@ the credited occurrence key/generation and taken_at_utc; duplicates exit
 import json
 import re
 from datetime import timedelta
-from unittest.mock import patch
 
 import pytest
 
@@ -19,7 +18,7 @@ import safe_write as sw
 from clock import FakeClock, parse_instant
 from occurrence import at_local
 from reply import handle_confirm, handle_confirm_all, handle_defer
-from tests.conftest import make_state, make_med, iso, local_dt, TZ
+from tests.conftest import make_state, make_med, iso, local_dt, utc, TZ
 
 import datetime as dtmod
 
@@ -322,32 +321,31 @@ def test_confirm_all_outside_digest_grace_uses_90min_window(state_file):
     assert events(state_file)[-1]["occurrence_key"] == "2026-04-20T11:00#0"
 
 
-# ── defer (unchanged legacy command, PR 4 replaces it) ─────────────────────────
+# ── defer — rewritten for PR 4: it is now a deprecated alias for snooze ────────
+# (the old defer wrote the dead `deferred` status; issue #1 §6 replaces it)
 
-def run_defer(state, med_id):
-    saved = []
-    with patch("reply.load_state", return_value=state), \
-         patch("reply.save_state", side_effect=lambda s, dr: saved.append(s)):
-        handle_defer(med_id, dry_run=False)
-    return saved
+def test_defer_is_snooze_alias_with_min_120_cap(state_file):
+    # once-daily 08:00: next dose tomorrow → gap 24h → cap 12h → min(120, 720)=120
+    med = make_med(med_id="med-001", frequency="once_daily", times=["08:00"])
+    write_state(state_file, meds=[med])
+    handle_defer("med-001", dry_run=False, clock=FakeClock(local_dt(8, 5)))
+    evs = events(state_file)
+    assert evs[0]["event"] == "snoozed"
+    assert parse_instant(evs[0]["ref"]) == utc(local_dt(10, 5))   # 08:05 + 120min
 
 
-def test_defer_sets_status_deferred():
+def test_defer_capped_below_120_when_gap_is_tight(state_file):
+    # 08:00/11:00: gap 3h → cap 90min → min(120, 90) = 90
+    med = make_med(med_id="med-001", frequency="twice_daily", times=["08:00", "11:00"])
+    write_state(state_file, meds=[med])
+    handle_defer("med-001", dry_run=False, clock=FakeClock(local_dt(8, 5)))
+    assert parse_instant(events(state_file)[0]["ref"]) == utc(local_dt(9, 35))
+
+
+def test_defer_never_writes_deferred_status(state_file):
     med = make_med(med_id="med-001", status="reminded")
-    state = make_state(meds=[med])
-    saved = run_defer(state, "med-001")
-    assert saved[-1]["meds"][0]["state"]["status"] == "deferred"
-
-
-def test_defer_appends_deferred_history():
-    med = make_med(med_id="med-001")
-    state = make_state(meds=[med])
-    saved = run_defer(state, "med-001")
-    hist = saved[-1]["meds"][0]["state"]["history"]
-    assert hist[-1]["event"] == "deferred"
-
-
-def test_defer_paused_med_does_not_write():
-    med = make_med(med_id="med-001", paused=True)
-    state = make_state(meds=[med])
-    assert run_defer(state, "med-001") == []
+    write_state(state_file, meds=[med])
+    handle_defer("med-001", dry_run=False, clock=FakeClock(local_dt(8, 5)))
+    st = on_disk(state_file)["meds"][0]["state"]
+    assert st["status"] != "deferred"
+    assert all(e["event"] != "deferred" for e in st["history"])
