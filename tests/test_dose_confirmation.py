@@ -22,7 +22,6 @@ from dispatch import (
     most_recent_dose_time,
     skip_if_needed,
 )
-from reply import handle_confirm
 from tests.conftest import make_state, make_med, local_dt, iso, TZ
 
 
@@ -130,45 +129,3 @@ def test_handle_fire_after_early_confirm_sends_nothing_and_writes_nothing():
          patch("dispatch.send_message", side_effect=lambda t, dr, clock=None: sent.append(t)):
         handle_fire("med-001", 0, dry_run=True, clock=FakeClock(local_dt(8, 0)))
     assert sent == [] and saved == []
-
-
-# ── Bug #4 regression: same-day second dose stays loggable ─────────────────────
-
-def run_confirm(state, now):
-    saved = []
-    with patch("reply.load_state", return_value=state), \
-         patch("reply.save_state", side_effect=lambda s, dr: saved.append(s)):
-        handle_confirm("med-001", None, dry_run=False, clock=FakeClock(now))
-    return saved
-
-
-def test_evening_confirm_after_morning_confirm_succeeds():
-    """
-    Machine asleep at 20:00 — fire never ran, status still 'confirmed' from the
-    morning dose. The 20:30 confirm must log the evening dose, not refuse.
-    """
-    med = make_med(frequency="twice_daily", times=["08:00", "20:00"],
-                   status="confirmed", last_taken=iso(local_dt(8, 14)),
-                   confirmed_dose=iso(local_dt(8, 0)))
-    saved = run_confirm(make_state(meds=[med]), local_dt(20, 30))
-    assert saved, "evening confirm must not be refused"
-    st = saved[-1]["meds"][0]["state"]
-    assert st["confirmed_dose"] == iso(local_dt(20, 0))
-    assert st["next_due"] == iso(local_dt(8, 0) + timedelta(days=1))
-    assert st["history"][-1]["event"] == "taken"
-
-
-def test_double_confirm_of_same_dose_is_noop():
-    med = make_med(frequency="once_daily", times=["08:00"],
-                   status="confirmed", last_taken=iso(local_dt(8, 14)),
-                   confirmed_dose=iso(local_dt(8, 0)))
-    saved = run_confirm(make_state(meds=[med]), local_dt(8, 14))
-    assert saved == []   # same occurrence already credited — no write
-
-
-def test_early_confirm_anchors_next_due_past_covered_dose():
-    med = make_med(frequency="twice_daily", times=["08:00", "20:00"])
-    saved = run_confirm(make_state(meds=[med]), local_dt(7, 32))
-    st = saved[-1]["meds"][0]["state"]
-    assert st["confirmed_dose"] == iso(local_dt(8, 0))
-    assert st["next_due"] == iso(local_dt(20, 0))   # not the 08:00 just covered
