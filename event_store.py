@@ -173,10 +173,18 @@ def load_events(path, logger=None) -> list:
 _PRECEDENCE = {"taken": 3, "skipped": 2, "missed": 1}
 
 
-def outcome(events: Iterable[dict], occurrence_key: str, generation: int = 0) -> Optional[str]:
-    """Resolve the terminal outcome of (occurrence, generation), or None."""
+def outcome(events: Iterable[dict], occurrence_key: str, generation: int = 0,
+            med_id: Optional[str] = None) -> Optional[str]:
+    """
+    Resolve the terminal outcome of (occurrence, generation), or None.
+
+    med_id scopes the lookup when given — wall-time keys are only unique
+    per med (two meds can both have "2026-04-21T08:00#0").
+    """
     best, best_rank, best_ts = None, 0, ""
     for ev in events:
+        if med_id is not None and ev.get("med_id") != med_id:
+            continue
         if ev.get("occurrence_key") != occurrence_key:
             continue
         if int(ev.get("generation") or 0) != generation:
