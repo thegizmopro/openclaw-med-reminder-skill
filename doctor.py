@@ -23,7 +23,7 @@ import json
 import os
 import subprocess
 import sys
-from datetime import datetime, timedelta, timezone as tz_utc
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 if sys.version_info < (3, 9):
@@ -192,7 +192,7 @@ def check_heartbeat(tick_minutes: int, now: datetime = None) -> None:
     """FAIL if tick-heartbeat.json is missing or older than 3x the tick
     interval (issue #1 §5) — a stale heartbeat means ticks stopped running
     and every reminder since then silently never happened."""
-    now = now or datetime.now(tz=tz_utc)
+    now = now or datetime.now(tz=timezone.utc)
     hb = STATE_FILE.parent / "tick-heartbeat.json"
     try:
         data = json.loads(hb.read_text(encoding="utf-8"))
