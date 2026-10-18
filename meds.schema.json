@@ -78,6 +78,11 @@
           "type": "string",
           "minLength": 1,
           "description": "Messaging channel for outbound reminders, e.g. 'whatsapp', 'telegram', 'sms'. Wire up send-message.sh for your channel."
+        },
+        "log_redact": {
+          "type": "boolean",
+          "default": false,
+          "description": "Optional privacy switch (issue #1 §7). When true (or MEDS_LOG_REDACT=1), logs use med ids only and sender stderr is redacted."
         }
       }
     },

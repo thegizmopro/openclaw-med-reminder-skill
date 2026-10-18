@@ -88,16 +88,8 @@ NONCE_TTL = timedelta(minutes=10)
 
 def setup_logging(dry_run: bool) -> None:
     log_path = Path(os.environ.get("MEDS_LOG_FILE", SCRIPT_DIR / "reply.log"))
-    level = logging.DEBUG if dry_run else logging.INFO
-    logging.basicConfig(
-        level=level,
-        format="%(asctime)s [reply] %(levelname)s %(message)s",
-        datefmt="%Y-%m-%dT%H:%M:%SZ",
-        handlers=[
-            logging.FileHandler(log_path, encoding="utf-8"),
-            logging.StreamHandler(sys.stdout),
-        ],
-    )
+    _safe_write_mod.configure_root_logging(
+        "reply", log_path, logging.DEBUG if dry_run else logging.INFO)
 
 
 # ── Confirm (issue #1 §4) ──────────────────────────────────────────────────────

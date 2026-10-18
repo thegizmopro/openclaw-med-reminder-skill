@@ -65,16 +65,8 @@ log = logging.getLogger("dispatch")
 # ── Logging ───────────────────────────────────────────────────────────────────
 
 def setup_logging(dry_run: bool) -> None:
-    level = logging.DEBUG if dry_run else logging.INFO
-    logging.basicConfig(
-        level=level,
-        format="%(asctime)s [dispatch] %(levelname)s %(message)s",
-        datefmt="%Y-%m-%dT%H:%M:%SZ",
-        handlers=[
-            logging.FileHandler(LOG_FILE, encoding="utf-8"),
-            logging.StreamHandler(sys.stdout),
-        ],
-    )
+    _safe_write_mod.configure_root_logging(
+        "dispatch", LOG_FILE, logging.DEBUG if dry_run else logging.INFO)
 
 # ── State I/O ─────────────────────────────────────────────────────────────────
 
