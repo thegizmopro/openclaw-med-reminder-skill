@@ -13,6 +13,7 @@ from dispatch import compute_next_due, most_recent_weekly_time
 from tests.conftest import local_dt, make_med, TZ
 
 
+
 def monday(hour=9, minute=0):
     """Monday 2026-04-20 at HH:MM."""
     return local_dt(hour, minute, year=2026, month=4, day=20)
