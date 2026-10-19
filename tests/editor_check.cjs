@@ -56,6 +56,7 @@ const STATE = JSON.stringify({
     paused: false,
     min_gap_hours: 6,
     active_since_utc: '2026-04-21T13:00:00+00:00',
+    start_date: '2026-04-22', end_date: '2026-04-29',
     schedule: { frequency: 'interval', interval_hours: 8, day_of_week: null,
                 with_food: false, notes: '', quiet_policy: 'shift' },
     escalation: { late_threshold_minutes: 30, missed_threshold_minutes: 90,
@@ -116,6 +117,8 @@ async function drvPassthrough() {
   assert(med.schedule.interval_hours === 8, 'known schedule field intact');
   assert(med.min_gap_hours === 6, 'unknown med-level field preserved');
   assert(med.active_since_utc === '2026-04-21T13:00:00+00:00', 'active_since preserved');
+  assert(med.start_date === '2026-04-22' && med.end_date === '2026-04-29',
+         'date-range bounds preserved (PR 6)');
   assert(med.state.status === 'pending', 'runtime state block preserved');
   assert(currentState.tick.watermark_utc === '2026-04-21T15:00:00+00:00',
          'top-level tick block preserved');
