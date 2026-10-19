@@ -159,6 +159,23 @@ Auto-generate sequentially: `med-001`, `med-002`, etc. Never ask.
 ### paused
 Always `false` for new meds. Never ask.
 
+### start_date / end_date — courses and seasonal meds (optional)
+Ask one follow-up when a med sounds time-bounded (antibiotics, a steroid
+taper, allergy meds for pollen season):
+
+> "Does [name] start on a specific day, and do you know when it ends?"
+
+- Already running → omit `start_date`. Starts later → `start_date: "YYYY-MM-DD"`
+  — nothing is reminded before that local date.
+- Known end → `end_date: "YYYY-MM-DD"` — **inclusive** (the last reminded day).
+  After it passes the med drops out of the digest with a one-time
+  "Course complete" line; remove the med whenever.
+- Dates are calendar dates in the user's timezone (`global.timezone`).
+  `reply.py add-med` / `edit-med` reject malformed dates and end-before-start;
+  clear a bound later with `"start_date": null` / `"end_date": null` in
+  `edit-med --json -`.
+- Everyday / open-ended meds → omit both fields silently. Never ask for those.
+
 ---
 
 ## Section 3 — Escalation

@@ -50,6 +50,8 @@ def make_med(
     missed_count=0,
     history=None,
     include_confirmed_dose=True,
+    start_date=None,
+    end_date=None,
 ):
     sched = {"frequency": frequency, "with_food": with_food, "notes": notes}
     if frequency == "interval":
@@ -83,6 +85,9 @@ def make_med(
             # include_confirmed_dose=False builds a legacy state block (pre-per-dose files)
             **({"confirmed_dose": confirmed_dose} if include_confirmed_dose else {}),
         },
+        # optional per-med calendar bounds (PR 6) — present only when set
+        **({"start_date": start_date} if start_date is not None else {}),
+        **({"end_date": end_date} if end_date is not None else {}),
     }
 
 
