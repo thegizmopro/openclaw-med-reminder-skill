@@ -9,8 +9,11 @@ One entry point, run every N minutes (default 5). Each tick:
      clock_anomaly and exits; a gap over 72h caps catch-up and sends
      one "were you away?" message instead of back-filling).
   3. Enumerates occurrences per med in (max(watermark, active_since,
-     now − LOOKBACK), now] using the PR 1 Occurrence helpers — all
-     comparisons on aware UTC datetimes.
+     start_date, now − LOOKBACK), now] using the PR 1 Occurrence
+     helpers — all comparisons on aware UTC datetimes. An optional
+     end_date (inclusive, local) drops later occurrences before any
+     stage acts, so a finished course produces no reminders, nudges,
+     misses or catch-up lines — catch-up and watermark advance included.
   4. Per occurrence only the highest due stage acts: reminder (quiet-
      hours exempt — the user chose the time), snooze_reminder, nudge
      (muted in quiet hours except the first 30 min), missed (always
@@ -47,7 +50,7 @@ import math
 import os
 import sys
 from dataclasses import dataclass, field
-from datetime import timedelta, timezone
+from datetime import date, timedelta, timezone
 from hashlib import sha256
 from pathlib import Path
 from typing import Optional
@@ -143,6 +146,26 @@ def next_quiet_end(instant, quiet: dict, tz: ZoneInfo):
 
 def fmt_12h(dt) -> str:
     return f"{dt.hour % 12 or 12}:{dt.minute:02d}{'am' if dt.hour < 12 else 'pm'}"
+
+
+# ── Per-med date ranges (PR 6) ────────────────────────────────────────────────
+
+def _start_bound_utc(med: dict, tz) -> Optional[object]:
+    """UTC instant of med.start_date's local midnight, or None when unbound."""
+    raw = med.get("start_date")
+    if not raw:
+        return None
+    return occurrence.at_local(date.fromisoformat(raw), "00:00", tz).utc
+
+
+def _in_window(med: dict, today) -> bool:
+    """True when the local date `today` is inside the med's date range."""
+    start, end = med.get("start_date"), med.get("end_date")
+    if start and today < date.fromisoformat(start):
+        return False
+    if end and today > date.fromisoformat(end):
+        return False
+    return True
 
 
 # ── Message builders ──────────────────────────────────────────────────────────
@@ -453,11 +476,27 @@ def _process_med(plan: Plan, state: dict, med: dict, ev, idx, tz, quiet,
     lo = lo_base if plan.capped else max(lo_base, plan.now - lookback)
     if active_since is not None and active_since > lo:
         lo = active_since
+    # A start_date bounds enumeration from below too (PR 6): effective
+    # start = max(active_since, start_date). The 1s slack keeps the
+    # half-open (lo, now] inclusive of a 00:00 dose on the start date.
+    start_bound = _start_bound_utc(med, tz)
+    if start_bound is not None and start_bound - timedelta(seconds=1) > lo:
+        lo = start_bound - timedelta(seconds=1)
 
     if freq == "interval":
         occs = _interval_occurrences(plan, state, med, lo, tz, quiet)
     else:
         occs = occurrence.occurrences_between(sched, lo, plan.now, tz)
+
+    end_raw = med.get("end_date")
+    if end_raw:
+        # end_date is inclusive — its day's doses still fire. Occurrences on
+        # later local dates are dropped before any stage decision, so no
+        # reminder, nudge, missed or catch-up line ever fires for them and
+        # the watermark is never pinned to them (zero phantom misses after
+        # a course ends, catch-up included).
+        end_day = date.fromisoformat(end_raw)
+        occs = [o for o in occs if o.local.date() <= end_day]
 
     for occ in occs:
         _process_occurrence(plan, state, med, occ, ev, idx, tz, quiet,
@@ -485,6 +524,12 @@ def _interval_occurrences(plan: Plan, state: dict, med: dict, lo, tz, quiet):
             anchor = parse_instant(med["active_since_utc"])
         else:
             anchor = plan.now
+        # A future start_date anchors the chain at the course start (PR 6):
+        # effective start = max(active_since, start_date) — no phantom doses
+        # between active_since and the start date.
+        start_bound = _start_bound_utc(med, tz)
+        if start_bound is not None and start_bound > anchor:
+            anchor = start_bound
         if in_quiet(anchor, quiet, tz):
             anchor = next_quiet_end(anchor, quiet, tz)
         mstate["next_due"] = anchor.isoformat()
@@ -793,8 +838,12 @@ def _daily_messages(plan: Plan, state: dict, ev, idx, tz):
     digest_due = occurrence.at_local(today, g["digest_time"], tz).utc
     if digest_due <= now <= digest_due + DAILY_LATE_LIMIT:
         key = f"digest#{today.isoformat()}"
-        listed = [m for m in state.get("meds", []) if not m.get("paused")]
-        if not _sent_for(idx, key, "digest") and listed:
+        listed = [m for m in state.get("meds", [])
+                  if not m.get("paused") and _in_window(m, today)]
+        # a pending course-complete note sends the digest even with nothing
+        # left to list (PR 6) — a lone ended course still gets announced
+        if not _sent_for(idx, key, "digest") and (
+                listed or _course_done_lines(state, ev, tz, now)):
             # Record the listing order for --position replies (issue #1 §6):
             # "the 2nd one" resolves against today's digest, never an older
             # one (reply._resolve_target refuses a stale last_digest_date).
@@ -884,9 +933,42 @@ def _active_meds(state: dict) -> list:
             if not m.get("paused") and m["schedule"].get("frequency") != "as_needed"]
 
 
+def _course_done_lines(state: dict, ev, tz, now) -> list:
+    """
+    One-time course-complete notes (PR 6): a med whose end_date has passed
+    gets one line in the FIRST delivered digest on or after the day after
+    its end_date. A sent digest event at/after that boundary counts as the
+    announcement, so the note never repeats — and survives a skipped digest
+    day or a failed send's retry, which rebuilds the text until delivered.
+    """
+    today = now.astimezone(tz).date()
+    last_digest = None
+    for e in ev:
+        if e.get("event") == "sent" and e.get("stage") == "digest":
+            ts = _ts(e)
+            if last_digest is None or ts > last_digest:
+                last_digest = ts
+    lines = []
+    for med in state.get("meds", []):
+        end = med.get("end_date")
+        if not end or med.get("paused"):
+            continue
+        end_day = date.fromisoformat(end)
+        if today <= end_day:
+            continue
+        boundary = occurrence.at_local(end_day + timedelta(days=1), "00:00", tz).utc
+        if last_digest is not None and last_digest >= boundary:
+            continue   # a delivered digest already announced it
+        lines.append(f"Course complete: {med['name']} — ended "
+                     f"{end_day:%a %b %d}. No more reminders for it.")
+    return lines
+
+
 def digest_text(state: dict, ev, tz, now) -> str:
     """Daily summary (format kept from the pre-tick digest)."""
-    active = [m for m in state.get("meds", []) if not m.get("paused")]
+    today = now.astimezone(tz).date()
+    active = [m for m in state.get("meds", [])
+              if not m.get("paused") and _in_window(m, today)]
     date_str = now.astimezone(tz).strftime("%a %b ") + str(now.astimezone(tz).day)
     lines = [f"Meds for {date_str}:"]
     for i, med in enumerate(active, 1):
@@ -902,6 +984,10 @@ def digest_text(state: dict, ev, tz, now) -> str:
             time_str = prefix + ", ".join(dispatch.fmt_12h(t) for t in sched["times"])
         food = " (with food)" if sched.get("with_food") else ""
         lines.append(f"{i}. {med['name']} {med['dose']}{med['unit']} | {time_str}{food}")
+    done = _course_done_lines(state, ev, tz, now)
+    if done:
+        lines.append("")
+        lines.extend(done)
 
     since = now - timedelta(days=7)
     counts = {"taken": 0, "missed": 0, "skipped": 0}
