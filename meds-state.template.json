@@ -19,6 +19,8 @@
       "dose": "500",
       "unit": "mg",
       "paused": false,
+      "start_date": null,
+      "end_date": null,
       "schedule": {
         "frequency": "twice_daily",
         "times": ["08:00", "20:00"],

@@ -134,6 +134,16 @@
           "$ref": "#/definitions/isoDatetime",
           "description": "UTC instant the med became active (add, unpause, schedule or timezone edit). Occurrences before it are never enumerated — no phantom misses. Set by reply.py's add/edit commands."
         },
+        "start_date": {
+          "type": ["string", "null"],
+          "pattern": "^\\d{4}-\\d{2}-\\d{2}$",
+          "description": "Optional first active local date (YYYY-MM-DD, in global.timezone) — for courses and seasonal meds. Occurrences on earlier local dates are never enumerated. Null/absent = no start bound. Must be <= end_date when both are set."
+        },
+        "end_date": {
+          "type": ["string", "null"],
+          "pattern": "^\\d{4}-\\d{2}-\\d{2}$",
+          "description": "Optional last active local date (YYYY-MM-DD, in global.timezone) — INCLUSIVE. Occurrences on later local dates are never enumerated and never logged missed (no phantom misses after a course ends). Null/absent = no end bound."
+        },
         "min_gap_hours": {
           "type": "number",
           "exclusiveMinimum": 0,

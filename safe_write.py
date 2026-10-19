@@ -37,7 +37,7 @@ import re
 import shutil
 import sys
 import time
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Union
 
@@ -170,6 +170,7 @@ def _setup_logging() -> None:
 
 _HHMM = re.compile(r"^([01][0-9]|2[0-3]):[0-5][0-9]$")
 _ISO  = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?(Z|[+-]\d{2}:\d{2})$")
+_DATE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
 _VALID_TYPES    = {"pill","liquid","injection","patch","inhaler","other"}
 _VALID_FREQS    = {"once_daily","twice_daily","interval","weekly","as_needed"}
@@ -256,6 +257,24 @@ def validate(state: dict) -> None:
 
         if not isinstance(med["paused"], bool):
             _die(f"{p}.paused must be a boolean")
+
+        # Optional calendar bounds (PR 6): local dates in global.timezone;
+        # end_date is inclusive. Null/absent = unbounded on that side.
+        bounds = {}
+        for field in ("start_date", "end_date"):
+            val = med.get(field)
+            if val is None:
+                continue
+            if not isinstance(val, str) or not _DATE.match(val):
+                _die(f"{p}.{field} must be a YYYY-MM-DD date or null (got '{val}')")
+            try:
+                bounds[field] = date.fromisoformat(val)
+            except ValueError:
+                _die(f"{p}.{field} '{val}' is not a real calendar date")
+        if "start_date" in bounds and "end_date" in bounds \
+                and bounds["end_date"] < bounds["start_date"]:
+            _die(f"{p}: end_date ({med['end_date']}) must be on or after "
+                 f"start_date ({med['start_date']})")
 
         sched = med["schedule"]
         if "frequency" not in sched:
