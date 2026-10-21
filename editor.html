@@ -292,8 +292,8 @@ section h2 { font-size: 14px; font-weight: 600; letter-spacing: .03em;
     </div>
     <div id="f-day-section" style="display:none">
       <div class="field">
-        <label>Day of Week *</label>
-        <select id="f-day">
+        <label>Day(s) of Week *</label>
+        <select id="f-day" multiple size="5">
           <option value="mon">Monday</option>
           <option value="tue">Tuesday</option>
           <option value="wed">Wednesday</option>
@@ -302,7 +302,7 @@ section h2 { font-size: 14px; font-weight: 600; letter-spacing: .03em;
           <option value="sat">Saturday</option>
           <option value="sun">Sunday</option>
         </select>
-        <div class="hint">Weekly meds remind only on this day</div>
+        <div class="hint">Weekly meds remind on these days — click to pick one, Ctrl/Cmd-click for several (e.g. Mon–Fri)</div>
       </div>
     </div>
     <div id="f-interval-section" style="display:none">
@@ -431,10 +431,29 @@ function validate(s) {
     const FREQS = ['once_daily','twice_daily','interval','weekly','as_needed'];
     if (!FREQS.includes(sc.frequency)) e.push(`${p}.schedule.frequency must be one of ${FREQS.join(', ')}`);
     const DAYS = ['mon','tue','wed','thu','fri','sat','sun'];
-    if (sc.day_of_week != null && !DAYS.includes(sc.day_of_week))
-      e.push(`${p}.schedule.day_of_week must be one of ${DAYS.join(', ')}`);
-    if (sc.frequency === 'weekly' && !sc.day_of_week)
-      e.push(`${p}.schedule.day_of_week is required for weekly meds (e.g. 'mon') — without it reminders fire daily`);
+    // single day (legacy) or canonical list: sorted mon..sun, deduped (PR 7)
+    if (sc.day_of_week != null) {
+      if (typeof sc.day_of_week === 'string') {
+        if (!DAYS.includes(sc.day_of_week))
+          e.push(`${p}.schedule.day_of_week must be one of ${DAYS.join(', ')} (or a list of them)`);
+      } else if (Array.isArray(sc.day_of_week)) {
+        if (!sc.day_of_week.length)
+          e.push(`${p}.schedule.day_of_week can't be an empty list — pick at least one day`);
+        else if (sc.day_of_week.some(d => !DAYS.includes(d)))
+          e.push(`${p}.schedule.day_of_week entries must be one of ${DAYS.join(', ')}`);
+        else if (new Set(sc.day_of_week).size !== sc.day_of_week.length)
+          e.push(`${p}.schedule.day_of_week has duplicate days — list each day once`);
+        else {
+          const idxs = sc.day_of_week.map(d => DAYS.indexOf(d));
+          if (!idxs.every((v, i) => i === 0 || v > idxs[i-1]))
+            e.push(`${p}.schedule.day_of_week must be sorted mon..sun (got [${sc.day_of_week.join(', ')}])`);
+        }
+      } else {
+        e.push(`${p}.schedule.day_of_week must be a day string, a list of days, or null`);
+      }
+    }
+    if (sc.frequency === 'weekly' && !(sc.day_of_week && sc.day_of_week.length))
+      e.push(`${p}.schedule.day_of_week is required for weekly meds (e.g. 'mon' or ['tue','sat']) — without it reminders fire daily`);
     if (sc.frequency === 'interval') {
       if (!Number.isInteger(sc.interval_hours) || sc.interval_hours < 1 || sc.interval_hours > 168)
         e.push(`${p}.schedule.interval_hours must be integer 1-168`);
@@ -654,7 +673,7 @@ function fmtSchedule(med) {
     return `${h%12||12}:${String(m).padStart(2,'0')}${suf}`;
   });
   if (s.frequency === 'weekly') {
-    const day = s.day_of_week ? `${s.day_of_week[0].toUpperCase()+s.day_of_week.slice(1)}s ` : '';
+    const day = s.day_of_week ? `${fmtDays(s.day_of_week)} ` : '';
     return `${day}${ts.join(', ')}`;
   }
   const freq = { once_daily:'daily', twice_daily:'twice daily' }[s.frequency] || s.frequency;
@@ -714,7 +733,9 @@ function openEditMed(id) {
 
   const s = med.schedule;
   document.getElementById('f-freq').value  = s.frequency;
-  document.getElementById('f-day').value   = s.day_of_week || 'mon';
+  setSelected(document.getElementById('f-day'),
+              Array.isArray(s.day_of_week) ? s.day_of_week
+                                           : (s.day_of_week ? [s.day_of_week] : ['mon']));
   if (s.frequency === 'interval') {
     document.getElementById('f-interval').value = s.interval_hours || '';
   } else {
@@ -771,7 +792,7 @@ function clearMedForm() {
   });
   document.getElementById('f-type').value    = 'pill';
   document.getElementById('f-freq').value    = 'once_daily';
-  document.getElementById('f-day').value     = 'mon';
+  setSelected(document.getElementById('f-day'), ['mon']);
   document.getElementById('f-paused').checked = false;
   document.getElementById('f-food').checked   = false;
   document.getElementById('f-times-list').innerHTML = '';
@@ -797,6 +818,42 @@ function addTimeRow(val = '') {
 function collectTimes() {
   return Array.from(document.querySelectorAll('#f-times-list input[type=time]'))
     .map(el => el.value).filter(Boolean);
+}
+
+// ── Weekly day picker (multi-day schedules, PR 7) ──────────────────────────
+const DAY_ORDER = ['mon','tue','wed','thu','fri','sat','sun'];
+
+function setSelected(sel, values) {
+  Array.from(sel.options).forEach(o => { o.selected = values.includes(o.value); });
+}
+
+function collectDays() {
+  // Canonical form: sorted mon..sun, deduped — matches safe_write.validate
+  const picked = new Set(
+    Array.from(document.getElementById('f-day').selectedOptions || [])
+      .map(o => o.value).filter(v => DAY_ORDER.includes(v)));
+  return DAY_ORDER.filter(d => picked.has(d));
+}
+
+function fmtDays(days) {
+  // 'tue' → 'Tue', ['tue','sat'] → 'Tue+Sat', ['mon'..'fri'] → 'Mon–Fri'
+  // (runs of 3+ compress) — mirrors dispatch.fmt_days on the Python side
+  if (!days || !days.length) return '';
+  const idxs = [...new Set((Array.isArray(days) ? days : [days])
+    .map(d => DAY_ORDER.indexOf(d)))].sort((a, b) => a - b);
+  const cap = s => s[0].toUpperCase() + s.slice(1);
+  const parts = [];
+  let start = idxs[0];
+  for (let k = 1; k <= idxs.length; k++) {
+    if (idxs[k] !== idxs[k-1] + 1) {          // run that started at `start` ended
+      if (idxs[k-1] - start >= 2)
+        parts.push(cap(DAY_ORDER[start]) + '–' + cap(DAY_ORDER[idxs[k-1]]));
+      else
+        for (let i = start; i <= idxs[k-1]; i++) parts.push(cap(DAY_ORDER[i]));
+      start = idxs[k];
+    }
+  }
+  return parts.join('+');
 }
 
 function saveMed() {
@@ -825,6 +882,7 @@ function saveMed() {
     const times = collectTimes();
     if (!times.length) errs.push('At least one dose time is required');
     times.forEach((t, i) => { if (!HHMM.test(t)) errs.push(`Time ${i+1} "${t}" must be HH:MM (zero-padded, 24h)`); });
+    if (freq === 'weekly' && !collectDays().length) errs.push('Pick at least one day of the week');
   }
   if (isNaN(late) || late < 1)  errs.push('Late threshold must be a positive number');
   if (isNaN(miss) || miss < 1)  errs.push('Missed threshold must be a positive number');
@@ -847,7 +905,7 @@ function saveMed() {
   } else if (freq !== 'as_needed') {
     schedule.interval_hours = null;
     schedule.times = collectTimes();
-    schedule.day_of_week = freq === 'weekly' ? document.getElementById('f-day').value : null;
+    schedule.day_of_week = freq === 'weekly' ? collectDays() : null;
   } else {
     schedule.interval_hours = null;
     schedule.day_of_week = null;

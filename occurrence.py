@@ -23,6 +23,19 @@ UTC = timezone.utc
 DAY_KEYS = ("mon", "tue", "wed", "thu", "fri", "sat", "sun")
 
 
+def day_indexes(day_of_week) -> tuple:
+    """
+    Weekday numbers (mon=0) a weekly schedule fires on. Accepts the legacy
+    single string ('tue') or the PR 7 list form (['tue','sat']). Empty when
+    unset — readers normalize, so stored form never matters here.
+    """
+    if not day_of_week:
+        return ()
+    if isinstance(day_of_week, str):
+        return (DAY_KEYS.index(day_of_week),)
+    return tuple(DAY_KEYS.index(d) for d in day_of_week)
+
+
 @dataclass(frozen=True)
 class Occurrence:
     """
@@ -80,24 +93,23 @@ def occurrences_between(sched: dict, lo: datetime, hi: datetime, tz: ZoneInfo) -
     """
     Wall-time occurrences whose UTC instant falls in (lo, hi], in UTC order.
 
-    Weekly meds enumerate only local dates matching day_of_week. Interval and
-    as_needed meds return [] — interval enumeration is anchored on next_due
-    by the tick (PR 2). lo/hi may carry any (or no) timezone.
+    Weekly meds enumerate only local dates whose weekday is in day_of_week
+    (single day or list — PR 7). Interval and as_needed meds return [] —
+    interval enumeration is anchored on next_due by the tick (PR 2). lo/hi
+    may carry any (or no) timezone.
     """
     freq = sched.get("frequency")
     if freq in ("interval", "as_needed") or not sched.get("times"):
         return []
     lo_utc, hi_utc = _to_utc(lo), _to_utc(hi)
 
-    weekly_day = None
-    if freq == "weekly" and sched.get("day_of_week"):
-        weekly_day = DAY_KEYS.index(sched["day_of_week"])
+    weekly_days = day_indexes(sched.get("day_of_week")) if freq == "weekly" else ()
 
     day = lo_utc.astimezone(tz).date() - timedelta(days=1)   # local-date margin
     end = hi_utc.astimezone(tz).date() + timedelta(days=1)
     out = []
     while day <= end:
-        if weekly_day is None or day.weekday() == weekly_day:
+        if not weekly_days or day.weekday() in weekly_days:
             for i, t in enumerate(sched["times"]):
                 occ = at_local(day, t, tz, i)
                 if lo_utc < occ.utc <= hi_utc:
@@ -153,20 +165,20 @@ def covered_occurrence(sched: dict, taken_at: datetime, tz: ZoneInfo,
     asof_utc = _to_utc(taken_at)
     local_now = asof_utc.astimezone(tz)
 
-    weekly_day = sched.get("day_of_week") if freq == "weekly" else None
+    weekly_days = day_indexes(sched.get("day_of_week")) if freq == "weekly" else ()
+    # Each (time, weekday) pair contributes its most recent past instance —
+    # one pair per time for daily meds, one per listed day for weekly (PR 7;
+    # a legacy weekly with no day_of_week keeps its daily-pair behavior).
+    weekdays = weekly_days or (local_now.date().weekday(),)
     pasts, futures = [], []
     for i, t in enumerate(sched["times"]):
-        if weekly_day:
-            day = local_now.date() - timedelta(days=(local_now.date().weekday() - DAY_KEYS.index(weekly_day)) % 7)
+        for wd in weekdays:
+            day = local_now.date() - timedelta(days=(local_now.date().weekday() - wd) % 7)
             past = at_local(day, t, tz, i)
             if past.utc > asof_utc:
-                past = at_local(day - timedelta(days=7), t, tz, i)
-        else:
-            past = at_local(local_now.date(), t, tz, i)
-            if past.utc > asof_utc:
-                past = at_local(local_now.date() - period, t, tz, i)
-        pasts.append(past)
-        futures.append(at_local(past.local.date() + period, t, tz, i))
+                past = at_local(day - period, t, tz, i)
+            pasts.append(past)
+            futures.append(at_local(past.local.date() + period, t, tz, i))
 
     nearest_past = max(pasts, key=lambda o: o.utc)
     next_future = min(futures, key=lambda o: o.utc)

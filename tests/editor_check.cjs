@@ -5,6 +5,8 @@
  *   save-fresh   open → save → the write happens and the mtime baseline re-syncs
  *   save-stale   open → the file changes on disk → save is REFUSED (M4, issue #1 §2)
  *   passthrough  edit a med → optional fields the form doesn't know survive
+ *   multi-day    weekly day list → canonical sorted array written; an empty
+ *                day selection is refused before anything changes
  *
  * The script source is eval'd together with the scenario driver so the
  * driver sees the eval scope (let/const declarations stay inside it).
@@ -26,14 +28,18 @@ function el(id) {
       className: '', disabled: false, style: {},
       classList: { add() {}, remove() {}, contains() { return false; } },
       appendChild() {}, addEventListener() {}, scrollIntoView() {},
+      options: [], selectedOptions: [],   // the multi-select day picker (PR 7)
     });
   }
   return els.get(id);
 }
+// querySelectorAll results a driver can inject (e.g. the weekly form's
+// time-row inputs); anything unregistered matches nothing, as before.
+const queried = {};
 globalThis.document = {
   getElementById: el,
   createElement: () => el('created-' + els.size),
-  querySelectorAll: () => [],
+  querySelectorAll: (sel) => queried[sel] || [],
   addEventListener() {},
 };
 globalThis.window = globalThis;
@@ -125,10 +131,45 @@ async function drvPassthrough() {
   assert(currentState.global.log_redact === true, 'unknown global field preserved');
 }
 
+async function drvMultiDay() {
+  await openFile();
+  // hand-edit the disk state to a multi-day weekly schedule in non-canonical
+  // order — the way a text editor would leave it
+  currentState.meds[0].schedule = { frequency: 'weekly', times: ['09:00'],
+                                    interval_hours: null, day_of_week: ['sat','tue'],
+                                    with_food: false, notes: '', quiet_policy: 'shift' };
+  let errs = validate(currentState);
+  assert(errs.some(e => /sorted mon\.\.sun/.test(e)),
+         'non-canonical day list flagged: ' + errs.join(' | '));
+
+  // the modal's time rows live in the DOM — inject one 09:00 input
+  queried['#f-times-list input[type=time]'] = [{ value: '09:00' }];
+  openEditMed('med-001');
+  el('f-day').selectedOptions = [{ value: 'tue' }, { value: 'sat' }];
+  saveMed();
+  const med = currentState.meds[0];
+  assert(Array.isArray(med.schedule.day_of_week)
+         && med.schedule.day_of_week.join() === 'tue,sat',
+         'saved as canonical sorted array: ' + JSON.stringify(med.schedule.day_of_week));
+  assert(med.schedule.quiet_policy === 'shift', 'unknown schedule field still preserved');
+  errs = validate(currentState);
+  assert(errs.length === 0, 'state with day array validates: ' + errs.join(' | '));
+
+  // an empty day selection is refused before anything is written
+  openEditMed('med-001');
+  el('f-day').selectedOptions = [];
+  saveMed();
+  assert(/Pick at least one day/.test(el('f-form-errors').textContent),
+         'empty day selection refused: ' + el('f-form-errors').textContent);
+  assert(currentState.meds[0].schedule.day_of_week.join() === 'tue,sat',
+         'refused save left the schedule untouched');
+}
+
 const DRIVERS = {
   'save-fresh': drvSaveFresh,
   'save-stale': drvSaveStale,
   'passthrough': drvPassthrough,
+  'multi-day': drvMultiDay,
 };
 const driver = DRIVERS[scenario];
 if (!driver) { console.error('unknown scenario: ' + scenario); process.exit(2); }

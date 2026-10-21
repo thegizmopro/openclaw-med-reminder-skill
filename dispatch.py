@@ -241,6 +241,27 @@ def fmt_12h(hhmm: str) -> str:
     suffix = "am" if h < 12 else "pm"
     return f"{h % 12 or 12}:{m:02d}{suffix}"
 
+def fmt_days(days) -> str:
+    """
+    Day-of-week label for weekly schedules: 'tue' → 'Tue', ['tue','sat'] →
+    'Tue+Sat', ['mon'..'fri'] → 'Mon–Fri' (runs of 3+ compress to First–Last).
+    Accepts either stored form; empty input → ''.
+    """
+    if not days:
+        return ""
+    if isinstance(days, str):
+        days = [days]
+    idxs = sorted({DAY_KEYS.index(d) for d in days})
+    parts, start = [], idxs[0]
+    for prev, cur in zip(idxs, idxs[1:] + [None]):
+        if cur != prev + 1:                  # the run that started at `start` ended
+            if prev - start >= 2:
+                parts.append(f"{DAY_KEYS[start].title()}–{DAY_KEYS[prev].title()}")
+            else:
+                parts.extend(DAY_KEYS[i].title() for i in range(start, prev + 1))
+            start = cur
+    return "+".join(parts)
+
 # ── Next-due calculation ──────────────────────────────────────────────────────
 
 def compute_next_due(med: dict, after: datetime, tz: ZoneInfo) -> Optional[datetime]:
@@ -275,8 +296,11 @@ def compute_next_due(med: dict, after: datetime, tz: ZoneInfo) -> Optional[datet
     if freq == "weekly":
         day = sched.get("day_of_week")
         if day:
-            # Next occurrence of (day, times[0]) — most recent one + 7 days
-            return most_recent_weekly_time(day, times[0], tz, after) + timedelta(days=7)
+            # Next occurrence of (day, times[0]) — most recent one + 7 days.
+            # Multi-day schedules (PR 7) take the soonest of each day's next.
+            days = [day] if isinstance(day, str) else day
+            return min(most_recent_weekly_time(d, times[0], tz, after)
+                       + timedelta(days=7) for d in days)
         # Legacy weekly without day_of_week: advance soonest candidate ~a week out
         base = min(candidates)
         while (base - after) < timedelta(days=6):
