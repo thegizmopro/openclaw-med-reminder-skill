@@ -180,6 +180,7 @@ _VALID_EVENTS   = {"taken","missed","late_nudge_sent","deferred"}
 # Canonical day order for list-valued day_of_week (PR 7): sorted mon..sun
 _DAY_ORDER      = ("mon","tue","wed","thu","fri","sat","sun")
 _VALID_DAYS     = set(_DAY_ORDER)
+_VALID_SYRINGES = {"U-100","U-50"}
 _MED_ID         = re.compile(r"^med-[0-9]{3,}$")
 
 
@@ -259,6 +260,10 @@ def validate(state: dict) -> None:
 
         if not isinstance(med["paused"], bool):
             _die(f"{p}.paused must be a boolean")
+
+        # Optional syringe for the reconstitution calculator (PR 8a, #10)
+        if med.get("syringe") is not None and med["syringe"] not in _VALID_SYRINGES:
+            _die(f"{p}.syringe must be one of {sorted(_VALID_SYRINGES)} or absent")
 
         # Optional calendar bounds (PR 6): local dates in global.timezone;
         # end_date is inclusive. Null/absent = unbounded on that side.

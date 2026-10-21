@@ -144,6 +144,11 @@
           "pattern": "^\\d{4}-\\d{2}-\\d{2}$",
           "description": "Optional last active local date (YYYY-MM-DD, in global.timezone) — INCLUSIVE. Occurrences on later local dates are never enumerated and never logged missed (no phantom misses after a course ends). Null/absent = no end bound."
         },
+        "syringe": {
+          "type": ["string", "null"],
+          "enum": ["U-100", "U-50", null],
+          "description": "Optional syringe type for the reconstitution calculator (PR 8a, #10). Absent/null = U-100. U-100: 1 unit = 10 µL; U-50: 1 unit = 20 µL. Only used when the dose is in mcg or mg and a mix has been logged (reply.py reconstitute)."
+        },
         "min_gap_hours": {
           "type": "number",
           "exclusiveMinimum": 0,

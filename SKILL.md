@@ -437,6 +437,8 @@ Never write state based on an ambiguous match. Always confirm with the user firs
 | `status`, `what's due`, `my meds` | Info only | `reply.py status` — relay output, no write |
 | `stop taking metformin`, `put met on hold` | Pause one med | `reply.py pause <id>` (confirm with the user first) |
 | `resume metformin`, `restart met` | Unpause one med | `reply.py unpause <id>` |
+| `I mixed wolverine: 10 mg with 2 mL`, `new vial of met, 5mg in 2ml` | Log a vial mix | `reply.py reconstitute <id> --vial-mg 10 --diluent-ml 2` |
+| `I use U-50 syringes for wolverine` | Set syringe type | `reply.py edit-med <id> --json -` with `{"syringe": "U-50"}` |
 | `add a med`, `new med` | Start interview | Section 2 flow, written via `reply.py add-med --json -` |
 | `change met to 9pm`, `met is now 1000mg` | Edit a med | `reply.py edit-med <id> --json -` |
 | `quiet hours 11 to 8` | Change quiet hours | `reply.py set-quiet-hours 23:00 08:00` |
@@ -466,6 +468,29 @@ python3 reply.py unpause med-001
 Unpause restarts tracking from now — doses during the pause aren't counted as
 missed. No `setup-tasks.py` re-run is needed: one tick task covers all meds,
 paused or not.
+
+### Reconstitution (syringe units)
+
+For injectables dosed in mcg or mg (peptides), log each vial mix:
+
+```bash
+python3 reply.py reconstitute med-002 --vial-mg 10 --diluent-ml 2
+```
+
+It prints the concentration, the units to draw for the prescribed dose on
+the med's syringe (`syringe`: `U-100` default, or `U-50`), and a sanity line
+("This vial holds about 40 doses") — relay all of it, including any
+`Check:` lines, and ask the user to confirm the numbers look right. From then
+on reminders, nudges and the confirm echo carry the units
+("Reminder: Wolverine 250mcg = 5 units on your U-100"). A new mix replaces
+the old one; there is nothing to undo — log the correct mix again.
+
+`--diluent-ml` is millilitres. If the user gives the water in syringe units
+("100 units of water"), confirm the mL with them (on a U-100, 100 units =
+1 mL) before logging — a units/mL mix-up changes every dose.
+
+Never suggest a dose or a mix. The calculator converts the dose the user
+already chose; if they ask what dose to take, refer them to their prescriber.
 
 ---
 

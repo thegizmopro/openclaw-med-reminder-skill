@@ -6,14 +6,15 @@ cache (issue §0). One JSON object per line:
 
     {id, ts_utc, med_id, event, occurrence_key, occurrence_utc, generation,
      stage, dose_prescribed, dose_taken, taken_at_utc, ref, attempt,
-     lease_until_utc, error}
+     lease_until_utc, error, vial_mg, diluent_ml}
 
 Appends flush + fsync so a crash never loses a recorded event. Readers
 dedupe by id and skip a torn last line (a crash mid-append), so a forced
 retry never duplicates history.
 
 Event vocabulary: taken, skipped, missed, undone, snoozed, send_intent,
-sent, send_failed, clock_anomaly. `reminded`/`late_nudge_sent` are dead —
+sent, send_failed, clock_anomaly, reconstituted (PR 8a: a vial mix,
+{vial_mg, diluent_ml}, no occurrence). `reminded`/`late_nudge_sent` are dead —
 expressed as send_intent/sent with `stage` set (issue §1).
 """
 
@@ -35,7 +36,7 @@ log = logging.getLogger("event_store")
 
 VALID_EVENTS = frozenset({
     "taken", "skipped", "missed", "undone", "snoozed",
-    "send_intent", "sent", "send_failed", "clock_anomaly",
+    "send_intent", "sent", "send_failed", "clock_anomaly", "reconstituted",
 })
 
 VALID_STAGES = frozenset({
@@ -48,6 +49,7 @@ _EVENT_FIELDS = (
     "occurrence_key", "occurrence_utc", "generation", "stage",
     "dose_prescribed", "dose_taken", "taken_at_utc",
     "ref", "attempt", "lease_until_utc", "error",
+    "vial_mg", "diluent_ml",
 )
 _OPTIONAL_FIELDS = _EVENT_FIELDS[4:]
 

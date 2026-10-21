@@ -60,6 +60,7 @@ import attribution
 import dispatch
 import event_store
 import occurrence
+import reconstitution
 import safe_write as sw
 from clock import Clock, get_clock, parse_instant
 from occurrence import Occurrence
@@ -177,9 +178,17 @@ def double_dose_warning(med: dict, taken_event: dict, tz: ZoneInfo) -> str:
             "Reply 'took it' only if you take this dose.")
 
 
-def reminder_text(med: dict, tz: ZoneInfo, warning: str = "", snoozed: bool = False) -> str:
+def draw_note(med: dict, draw) -> str:
+    """'250mcg = 10 units on your U-100' — the syringe units for the
+    prescribed dose under the current mix (PR 8a, #10)."""
+    return (f"{med['dose']}{med['unit']} = {reconstitution.units_phrase(draw)} "
+            f"on your {draw.syringe}")
+
+
+def reminder_text(med: dict, tz: ZoneInfo, warning: str = "", snoozed: bool = False,
+                  draw=None) -> str:
     tag = "Reminder (snoozed)" if snoozed else "Reminder"
-    msg = f"{tag}: {med['name']} {med['dose']}{med['unit']}"
+    msg = f"{tag}: {med['name']} {draw_note(med, draw) if draw else med['dose'] + med['unit']}"
     if med["schedule"].get("with_food"):
         msg += " — take with food"
     if warning:
@@ -189,8 +198,10 @@ def reminder_text(med: dict, tz: ZoneInfo, warning: str = "", snoozed: bool = Fa
     return msg
 
 
-def nudge_text(med: dict, tz: ZoneInfo, warning: str = "") -> str:
+def nudge_text(med: dict, tz: ZoneInfo, warning: str = "", draw=None) -> str:
     msg = dispatch.expand(med["escalation"]["late_message"], med)
+    if draw:
+        msg += f"\n{draw_note(med, draw)}"
     if warning:
         msg += f"\n{warning}"
     return msg
@@ -598,19 +609,22 @@ def _process_occurrence(plan: Plan, state: dict, med: dict, occ: Occurrence,
             log.info("tick: nudge for %s %s muted (quiet hours)", med_id, key)
             return
         warning = _double_dose_guard(ev, med, T, tz)
-        plan_send(plan, idx, med, occ, gen, "nudge", nudge_text(med, tz, warning))
+        plan_send(plan, idx, med, occ, gen, "nudge",
+                  nudge_text(med, tz, warning, reconstitution.med_draw(med, ev, now)))
         return
 
     if snoozed_until is not None and now >= snoozed_until:
         warning = _double_dose_guard(ev, med, T, tz)
         plan_send(plan, idx, med, occ, gen, "snooze_reminder",
-                  reminder_text(med, tz, warning, snoozed=True))
+                  reminder_text(med, tz, warning, snoozed=True,
+                                draw=reconstitution.med_draw(med, ev, now)))
         return
 
     if now >= T:
         warning = _double_dose_guard(ev, med, T, tz)
         plan_send(plan, idx, med, occ, gen, "reminder",
-                  reminder_text(med, tz, warning))
+                  reminder_text(med, tz, warning,
+                                draw=reconstitution.med_draw(med, ev, now)))
 
 
 def _double_dose_guard(ev, med: dict, T, tz) -> str:
@@ -772,10 +786,12 @@ def _rebuild_text(plan: Plan, state: dict, med: dict, ev, tz, stage: str,
                   key: str, occ_utc, tr, quiet) -> str:
     occ = Occurrence(utc=occ_utc, key=key, tz=tz)
     warning = _double_dose_guard(ev, med, occ_utc, tz)
+    draw = reconstitution.med_draw(med, ev, plan.now) if "id" in med else None
     if stage in ("reminder", "snooze_reminder"):
-        return reminder_text(med, tz, warning, snoozed=(stage == "snooze_reminder"))
+        return reminder_text(med, tz, warning, snoozed=(stage == "snooze_reminder"),
+                             draw=draw)
     if stage == "nudge":
-        return nudge_text(med, tz, warning)
+        return nudge_text(med, tz, warning, draw)
     if stage == "catchup" and med.get("id") is not None and med.get("id") != GLOBAL_MED_ID:
         return missed_text(med)          # per-occurrence missed message
     if stage == "digest":
