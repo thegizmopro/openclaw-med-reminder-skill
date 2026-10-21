@@ -111,13 +111,16 @@ Infer from context:
 | once a day / daily | `once_daily` | ask what time |
 | twice a day / BID | `twice_daily` | ask what times, or use `["08:00","20:00"]` |
 | every N hours | `interval` | set `interval_hours: N`, no times |
-| weekly / once a week | `weekly` | ask what time on what day* |
+| weekly / once a week | `weekly` | ask what time on what day(s)* |
 | as needed / PRN | `as_needed` | no times |
 
-*Weekly: store the dose time in `times[0]` and the day in `schedule.day_of_week`
-(`"mon"`, `"tue"`, `"wed"`, `"thu"`, `"fri"`, `"sat"`, `"sun"`). Required — without
-it reminders fire every day. `schedule.notes` stays free-text ("Every Monday at
-breakfast" is fine, but the machine-readable day lives in `day_of_week`).
+*Weekly: store the dose time in `times[0]` and the day(s) in
+`schedule.day_of_week` — a single day (`"mon"`) or a list for multi-day
+protocols (`["tue","sat"]`, `["mon","tue","wed","thu","fri"]` for Mon–Fri).
+Required — without it reminders fire every day. Lists are stored sorted
+`mon`→`sun` and deduped; single strings stay strings. `schedule.notes` stays
+free-text ("Every Monday at breakfast" is fine, but the machine-readable day
+lives in `day_of_week`).
 
 ### schedule.quiet_policy — interval meds only
 Interval meds fire around the clock, so the §1 rules can't place their doses.
