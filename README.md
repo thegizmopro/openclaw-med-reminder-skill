@@ -148,10 +148,11 @@ When you reply to a reminder or digest ("took metformin", "snooze that", "took i
 |---------|---------|
 | `took metformin` / `done` / `all taken` | `confirm <id>` / `confirm --all` |
 | `took it at 8` | `confirm <id> --taken-at 08:00` |
-| `snooze that` / `not yet` | `snooze <id> [--minutes N]` |
+| `snooze that` / `not yet` / `pause metformin 90` | `snooze <id> [--minutes N]` (pausing a reminder is a snooze) |
 | `skip metformin` | `skip <id>` (logged skipped, never missed) |
 | `undo` | `undo <id>` (within 24h) |
-| `pause metformin` / `unpause` | `pause <id>` / `unpause <id>` |
+| `stop taking metformin` / `resume metformin` | `pause <id>` / `unpause <id>` |
+| `I mixed wolverine: 10 mg with 2 mL` | `reconstitute <id> --vial-mg 10 --diluent-ml 2` (reminders then show syringe units) |
 | `status` / `what's due` | `status` (read-only) |
 | add / change / remove a med, quiet hours | `add-med` / `edit-med` / `remove` / `set-quiet-hours` |
 

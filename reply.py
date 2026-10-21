@@ -16,6 +16,8 @@ Subcommands (issue #1 §6 — all writes go through transact):
     defer   <med-id>           Deprecated alias for snooze
     undo <med-id>              Undo the most recent taken/skipped (24h)
     pause/unpause <med-id>     Stop or resume reminders for one med
+    reconstitute <med-id> --vial-mg X --diluent-ml Y
+                               Log a vial mix; reminders then show syringe units
     add-med --json -           Add a med from a JSON object on stdin
     edit-med <med-id> --json - Edit a med from a JSON object on stdin
     set-quiet-hours HH:MM HH:MM
@@ -46,6 +48,7 @@ import argparse
 import copy
 import json
 import logging
+import math
 import os
 import re
 import sys
@@ -66,6 +69,7 @@ sys.path.insert(0, str(SCRIPT_DIR))
 import dispatch as _dispatch_mod
 import event_store as _event_store_mod
 import occurrence as _occurrence_mod
+import reconstitution as _rc
 import safe_write as _safe_write_mod
 from clock import Clock, get_clock, parse_instant
 from dispatch import (
@@ -349,7 +353,9 @@ def handle_confirm(med_id: str, dose_taken: Optional[str], dry_run: bool,
     if next_due:
         nd_dt = parse_instant(next_due).astimezone(tz)
         nd_str = f" Next due: {nd_dt:%a} {_fmt_12h(nd_dt)}."
-    print(f"{med['name']} {med['dose']}{med['unit']}.{nd_str}")
+    draw = _rc.med_draw(med, history, now) if dose_taken is None else None
+    units = f" ({_rc.units_phrase(draw)})" if draw else ""
+    print(f"{med['name']} {med['dose']}{med['unit']}{units}.{nd_str}")
     log.info("CONFIRM [%s] credited %s", med_id, occ.key if occ else "(unattributed)")
 
 
@@ -803,6 +809,66 @@ def handle_unpause(med_id: str, dry_run: bool, clock: Optional[Clock] = None,
     log.info("UNPAUSE [%s]", med["id"])
 
 
+# ── Reconstitution (PR 8a, #10) ────────────────────────────────────────────────
+
+def handle_reconstitute(med_id: str, vial_mg: float, diluent_ml: float,
+                        dry_run: bool, clock: Optional[Clock] = None,
+                        position: Optional[int] = None) -> None:
+    """
+    Log a vial mix as a `reconstituted` event. From then on reminders,
+    nudges and the confirm echo carry the syringe units for the prescribed
+    dose. Computes units for the dose the user chose — never suggests one.
+    """
+    clock = clock or get_clock()
+    state = load_state()
+    tz = get_tz(state)
+    now = clock.now_utc()
+    med = _resolve_target(state, med_id, position, tz, now)
+
+    for label, val in (("--vial-mg", vial_mg), ("--diluent-ml", diluent_ml)):
+        if not (math.isfinite(val) and val > 0):
+            print(f"Error: {label} must be a positive number (got {val}).")
+            raise SystemExit(EXIT_BAD_OPTION)
+    mcg = _rc.dose_mcg(med)
+    if mcg is None:
+        print(f"Error: {med['name']} is dosed in {med['dose']}{med['unit']} — "
+              "units can only be computed for a dose in mcg or mg.")
+        raise SystemExit(EXIT_BAD_OPTION)
+    draw = _rc.compute(mcg, vial_mg, diluent_ml, _rc.syringe_of(med))
+    dose = f"{med['dose']}{med['unit']}"
+    if draw.doses_per_vial < 1:
+        print(f"Error: a {dose} dose is more than the whole vial "
+              f"({_rc.fmt_num(vial_mg)} mg) — check the vial strength.")
+        raise SystemExit(EXIT_BAD_OPTION)
+
+    lines = [
+        f"{_rc.fmt_num(vial_mg)} mg in {_rc.fmt_num(diluent_ml)} mL = "
+        f"{_rc.fmt_num(draw.conc_mg_per_ml)} mg/mL.",
+        f"{dose} = {_rc.units_phrase(draw)} on your {draw.syringe} "
+        f"({_rc.fmt_num(draw.volume_ml, 3)} mL).",
+        f"This vial holds about {math.floor(draw.doses_per_vial + 1e-9)} doses at {dose}.",
+    ] + [f"Check: {w}" for w in draw.warnings]
+
+    if dry_run:
+        print(f"[DRY RUN] Would log a mix for {med['name']}:")
+        for line in lines:
+            print(line)
+        return
+
+    def fn(state_copy, history_view):
+        if _find_med(state_copy, med["id"]) is None:
+            raise ValueError(f"med {med['id']} disappeared mid-reconstitute")
+        return state_copy, [_event_store_mod.new_event(
+            med["id"], "reconstituted", now,
+            vial_mg=vial_mg, diluent_ml=diluent_ml)]
+
+    _safe_write_mod.transact(fn, clock=clock)
+    print(f"Logged mix for {med['name']}:")
+    for line in lines:
+        print(line)
+    log.info("RECONSTITUTE [%s] %s mg / %s mL", med["id"], vial_mg, diluent_ml)
+
+
 # ── Edit-time quiet-hours checks (issue #1 §6, AC 27) ─────────────────────────
 #
 # validate() never rejects quiet-hours conflicts (AC 26 — existing state
@@ -1254,6 +1320,17 @@ def main() -> None:
         p.add_argument("--position", type=int, default=None, metavar="N",
                        help="Pick the Nth med from today's digest order (1-based)")
 
+    p_recon = sub.add_parser("reconstitute",
+                             help="Log a vial mix (reminders then show syringe units)")
+    p_recon.add_argument("med_id", nargs="?", default=None,
+                         help="Med ID, e.g. med-001 (or use --position)")
+    p_recon.add_argument("--position", type=int, default=None, metavar="N",
+                         help="Pick the Nth med from today's digest order (1-based)")
+    p_recon.add_argument("--vial-mg", type=float, required=True, metavar="MG",
+                         help="Peptide in the vial, mg")
+    p_recon.add_argument("--diluent-ml", type=float, required=True, metavar="ML",
+                         help="Bacteriostatic water added, mL")
+
     p_add = sub.add_parser("add-med", help="Add a med from a JSON object on stdin")
     p_add.add_argument("--json", action="store_true",
                        help="Read the med's JSON from stdin ('-' or a path)")
@@ -1328,6 +1405,11 @@ def main() -> None:
         if not args.med_id and args.position is None:
             parser.error("unpause requires a med_id or --position")
         handle_unpause(args.med_id, args.dry_run, position=args.position)
+    elif args.mode == "reconstitute":
+        if not args.med_id and args.position is None:
+            parser.error("reconstitute requires a med_id or --position")
+        handle_reconstitute(args.med_id, args.vial_mg, args.diluent_ml,
+                            args.dry_run, position=args.position)
     elif args.mode == "add-med":
         handle_add_med(_read_json_input(args.json_src), args.dry_run)
     elif args.mode == "edit-med":

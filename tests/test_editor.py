@@ -21,7 +21,7 @@ EDITOR = Path(__file__).parent.parent / "editor.html"
 pytestmark = pytest.mark.skipif(NODE is None, reason="node.js not available")
 
 
-@pytest.mark.parametrize("scenario", ["save-fresh", "save-stale", "passthrough", "multi-day"])
+@pytest.mark.parametrize("scenario", ["save-fresh", "save-stale", "passthrough", "multi-day", "calculator"])
 def test_editor_scenario(scenario, tmp_path):
     r = subprocess.run([NODE, str(HARNESS), scenario], capture_output=True,
                        text=True, timeout=60, cwd=tmp_path)

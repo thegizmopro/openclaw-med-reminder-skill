@@ -258,13 +258,36 @@ section h2 { font-size: 14px; font-weight: 600; letter-spacing: .03em;
     <div class="field-row">
       <div class="field">
         <label>Dose Amount *</label>
-        <input id="f-dose" type="text" placeholder="500">
+        <input id="f-dose" type="text" placeholder="500" oninput="calcUnits()">
       </div>
       <div class="field">
         <label>Unit *</label>
-        <input id="f-unit" type="text" placeholder="mg">
+        <input id="f-unit" type="text" placeholder="mg" oninput="calcUnits()">
         <div class="hint">mg, ml, tablet, unit, IU ...</div>
       </div>
+    </div>
+    <div class="field">
+      <label>Syringe</label>
+      <select id="f-syringe" onchange="calcUnits()">
+        <option value="">U-100 (default)</option>
+        <option value="U-50">U-50</option>
+      </select>
+      <div class="hint">For injectables dosed in mcg or mg: reminders show syringe units once a vial mix is logged</div>
+    </div>
+    <div class="section-divider">Syringe Calculator (scratch &mdash; saves nothing)</div>
+    <div class="field-row">
+      <div class="field">
+        <label>Vial (mg)</label>
+        <input id="calc-vial" type="number" min="0" step="any" placeholder="5" oninput="calcUnits()">
+      </div>
+      <div class="field">
+        <label>Water added (mL)</label>
+        <input id="calc-dil" type="number" min="0" step="any" placeholder="2" oninput="calcUnits()">
+      </div>
+    </div>
+    <div class="field">
+      <div id="calc-out" class="hint" style="font-size:13px;color:var(--text);white-space:pre-line">Uses the dose, unit and syringe above.</div>
+      <div class="hint">Computes units for the dose you entered &mdash; it never suggests a dose. To use a mix in reminders, log it in chat ("I mixed 5 mg with 2 mL").</div>
     </div>
     <div class="field inline">
       <input id="f-paused" type="checkbox">
@@ -426,6 +449,8 @@ function validate(s) {
     if (!m.dose?.trim())            e.push(`${p}.dose is required`);
     if (!m.unit?.trim())            e.push(`${p}.unit is required`);
     if (typeof m.paused !== 'boolean') e.push(`${p}.paused must be boolean`);
+    if (m.syringe != null && !(m.syringe in SYRINGE_UNITS_PER_ML))
+      e.push(`${p}.syringe must be U-100 or U-50 (or absent)`);
 
     const sc = m.schedule || {};
     const FREQS = ['once_daily','twice_daily','interval','weekly','as_needed'];
@@ -730,6 +755,7 @@ function openEditMed(id) {
   document.getElementById('f-dose').value  = med.dose;
   document.getElementById('f-unit').value  = med.unit;
   document.getElementById('f-paused').checked = med.paused;
+  document.getElementById('f-syringe').value = med.syringe || '';
 
   const s = med.schedule;
   document.getElementById('f-freq').value  = s.frequency;
@@ -787,7 +813,8 @@ function closeModal() {
 }
 
 function clearMedForm() {
-  ['f-name','f-dose','f-unit','f-notes','f-late-msg','f-miss-msg','f-interval'].forEach(id => {
+  ['f-name','f-dose','f-unit','f-notes','f-late-msg','f-miss-msg','f-interval',
+   'f-syringe','calc-vial','calc-dil'].forEach(id => {
     document.getElementById(id).value = '';
   });
   document.getElementById('f-type').value    = 'pill';
@@ -796,6 +823,7 @@ function clearMedForm() {
   document.getElementById('f-paused').checked = false;
   document.getElementById('f-food').checked   = false;
   document.getElementById('f-times-list').innerHTML = '';
+  document.getElementById('calc-out').textContent = 'Uses the dose, unit and syringe above.';
 }
 
 function onFreqChange() {
@@ -862,6 +890,7 @@ function saveMed() {
   const dose  = document.getElementById('f-dose').value.trim();
   const unit  = document.getElementById('f-unit').value.trim();
   const paused= document.getElementById('f-paused').checked;
+  const syringe = document.getElementById('f-syringe').value;
   const freq  = document.getElementById('f-freq').value;
   const food  = document.getElementById('f-food').checked;
   const notes = document.getElementById('f-notes').value.trim();
@@ -917,6 +946,7 @@ function saveMed() {
     // Update existing
     const med = currentState.meds.find(m => m.id === editingId);
     med.name = name; med.type = type; med.dose = dose; med.unit = unit; med.paused = paused;
+    if (syringe) med.syringe = syringe; else delete med.syringe;
     med.schedule   = schedule;
     med.escalation = { late_threshold_minutes: late, missed_threshold_minutes: miss,
                        late_message: lateMsg, missed_message: missMsg };
@@ -925,6 +955,7 @@ function saveMed() {
     // Add new
     currentState.meds.push({
       id: generateId(), name, type, dose, unit, paused,
+      ...(syringe ? { syringe } : {}),
       schedule,
       escalation: { late_threshold_minutes: late, missed_threshold_minutes: miss,
                     late_message: lateMsg, missed_message: missMsg },
@@ -945,6 +976,58 @@ function deleteMed(id) {
   currentState.meds = currentState.meds.filter(m => m.id !== id);
   renderMeds();
   markUnsaved();
+}
+
+// ── Syringe calculator (PR 8a, #10) — mirrors reconstitution.py ────────────
+// Computes units for the dose the user entered; never suggests a dose.
+const SYRINGE_UNITS_PER_ML = { 'U-100': 100, 'U-50': 50 };
+const MCG_PER = { mcg: 1, ug: 1, 'µg': 1, 'μg': 1, mg: 1000 };
+
+function doseMcg(dose, unit) {
+  const f = MCG_PER[String(unit || '').trim().toLowerCase()];
+  const amt = Number(dose);
+  if (!f || !Number.isFinite(amt) || amt <= 0) return null;
+  return amt * f;
+}
+
+function computeDraw(mcg, vialMg, dilMl, syringe) {
+  const conc = vialMg / dilMl;
+  const volume = mcg / (conc * 1000);
+  const exact = Math.round(volume * SYRINGE_UNITS_PER_ML[syringe] * 1e6) / 1e6;
+  const units = Math.floor(exact + 0.5);
+  const warnings = [];
+  if (units === 0)
+    warnings.push(`This dose is ${exact.toFixed(2)} units — too small to measure on a ${syringe} syringe. Double-check the mix.`);
+  else if (Math.abs(units - exact) / exact > 0.05)
+    warnings.push(`Rounding to ${units} units is ${Math.round(Math.abs(units - exact) / exact * 100)}% off the exact ${exact.toFixed(1)}.`);
+  if (volume > 0.5)
+    warnings.push(`That's ${volume.toFixed(2)} mL per dose — more than half a 1 mL syringe. Double-check the vial mg and diluent mL.`);
+  return { syringe, conc, volume, exact, units, dosesPerVial: vialMg * 1000 / mcg, warnings };
+}
+
+function fmtNum(x, places = 2) {
+  return x.toFixed(places).replace(/\.?0+$/, '');
+}
+
+function calcUnits() {
+  const out = document.getElementById('calc-out');
+  const dose = document.getElementById('f-dose').value.trim();
+  const unit = document.getElementById('f-unit').value.trim();
+  const syringe = document.getElementById('f-syringe').value || 'U-100';
+  const vial = Number(document.getElementById('calc-vial').value);
+  const dil  = Number(document.getElementById('calc-dil').value);
+  const mcg = doseMcg(dose, unit);
+  if (mcg === null) { out.textContent = 'Enter a dose in mcg or mg above.'; return; }
+  if (!(vial > 0) || !(dil > 0)) { out.textContent = 'Enter the vial mg and the water mL.'; return; }
+  const d = computeDraw(mcg, vial, dil, syringe);
+  if (d.dosesPerVial < 1) { out.textContent = `A ${dose}${unit} dose is more than the whole vial — check the vial strength.`; return; }
+  const exactNote = Math.abs(d.units - d.exact) < 0.05 ? '' : ` (exact ${d.exact.toFixed(1)})`;
+  out.textContent = [
+    `${fmtNum(vial)} mg in ${fmtNum(dil)} mL = ${fmtNum(d.conc)} mg/mL`,
+    `${dose}${unit} = ${d.units} ${d.units === 1 ? 'unit' : 'units'}${exactNote} on a ${syringe} (${fmtNum(d.volume, 3)} mL)`,
+    `This vial holds about ${Math.floor(d.dosesPerVial + 1e-9)} doses`,
+    ...d.warnings.map(w => 'Check: ' + w),
+  ].join('\n');
 }
 
 // ── Helpers ────────────────────────────────────────────────────────────────

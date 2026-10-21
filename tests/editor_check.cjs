@@ -7,6 +7,8 @@
  *   passthrough  edit a med → optional fields the form doesn't know survive
  *   multi-day    weekly day list → canonical sorted array written; an empty
  *                day selection is refused before anything changes
+ *   calculator   syringe-unit math matches reconstitution.py; the syringe
+ *                field saves/clears and validates (PR 8a, #10)
  *
  * The script source is eval'd together with the scenario driver so the
  * driver sees the eval scope (let/const declarations stay inside it).
@@ -165,11 +167,47 @@ async function drvMultiDay() {
          'refused save left the schedule untouched');
 }
 
+async function drvCalculator() {
+  let d = computeDraw(250, 5, 2, 'U-100');
+  assert(d.units === 10 && d.warnings.length === 0, 'U-100 worked example: ' + JSON.stringify(d));
+  assert(computeDraw(250, 5, 2, 'U-50').units === 5, 'U-50 is half the units');
+  d = computeDraw(320, 10, 2, 'U-100');
+  assert(d.units === 6 && /off the exact 6\.4/.test(d.warnings[0] || ''), 'rounding warning: ' + d.warnings);
+  assert(computeDraw(250, 10, 3, 'U-100').units === 8, 'half unit rounds up');
+  assert(doseMcg('0.25', 'mg') === 250 && doseMcg('15', 'units') === null, 'dose units');
+
+  await openFile();
+  openEditMed('med-001');
+  el('f-dose').value = '250'; el('f-unit').value = 'mcg';
+  el('calc-vial').value = '5'; el('calc-dil').value = '2';
+  calcUnits();
+  assert(/250mcg = 10 units on a U-100/.test(el('calc-out').textContent),
+         'scratch calculator output: ' + el('calc-out').textContent);
+  el('f-syringe').value = 'U-50';
+  calcUnits();
+  assert(/= 5 units on a U-50/.test(el('calc-out').textContent), 'calculator follows syringe');
+  saveMed();
+  assert(currentState.meds[0].syringe === 'U-50', 'syringe saved');
+  assert(validate(currentState).length === 0, 'state with syringe validates');
+  assert(!('calc_vial' in currentState.meds[0]) && !('vial_mg' in currentState.meds[0]),
+         'calculator persists nothing');
+
+  openEditMed('med-001');
+  assert(el('f-syringe').value === 'U-50', 'syringe loaded into the form');
+  el('f-syringe').value = '';
+  saveMed();
+  assert(!('syringe' in currentState.meds[0]), 'default clears the field');
+
+  currentState.meds[0].syringe = 'U-40';
+  assert(validate(currentState).some(e => /syringe/.test(e)), 'bad syringe flagged');
+}
+
 const DRIVERS = {
   'save-fresh': drvSaveFresh,
   'save-stale': drvSaveStale,
   'passthrough': drvPassthrough,
   'multi-day': drvMultiDay,
+  'calculator': drvCalculator,
 };
 const driver = DRIVERS[scenario];
 if (!driver) { console.error('unknown scenario: ' + scenario); process.exit(2); }
