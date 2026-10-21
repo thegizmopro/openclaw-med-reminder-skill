@@ -178,9 +178,18 @@
           "description": "Hours between doses. Required when frequency is 'interval'. Null otherwise."
         },
         "day_of_week": {
-          "type": ["string", "null"],
-          "enum": ["mon", "tue", "wed", "thu", "fri", "sat", "sun", null],
-          "description": "Dose day for weekly meds, e.g. 'mon'. Required when frequency is 'weekly' — without it reminders fire daily. Null otherwise."
+          "description": "Dose day(s) for weekly meds: a single day ('mon', legacy) or a list for multi-day protocols (['tue','sat'], ['mon','tue','wed','thu','fri']). Lists are stored sorted mon..sun and deduped; single strings stay strings for compat reads. Required when frequency is 'weekly' — without it reminders fire daily. Null otherwise.",
+          "oneOf": [
+            { "type": "string", "enum": ["mon", "tue", "wed", "thu", "fri", "sat", "sun"] },
+            {
+              "type": "array",
+              "items": { "type": "string", "enum": ["mon", "tue", "wed", "thu", "fri", "sat", "sun"] },
+              "minItems": 1,
+              "maxItems": 7,
+              "uniqueItems": true
+            },
+            { "type": "null" }
+          ]
         },
         "with_food": {
           "type": "boolean",

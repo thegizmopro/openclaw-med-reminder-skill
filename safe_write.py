@@ -177,7 +177,9 @@ _VALID_FREQS    = {"once_daily","twice_daily","interval","weekly","as_needed"}
 # `deferred` stays readable forever; new code never writes it (issue #1 §1)
 _VALID_STATUSES = {"pending","reminded","confirmed","late","missed","deferred"}
 _VALID_EVENTS   = {"taken","missed","late_nudge_sent","deferred"}
-_VALID_DAYS     = {"mon","tue","wed","thu","fri","sat","sun"}
+# Canonical day order for list-valued day_of_week (PR 7): sorted mon..sun
+_DAY_ORDER      = ("mon","tue","wed","thu","fri","sat","sun")
+_VALID_DAYS     = set(_DAY_ORDER)
 _MED_ID         = re.compile(r"^med-[0-9]{3,}$")
 
 
@@ -295,13 +297,34 @@ def validate(state: dict) -> None:
                 if not _HHMM.match(str(t)):
                     _die(f"{p}.schedule.times contains invalid time '{t}' (expected HH:MM)")
 
-        # Optional: day-of-week for weekly meds (absent in older state files)
+        # Day-of-week for weekly meds (absent in older state files): a single
+        # day string (legacy) or a canonical list — sorted mon..sun, deduped (PR 7)
         day = sched.get("day_of_week")
-        if day is not None and day not in _VALID_DAYS:
-            _die(f"{p}.schedule.day_of_week must be one of {sorted(_VALID_DAYS)} (or null)")
-        if freq == "weekly" and day is None:
-            _die(f"{p}.schedule.day_of_week is required for weekly meds "
-                 "(e.g. 'mon') — without it reminders fire daily")
+        if day is None:
+            if freq == "weekly":
+                _die(f"{p}.schedule.day_of_week is required for weekly meds "
+                     "(e.g. 'mon' or ['mon','fri']) — without it reminders fire daily")
+        elif isinstance(day, str):
+            if day not in _VALID_DAYS:
+                _die(f"{p}.schedule.day_of_week must be one of {sorted(_VALID_DAYS)} "
+                     "(or a list of them, or null)")
+        elif isinstance(day, list):
+            if not day:
+                _die(f"{p}.schedule.day_of_week can't be an empty list — name at "
+                     "least one day (e.g. ['tue','sat']) or use null")
+            bad = [d for d in day if d not in _VALID_DAYS]
+            if bad:
+                _die(f"{p}.schedule.day_of_week has unknown day(s) {bad} — valid "
+                     f"days are {_DAY_ORDER}")
+            if len(set(day)) != len(day):
+                _die(f"{p}.schedule.day_of_week has duplicate day(s) {day} — list "
+                     "each day once (they are deduped on save)")
+            if [d for d in _DAY_ORDER if d in set(day)] != day:
+                _die(f"{p}.schedule.day_of_week must be sorted mon..sun and deduped "
+                     f"(got {day}, e.g. ['mon','fri'])")
+        else:
+            _die(f"{p}.schedule.day_of_week must be a day string, a list of days, "
+                 "or null")
 
         esc = med["escalation"]
         for field in ("late_threshold_minutes","missed_threshold_minutes","late_message","missed_message"):

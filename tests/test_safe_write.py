@@ -179,3 +179,57 @@ def test_late_threshold_gte_missed_rejected():
     state["meds"][0]["escalation"]["missed_threshold_minutes"] = 30
     with pytest.raises(ValueError, match="less than missed"):
         sw.validate(state)
+
+
+# ── day_of_week: single string or canonical list (PR 7) ─────────────────────
+
+def _weekly_state(day):
+    state = _state(1)
+    state["meds"][0]["schedule"] = {
+        "frequency": "weekly", "times": ["09:00"], "interval_hours": None,
+        "day_of_week": day, "with_food": False, "notes": ""}
+    return state
+
+
+def test_day_of_week_canonical_list_accepted():
+    sw.validate(_weekly_state(["tue", "sat"]))
+    sw.validate(_weekly_state(["mon", "tue", "wed", "thu", "fri"]))
+
+
+def test_day_of_week_single_string_still_accepted():
+    sw.validate(_weekly_state("mon"))
+
+
+def test_day_of_week_empty_list_rejected():
+    with pytest.raises(ValueError, match="empty list"):
+        sw.validate(_weekly_state([]))
+
+
+def test_day_of_week_unknown_day_in_list_rejected():
+    with pytest.raises(ValueError, match="unknown day"):
+        sw.validate(_weekly_state(["tue", "funday"]))
+
+
+def test_day_of_week_unknown_string_rejected():
+    with pytest.raises(ValueError, match="must be one of"):
+        sw.validate(_weekly_state("funday"))
+
+
+def test_day_of_week_duplicates_rejected():
+    with pytest.raises(ValueError, match="duplicate day"):
+        sw.validate(_weekly_state(["tue", "sat", "tue"]))
+
+
+def test_day_of_week_unsorted_rejected():
+    with pytest.raises(ValueError, match="sorted mon..sun"):
+        sw.validate(_weekly_state(["sat", "tue"]))
+
+
+def test_day_of_week_non_string_non_list_rejected():
+    with pytest.raises(ValueError, match="day string, a list of days"):
+        sw.validate(_weekly_state(3))
+
+
+def test_weekly_without_day_of_week_still_rejected():
+    with pytest.raises(ValueError, match="required for weekly"):
+        sw.validate(_weekly_state(None))
