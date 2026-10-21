@@ -980,7 +980,7 @@ def digest_text(state: dict, ev, tz, now) -> str:
             time_str = "as needed"
         else:
             day = sched.get("day_of_week") if freq == "weekly" else None
-            prefix = f"{day.title()} " if day else ""
+            prefix = f"{dispatch.fmt_days(day)} " if day else ""
             time_str = prefix + ", ".join(dispatch.fmt_12h(t) for t in sched["times"])
         food = " (with food)" if sched.get("with_food") else ""
         lines.append(f"{i}. {med['name']} {med['dose']}{med['unit']} | {time_str}{food}")

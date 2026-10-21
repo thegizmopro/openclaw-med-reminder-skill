@@ -157,7 +157,8 @@ def nearest_dose_occurrence(med: dict, hhmm: str, taken_at: datetime,
     """
     --dose HH:MM: pin the occurrence. HH:MM must match a scheduled
     times[] entry exactly; the nearest instance of that wall time to
-    taken_at is credited (weekly meds: nearest instance on day_of_week).
+    taken_at is credited (weekly meds: nearest instance on any listed
+    day_of_week — single day or list, PR 7).
     """
     sched = med["schedule"]
     if hhmm not in (sched.get("times") or []):
@@ -167,12 +168,13 @@ def nearest_dose_occurrence(med: dict, hhmm: str, taken_at: datetime,
     index = sched["times"].index(hhmm)
     asof = taken_at.astimezone(UTC)
     local_day = asof.astimezone(tz).date()
+    weekly_days = _occ.day_indexes(sched.get("day_of_week")) \
+        if sched.get("frequency") == "weekly" else ()
     best = None
     for offset in range(-8, 9):   # ±8 days covers weekly meds
         day = local_day + timedelta(days=offset)
-        if sched.get("frequency") == "weekly" and sched.get("day_of_week"):
-            if day.weekday() != _occ.DAY_KEYS.index(sched["day_of_week"]):
-                continue
+        if weekly_days and day.weekday() not in weekly_days:
+            continue
         cand = _occ.at_local(day, hhmm, tz, index)
         if best is None or abs((cand.utc - asof).total_seconds()) < \
                 abs((best.utc - asof).total_seconds()):

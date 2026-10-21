@@ -909,6 +909,43 @@ def _next_med_id(state: dict) -> str:
 _SCHEDULE_KEYS = ("frequency", "times", "interval_hours", "day_of_week")
 
 
+def _normalize_day_of_week(sched: dict) -> None:
+    """
+    Canonicalize an incoming schedule.day_of_week in place (PR 7): a list is
+    deduped and sorted mon..sun — the stored canonical form — while a single
+    string stays a string (compat reads). Unknown days, an empty list, or a
+    non-string/non-list value get a friendly error here so the writer never
+    reaches the validator with a half-useful message.
+    """
+    day = sched.get("day_of_week")
+    if day is None or isinstance(day, str):
+        return
+    if not isinstance(day, list):
+        print("Error: schedule.day_of_week must be a day like 'tue', a list like "
+              "['tue','sat'], or null.")
+        raise SystemExit(EXIT_BAD_OPTION)
+    if not day:
+        print("Error: schedule.day_of_week can't be an empty list — name at least "
+              "one day (e.g. ['tue','sat']) or use null.")
+        raise SystemExit(EXIT_BAD_OPTION)
+    bad = [d for d in day if d not in _dispatch_mod.DAY_KEYS]
+    if bad:
+        print(f"Error: unknown day(s) {bad} in schedule.day_of_week — valid days: "
+              f"{', '.join(_dispatch_mod.DAY_KEYS)}.")
+        raise SystemExit(EXIT_BAD_OPTION)
+    sched["day_of_week"] = sorted(set(day), key=_dispatch_mod.DAY_KEYS.index)
+
+
+def _same_days(a, b) -> bool:
+    """True when two day_of_week values mean the same schedule ('tue' == ['tue'])
+    — swapping representations must not re-anchor tracking."""
+    if isinstance(a, str):
+        a = [a]
+    if isinstance(b, str):
+        b = [b]
+    return set(a or []) == set(b or [])
+
+
 def handle_add_med(json_text: str, dry_run: bool,
                    clock: Optional[Clock] = None) -> None:
     """
@@ -919,6 +956,8 @@ def handle_add_med(json_text: str, dry_run: bool,
     clock = clock or get_clock()
     now = clock.now_utc()
     med = _parse_med_json(json_text)
+    if isinstance(med.get("schedule"), dict):
+        _normalize_day_of_week(med["schedule"])
     state = load_state()
 
     med.setdefault("state", {"status": "pending", "last_taken": None,
@@ -976,6 +1015,8 @@ def handle_edit_med(med_id: str, json_text: str, dry_run: bool,
     now = clock.now_utc()
     med = _resolve_target(state, med_id, position, tz, now)
     incoming = _parse_med_json(json_text)
+    if isinstance(incoming.get("schedule"), dict):
+        _normalize_day_of_week(incoming["schedule"])
 
     if incoming.get("id") not in (None, med["id"]):
         print(f"Error: edit-med targets {med['id']} but the JSON describes "
@@ -991,8 +1032,14 @@ def handle_edit_med(med_id: str, json_text: str, dry_run: bool,
     _validated_candidate(
         state, [merged if m["id"] == med["id"] else m for m in state["meds"]])
 
-    schedule_changed = any(
-        (med["schedule"].get(k) != merged["schedule"].get(k)) for k in _SCHEDULE_KEYS)
+    def _sched_field_changed(key: str) -> bool:
+        old, new = med["schedule"].get(key), merged["schedule"].get(key)
+        # day_of_week compares semantically — 'tue' == ['tue'] (PR 7)
+        if key == "day_of_week":
+            return not _same_days(old, new)
+        return old != new
+
+    schedule_changed = any(_sched_field_changed(k) for k in _SCHEDULE_KEYS)
 
     if dry_run:
         print(f"[DRY RUN] Would update {merged.get('name')} ({med['id']}).")
@@ -1103,7 +1150,7 @@ def handle_status() -> None:
         elif freq == "as_needed":
             when = "as needed"
         else:
-            day = (f"{sched['day_of_week'].title()} "
+            day = (f"{_dispatch_mod.fmt_days(sched.get('day_of_week'))} "
                    if freq == "weekly" and sched.get("day_of_week") else "")
             when = day + ", ".join(_dispatch_mod.fmt_12h(t) for t in sched["times"])
         line = f"{i}. {med['name']} {med['dose']}{med['unit']} — {when}"
