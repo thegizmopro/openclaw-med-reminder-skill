@@ -430,11 +430,13 @@ Never write state based on an ambiguous match. Always confirm with the user firs
 | `took met: 250mg`, `metformin 250` | Confirm one, different dose | `reply.py confirm <id> --dose-taken 250mg` |
 | `took it at 8`, `met at 8am`, `took met this morning` | Confirm with a time | `reply.py confirm <id> --taken-at 08:00` |
 | `snooze met`, `later`, `not yet met`, `remind me in 30` | Snooze | `reply.py snooze <id> [--minutes N]` |
+| `pause met 90`, `pause met for 2 hours` | Snooze this dose N min | `reply.py snooze <id> --minutes N` |
+| `pause met` (no number) | Snooze this dose 2h | `reply.py snooze <id> --minutes 120` |
 | `skip metformin`, `skip 2` | Skip a dose | `reply.py skip <id>` |
 | `undo`, `undo met`, `I didn't take it after all` | Undo last taken/skipped | `reply.py undo <id>` |
 | `status`, `what's due`, `my meds` | Info only | `reply.py status` — relay output, no write |
-| `pause metformin` | Pause one med | `reply.py pause <id>` (confirm with the user first) |
-| `unpause metformin` | Unpause one med | `reply.py unpause <id>` |
+| `stop taking metformin`, `put met on hold` | Pause one med | `reply.py pause <id>` (confirm with the user first) |
+| `resume metformin`, `restart met` | Unpause one med | `reply.py unpause <id>` |
 | `add a med`, `new med` | Start interview | Section 2 flow, written via `reply.py add-med --json -` |
 | `change met to 9pm`, `met is now 1000mg` | Edit a med | `reply.py edit-med <id> --json -` |
 | `quiet hours 11 to 8` | Change quiet hours | `reply.py set-quiet-hours 23:00 08:00` |
@@ -446,6 +448,12 @@ order; a stale yesterday's order is refused and the resolved name is echoed).
 ---
 
 ### Pause / unpause
+
+"Pause" in a reply to a reminder always means pause **that reminder** — it
+is a snooze (see the intent map), never this command. If the snooze is
+refused because it would run into the next dose, relay that and offer a
+shorter pause or a skip. `reply.py pause` is the med start/stop flow, reached
+only through phrasing like "stop taking X" or "put X on hold".
 
 Confirm the action with the user first: *"Pause Metformin — correct? It won't
 receive reminders until you unpause it."* Then:
