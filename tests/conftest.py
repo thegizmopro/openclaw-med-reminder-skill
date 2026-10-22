@@ -127,6 +127,8 @@ def make_tick_env(tmp_path, monkeypatch):
         f'"{sys.executable}" "{Path(__file__).parent / "fake_sender.py"}"')
     monkeypatch.setenv("FAKE_SEND_OUT", str(out))
     monkeypatch.setenv("FAKE_SEND_FAIL", str(fail_flag))
+    fail_match = tmp_path / "sender-fail-match"
+    monkeypatch.setenv("FAKE_SEND_FAIL_MATCH", str(fail_match))
     monkeypatch.setenv("FAKE_SEND_SLEEP", str(sleep_flag))
 
     class Env:
@@ -174,6 +176,10 @@ def make_tick_env(tmp_path, monkeypatch):
 
         def heal_sends(self):
             fail_flag.unlink(missing_ok=True)
+            fail_match.unlink(missing_ok=True)
+
+        def fail_sends_containing(self, needle):
+            fail_match.write_text(needle, encoding="utf-8")
 
         def sleep_sends(self, seconds):
             sleep_flag.write_text(str(seconds), encoding="utf-8")

@@ -44,6 +44,7 @@ VALID_EVENTS = frozenset({
 
 VALID_STAGES = frozenset({
     "reminder", "snooze_reminder", "nudge", "catchup", "overnight", "digest",
+    "delivery",   # #21: a note naming one message that keeps failing
 })
 # Repeat nudges (#11) are "nudge-<minutes after the dose was due>"
 _REPEAT_NUDGE = re.compile(r"^nudge-[0-9]+$")

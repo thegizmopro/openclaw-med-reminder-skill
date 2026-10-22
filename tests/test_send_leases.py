@@ -2,7 +2,7 @@
 Send lease tests (issue #1 §3.6, AC 23-25): at-least-once delivery with
 a 5-minute lease, retries after unknown outcomes prefixed "(repeat …)",
 backoff on known failures until the missed deadline, the SENDER_DOWN
-marker, and the outage note on the first successful send.
+marker, and plain (never prefixed) messages once sends recover (#21).
 """
 import json
 import os
@@ -223,9 +223,9 @@ def test_tick_lock_prevents_overlap(env):
     assert env.sent_count("Reminder") == 1
 
 
-# ── AC 25: outage window → SENDER_DOWN marker + note on recovery ──────────────
+# ── AC 25: outage window → SENDER_DOWN marker, cleared on recovery ────────────
 
-def test_ac25_sender_down_marker_and_outage_note(env):
+def test_ac25_sender_down_marker_cleared_on_recovery(env):
     env.write(meds=[once_daily()])
     env.run(local_dt(7, 55))
     env.fail_sends()
@@ -247,9 +247,9 @@ def test_ac25_sender_down_marker_and_outage_note(env):
     env.run(local_dt(9, 25))                # first success after the outage
     msgs = env.sent()
     assert len(msgs) == 1                   # nudge supersedes the reminder retry
-    assert msgs[0].startswith("Delivery was down from 8:05am to 9:25am")
-    assert "you may have missed" in msgs[0]
-    assert "Late: Metformin" in msgs[0]     # the highest due stage's message
+    # #21: never prefixed with an outage note — the highest due stage's
+    # message goes out as itself
+    assert msgs[0].startswith("Late: Metformin")
     assert not marker.exists()              # marker cleared on success
 
 
