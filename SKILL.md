@@ -131,8 +131,16 @@ Ask each interval med's owner once:
 
 - "remind anyway" / "yes, always" → `schedule.quiet_policy: "ignore"`
 - "hold" / "wait until morning" / "not at night" → `schedule.quiet_policy: "shift"`
-- If the user doesn't care: set `"ignore"` silently (the default — omit the
-  field and the schema treats it as `ignore`).
+- If the user doesn't care: omit the field — the default is `"shift"` (#11).
+
+How `shift` behaves: a dose due inside quiet hours is announced at quiet-hours
+end instead, and nudges count from then. The dose keeps its place in the
+interval chain (the next dose is still `interval_hours` after the original
+time, and confirming re-anchors the chain on when it was taken). When several
+doses fall in one quiet window, each is closed as missed when the next one
+arrives — they show in the overnight summary — and only the latest is
+announced at quiet end. Strict-interval meds (e.g. antibiotics every 6h) should
+use `"ignore"`, which reminds on time through quiet hours.
 
 Do not ask this for scheduled-time meds (`once_daily`, `twice_daily`, `weekly`)
 or `as_needed` — the field is interval-only.

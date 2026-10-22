@@ -207,7 +207,7 @@
         "quiet_policy": {
           "type": "string",
           "enum": ["ignore", "shift"],
-          "description": "Interval meds only: 'ignore' fires through quiet hours (default), 'shift' waits for quiet hours to end. Asked at interview (issue #1 §8)."
+          "description": "Interval meds only: 'shift' (default when omitted) holds a dose that lands in quiet hours until quiet hours end — the dose keeps its slot in the interval chain, and if the next dose arrives first the held one closes as missed and only the latest is announced; 'ignore' fires on time through quiet hours (strict intervals). Asked at interview (issue #1 §8, #11)."
         }
       },
       "allOf": [

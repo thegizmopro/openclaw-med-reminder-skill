@@ -50,6 +50,9 @@ def test_simulated_day_of_5_minute_ticks(env):
     m2 = make_med(med_id="med-002", name="Theophylline",
                   frequency="interval", interval_hours=6)
     m2["state"]["next_due"] = utc(local_dt(6, 0)).isoformat()
+    # 06:00 is inside quiet hours: 'ignore' keeps it reminded on time
+    # (the 'shift' default is covered in test_quiet_policy.py)
+    m2["schedule"]["quiet_policy"] = "ignore"
     env.write(meds=[m1, m2], digest_time="07:30")
 
     # interval occurrences keyed by UTC instant: 06:00, 12:00, 18:00 local
