@@ -15,7 +15,8 @@ One entry point, run every N minutes (default 5). Each tick:
      stage acts, so a finished course produces no reminders, nudges,
      misses or catch-up lines — catch-up and watermark advance included.
   4. Per occurrence only the highest due stage acts: reminder (quiet-
-     hours exempt — the user chose the time), snooze_reminder, nudge
+     hours exempt — the user chose the time; an interval dose under
+     quiet_policy 'shift', the default, waits for quiet end), snooze_reminder, nudge
      (repeats every late_threshold_minutes from T or the snooze wake;
      muted in quiet hours except the first 30 min), missed (logged
      silently when the med's next dose arrives, at most CLOSE_CAP after
@@ -516,8 +517,9 @@ def _interval_occurrences(plan: Plan, state: dict, med: dict, lo, tz, quiet):
     """
     Interval occurrences from the anchor (state.next_due), keyed by UTC
     instant. A null anchor initializes from active_since, or from the
-    next quiet-hours end when that lands inside quiet hours (issue §3.3).
-    The anchor never moves on the tick — it re-anchors on confirm.
+    next quiet-hours end when that lands inside quiet hours and the med's
+    quiet_policy is 'shift' (issue §3.3). The anchor never moves on the
+    tick — it re-anchors on confirm.
     """
     sched = med["schedule"]
     step = timedelta(hours=float(sched["interval_hours"]))
@@ -539,7 +541,7 @@ def _interval_occurrences(plan: Plan, state: dict, med: dict, lo, tz, quiet):
         start_bound = _start_bound_utc(med, tz)
         if start_bound is not None and start_bound > anchor:
             anchor = start_bound
-        if in_quiet(anchor, quiet, tz):
+        if quiet_policy(med) == "shift" and in_quiet(anchor, quiet, tz):
             anchor = next_quiet_end(anchor, quiet, tz)
         mstate["next_due"] = anchor.isoformat()
         plan.state_dirty = True
@@ -558,6 +560,27 @@ def _interval_occurrences(plan: Plan, state: dict, med: dict, lo, tz, quiet):
             for k in range(k0, k1 + 1)]
 
 
+def quiet_policy(med: dict) -> str:
+    """An interval med's schedule.quiet_policy; 'shift' when unset (#11)."""
+    return (med.get("schedule") or {}).get("quiet_policy") or "shift"
+
+
+def fire_instant(med: dict, T, quiet: dict, tz: ZoneInfo):
+    """
+    When a dose due at T is first announced. An interval dose landing in
+    quiet hours under quiet_policy 'shift' waits for quiet-hours end; any
+    other dose fires at T. Only the announcement moves: the occurrence
+    key, its close instant (the next dose in the chain) and the next_due
+    anchor all stay on T. A held dose whose next dose arrives before quiet
+    ends is closed as missed silently (overnight summary) and only the
+    latest held dose is announced at quiet end.
+    """
+    if (med["schedule"].get("frequency") == "interval"
+            and quiet_policy(med) == "shift" and in_quiet(T, quiet, tz)):
+        return next_quiet_end(T, quiet, tz)
+    return T
+
+
 def _process_occurrence(plan: Plan, state: dict, med: dict, occ: Occurrence,
                         ev, idx, tz, quiet, tick_minutes):
     med_id = med["id"]
@@ -568,7 +591,8 @@ def _process_occurrence(plan: Plan, state: dict, med: dict, occ: Occurrence,
         return
 
     # late_threshold_minutes is the nudge cadence (#11): nudges repeat every
-    # `interval` from the anchor (T, or the snooze wake) until the dose is
+    # `interval` from the anchor (T — or quiet end for a shifted interval
+    # dose — or the snooze wake) until the dose is
     # taken, skipped, snoozed again, or closed as missed when the next dose
     # arrives. missed_threshold_minutes is retired — no longer read.
     interval = timedelta(minutes=med["escalation"]["late_threshold_minutes"])
@@ -576,7 +600,8 @@ def _process_occurrence(plan: Plan, state: dict, med: dict, occ: Occurrence,
     now = plan.now
     T = occ.utc
 
-    anchor = snoozed_until or T
+    due = fire_instant(med, T, quiet, tz)
+    anchor = snoozed_until or due
     missed_due = occurrence.close_instant(med["schedule"], T, tz)
 
     if now >= missed_due:
@@ -621,7 +646,7 @@ def _process_occurrence(plan: Plan, state: dict, med: dict, occ: Occurrence,
                                 draw=reconstitution.med_draw(med, ev, now)))
         return
 
-    if now >= T:
+    if now >= due:
         warning = _double_dose_guard(ev, med, T, tz)
         plan_send(plan, idx, med, occ, gen, "reminder",
                   reminder_text(med, tz, warning,
