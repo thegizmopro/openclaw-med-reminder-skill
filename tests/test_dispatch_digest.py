@@ -113,6 +113,39 @@ def test_digest_adherence_from_history_store(env):
     assert "Last 7 days: 4/5 doses taken" in msg
 
 
+def test_digest_adherence_ignores_undone_doses(env):
+    # yesterday: taken then undone, then logged missed (generation 1);
+    # 2 days ago: skipped then undone, then taken — the undone events must
+    # not count, so 1 taken of 2
+    med = make_med(med_id="med-001", frequency="once_daily", times=["08:00"])
+    env.write(meds=[med], digest_time="07:30")
+    d1 = dtmod.timedelta(days=1)
+    d2 = dtmod.timedelta(days=2)
+    occ1 = at_local(TUE - d1, "08:00", TZ, 0)
+    occ2 = at_local(TUE - d2, "08:00", TZ, 0)
+    taken1 = event_store.new_event("med-001", "taken", local_dt(8, 10) - d1,
+                                   occurrence=occ1, generation=0)
+    skipped2 = event_store.new_event("med-001", "skipped", local_dt(8, 10) - d2,
+                                     occurrence=occ2, generation=0)
+    env.seed([
+        taken1,
+        event_store.new_event("med-001", "undone", local_dt(8, 20) - d1,
+                              occurrence=occ1, generation=0, ref=taken1["id"]),
+        event_store.new_event("med-001", "missed", local_dt(20, 0) - d1,
+                              occurrence=occ1, generation=1),
+        skipped2,
+        event_store.new_event("med-001", "undone", local_dt(8, 20) - d2,
+                              occurrence=occ2, generation=0, ref=skipped2["id"]),
+        event_store.new_event("med-001", "taken", local_dt(9, 0) - d2,
+                              occurrence=occ2, generation=1),
+    ])
+    env.run(local_dt(7, 0))
+    env.run(local_dt(7, 32))
+    msg = digest_msgs(env)[0]
+    assert "Last 7 days: 1/2 doses taken" in msg
+    assert "skipped" not in msg
+
+
 def test_digest_adherence_omitted_without_events(env):
     env.write(meds=[make_med(med_id="med-001", frequency="once_daily",
                              times=["08:00"])],

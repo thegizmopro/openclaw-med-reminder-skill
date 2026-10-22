@@ -1075,8 +1075,10 @@ def digest_text(state: dict, ev, tz, now) -> str:
     since = now - timedelta(days=7)
     counts = {"taken": 0, "missed": 0, "skipped": 0}
     seen = {}
+    # an undone taken/skipped no longer happened — undone{ref} names it
+    undone = {e.get("ref") for e in ev if e.get("event") == "undone"}
     for e in ev:
-        if e.get("event") not in ("taken", "missed", "skipped"):
+        if e.get("event") not in ("taken", "missed", "skipped") or e.get("id") in undone:
             continue
         if parse_instant(e.get("occurrence_utc") or e["ts_utc"]) < since:
             continue
