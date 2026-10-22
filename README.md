@@ -29,10 +29,9 @@ pip install tzdata
 ```bash
 git clone <repo-url>
 cd openclaw-med-reminder-skill
-cp meds-state.template.json meds-state.json
 ```
 
-That's it. No build step, no package manager.
+That's it. No build step, no package manager. On first use the AI creates your state file with `python3 reply.py init` (or copy `meds-state.template.json` to `meds-state.json` and use the editor).
 
 ---
 

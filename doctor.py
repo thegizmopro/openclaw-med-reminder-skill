@@ -80,7 +80,7 @@ def check_runtime() -> None:
 def check_state() -> dict:
     if not STATE_FILE.exists():
         fail(f"state file not found: {STATE_FILE} "
-             "(run: cp meds-state.template.json meds-state.json)")
+             "(run: python3 reply.py init ... or cp meds-state.template.json meds-state.json)")
         return {}
     try:
         state = json.loads(STATE_FILE.read_text(encoding="utf-8"))
