@@ -265,6 +265,19 @@ def validate(state: dict) -> None:
         if med.get("syringe") is not None and med["syringe"] not in _VALID_SYRINGES:
             _die(f"{p}.syringe must be one of {sorted(_VALID_SYRINGES)} or absent")
 
+        # Optional inventory tracking (PR 8b, #10)
+        inv_unit = med.get("inventory_unit")
+        if inv_unit is not None and (not isinstance(inv_unit, str) or not inv_unit.strip()):
+            _die(f"{p}.inventory_unit must be a non-empty string (e.g. 'vial') or absent")
+        dpu = med.get("doses_per_unit")
+        if dpu is not None and (isinstance(dpu, bool) or not isinstance(dpu, (int, float))
+                                or not dpu > 0):
+            _die(f"{p}.doses_per_unit must be a positive number or absent")
+        reorder = med.get("reorder_when_below_days")
+        if reorder is not None and (isinstance(reorder, bool) or not isinstance(reorder, int)
+                                    or reorder < 1):
+            _die(f"{p}.reorder_when_below_days must be a positive integer or absent")
+
         # Optional calendar bounds (PR 6): local dates in global.timezone;
         # end_date is inclusive. Null/absent = unbounded on that side.
         bounds = {}

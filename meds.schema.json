@@ -149,6 +149,21 @@
           "enum": ["U-100", "U-50", null],
           "description": "Optional syringe type for the reconstitution calculator (PR 8a, #10). Absent/null = U-100. U-100: 1 unit = 10 µL; U-50: 1 unit = 20 µL. Only used when the dose is in mcg or mg and a mix has been logged (reply.py reconstitute)."
         },
+        "inventory_unit": {
+          "type": ["string", "null"],
+          "minLength": 1,
+          "description": "Optional inventory tracking (PR 8b, #10): the unit stock is counted in — 'vial', 'tablet', 'pen', 'mL', … On hand is derived from restocked/counted events minus taken doses (reply.py restock); nothing is stored."
+        },
+        "doses_per_unit": {
+          "type": ["number", "null"],
+          "exclusiveMinimum": 0,
+          "description": "Optional: prescribed doses per inventory unit (e.g. 133 doses per vial). Needed only when it can't be derived — the dose unit equals inventory_unit, syringe units with inventory in mL, or a logged vial mix."
+        },
+        "reorder_when_below_days": {
+          "type": ["integer", "null"],
+          "minimum": 1,
+          "description": "Optional: the digest flags 'reorder' when the derived days of supply drop below this (e.g. 30 for a peptide with shipping lead time)."
+        },
         "min_gap_hours": {
           "type": "number",
           "exclusiveMinimum": 0,

@@ -202,12 +202,41 @@ async function drvCalculator() {
   assert(validate(currentState).some(e => /syringe/.test(e)), 'bad syringe flagged');
 }
 
+async function drvSupplies() {
+  await openFile();
+  openEditMed('med-001');
+  el('f-inv-unit').value = 'tablet'; el('f-reorder').value = '14'; el('f-dpu').value = '';
+  saveMed();
+  let med = currentState.meds[0];
+  assert(med.inventory_unit === 'tablet' && med.reorder_when_below_days === 14,
+         'supplies saved: ' + JSON.stringify(med));
+  assert(!('doses_per_unit' in med), 'empty doses-per-unit not written');
+  assert(validate(currentState).length === 0, 'state with supplies validates');
+
+  openEditMed('med-001');
+  assert(el('f-inv-unit').value === 'tablet', 'inventory unit loaded into the form');
+  el('f-reorder').value = '2.5';
+  saveMed();
+  assert(/whole number of days/.test(el('f-form-errors').textContent), 'fractional reorder refused');
+  assert(currentState.meds[0].reorder_when_below_days === 14, 'refused save changed nothing');
+
+  openEditMed('med-001');
+  el('f-inv-unit').value = ''; el('f-reorder').value = '';
+  saveMed();
+  med = currentState.meds[0];
+  assert(!('inventory_unit' in med) && !('reorder_when_below_days' in med), 'clearing removes the fields');
+
+  currentState.meds[0].doses_per_unit = 0;
+  assert(validate(currentState).some(e => /doses_per_unit/.test(e)), 'bad doses_per_unit flagged');
+}
+
 const DRIVERS = {
   'save-fresh': drvSaveFresh,
   'save-stale': drvSaveStale,
   'passthrough': drvPassthrough,
   'multi-day': drvMultiDay,
   'calculator': drvCalculator,
+  'supplies': drvSupplies,
 };
 const driver = DRIVERS[scenario];
 if (!driver) { console.error('unknown scenario: ' + scenario); process.exit(2); }

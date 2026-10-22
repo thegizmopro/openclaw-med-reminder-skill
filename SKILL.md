@@ -429,7 +429,7 @@ Never write state based on an ambiguous match. Always confirm with the user firs
 |-----------|--------|---------|
 | `yes`, `done`, `all taken`, `took them all` | Confirm all | `reply.py confirm --all` |
 | `took metformin`, `done met`, `met done` | Confirm one | `reply.py confirm <id>` |
-| `took met: 250mg`, `metformin 250` | Confirm one, different dose | `reply.py confirm <id> --dose-taken 250mg` |
+| `took met: 250mg`, `metformin 250`, `took 10 units of T` | Confirm one, different dose | `reply.py confirm <id> --dose-taken 250mg` (always a number + unit: `10units`, `0.5mg`, `1tablet`) |
 | `took it at 8`, `met at 8am`, `took met this morning` | Confirm with a time | `reply.py confirm <id> --taken-at 08:00` |
 | `snooze met`, `later`, `not yet met`, `remind me in 30` | Snooze | `reply.py snooze <id> [--minutes N]` |
 | `pause met 90`, `pause met for 2 hours` | Snooze this dose N min | `reply.py snooze <id> --minutes N` |
@@ -441,6 +441,9 @@ Never write state based on an ambiguous match. Always confirm with the user firs
 | `resume metformin`, `restart met` | Unpause one med | `reply.py unpause <id>` |
 | `I mixed wolverine: 10 mg with 2 mL`, `new vial of met, 5mg in 2ml` | Log a vial mix | `reply.py reconstitute <id> --vial-mg 10 --diluent-ml 2` |
 | `I use U-50 syringes for wolverine` | Set syringe type | `reply.py edit-med <id> --json -` with `{"syringe": "U-50"}` |
+| `track my wolverine vials`, `tell me when to reorder T` | Start supply tracking | `reply.py edit-med <id> --json -` with `{"inventory_unit": "vial", "reorder_when_below_days": 14}`, then `restock` |
+| `got 3 more vials of wolverine`, `picked up 60 met` | Add stock | `reply.py restock <id> --qty 3` |
+| `I have 2 vials left`, `only 10 met tablets left` | Recount | `reply.py restock <id> --set 2` |
 | `add a med`, `new med` | Start interview | Section 2 flow, written via `reply.py add-med --json -` |
 | `change met to 9pm`, `met is now 1000mg` | Edit a med | `reply.py edit-med <id> --json -` |
 | `quiet hours 11 to 8` | Change quiet hours | `reply.py set-quiet-hours 23:00 08:00` |
@@ -470,6 +473,28 @@ python3 reply.py unpause med-001
 Unpause restarts tracking from now — doses during the pause aren't counted as
 missed. No `setup-tasks.py` re-run is needed: one tick task covers all meds,
 paused or not.
+
+### Supplies (inventory and refills)
+
+Optional per med. `inventory_unit` names what stock is counted in (`vial`,
+`tablet`, `pen`, `mL`, …); `reorder_when_below_days` makes the digest flag
+"reorder" when the days of supply drop below it. Nothing is stored as a
+counter — on hand is derived from `restock` events minus taken doses, so an
+undo puts the dose back, skipped and missed doses use nothing, and a partial
+dose (`--dose-taken 10units`) uses its share.
+
+What one dose uses is worked out when it can be: the dose unit equals the
+inventory unit (2 tablet from tablets), syringe units with stock in mL, or a
+logged vial mix with stock in vials. Otherwise set `doses_per_unit` via
+`edit-med` (e.g. `{"doses_per_unit": 30}`) — the status line asks for it.
+
+```bash
+python3 reply.py restock med-002 --qty 3     # 3 vials arrived
+python3 reply.py restock med-002 --set 1.5   # a recount: 1.5 vials on hand
+```
+
+Relay the printed line ("Now ~2.4 vials left (~48 days)."). `status` and the
+morning digest show the same line per tracked med.
 
 ### Reconstitution (syringe units)
 

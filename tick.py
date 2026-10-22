@@ -62,6 +62,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 import attribution
 import dispatch
 import event_store
+import inventory
 import occurrence
 import reconstitution
 import safe_write as sw
@@ -1062,6 +1063,14 @@ def digest_text(state: dict, ev, tz, now) -> str:
     if done:
         lines.append("")
         lines.extend(done)
+
+    # derived stock and refill flags (PR 8b, #10)
+    stock = [(m, inventory.status_line(m, ev, now)) for m in active]
+    stock = [f"{m['name']}: {line}" for m, line in stock if line]
+    if stock:
+        lines.append("")
+        lines.append("Supplies:")
+        lines.extend(stock)
 
     since = now - timedelta(days=7)
     counts = {"taken": 0, "missed": 0, "skipped": 0}
