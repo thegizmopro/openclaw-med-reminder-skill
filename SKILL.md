@@ -355,9 +355,8 @@ Follow the protocol below exactly for every reply that mutates state.
 Every state change is a single `reply.py` invocation. The command itself reads
 fresh state under a lock, validates, writes atomically, and appends history.
 The agent never reads-then-writes `meds-state.json`, never composes full-state
-JSON, never calls `dispatch.py` (scheduler-era; its old confirm/defer writers
-are gone), and never calls `safe-write.sh` (a deprecated shim around
-`safe_write.py`).
+JSON, and never calls `dispatch.py` (scheduler-era; its old confirm/defer
+writers are gone).
 
 **Step 1 — Resolve the med name**
 Map the user's words to a med ID or digest position using the fuzzy match rules
