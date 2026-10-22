@@ -134,7 +134,7 @@ Every scheduled run is one `dispatch.py tick`:
 4. **Send at-least-once** under a lease with a 60s timeout. A crash between send and record produces exactly one repeat, prefixed `(repeat — ignore if you already got this)`. A sender outage is tracked and announced on the first successful send afterwards.
 5. **Persist** every decision (`reminded`, `taken`, `missed`, …) to the append-only `history.jsonl` under an OS file lock. History is the source of truth; the state file is a cache. A crash at any point heals on the next tick.
 
-Quiet hours mute escalations only — dose-time reminders always send (you chose the time), nudges may still land in the first 30 minutes of the quiet window, and anything silently missed during the night is summarized right after quiet hours end.
+Quiet hours mute escalations only — dose-time reminders always send (you chose the time), nudges may still land in the first 30 minutes of the quiet window, and any dose logged missed during the night is summarized right after quiet hours end.
 
 A single tick instance runs at a time (non-blocking instance lock); a per-med failure is isolated so one broken schedule can't stop the others (one alert per day, and `doctor.py` explains).
 
@@ -185,8 +185,8 @@ For each scheduled dose:
 | Time | What happens |
 |------|-------------|
 | Dose time | Initial reminder sent (quiet-hours exempt) |
-| Dose time + late threshold (default: 30min) | Late nudge sent if not confirmed (muted in quiet hours past the first 30 min) |
-| Dose time + missed threshold (default: 90min) | Logged as missed if still unconfirmed (message muted in quiet hours; folded into the post-quiet-hours summary) |
+| Every nudge interval after the dose (default: 30min) | Nudge sent until you take it, skip it, or pause it ("pause metformin 90") — muted in quiet hours past the first 30 min, resumes after |
+| The med's next dose is due (at most 25h later) | Logged as missed, silently — the digest shows it; misses that close overnight are in the post-quiet-hours summary |
 
 Thresholds are configurable per medication. Doses and nudge times that would be muted by quiet hours are refused at add/edit time with a suggested fix.
 

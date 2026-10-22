@@ -75,13 +75,25 @@ def test_snooze_writes_snoozed_event_with_wake_instant(state_file):
     assert parse_instant(evs[0]["ref"]) == utc(local_dt(8, 35))
 
 
-def test_snooze_defaults_to_30_minutes(state_file):
+def test_snooze_defaults_to_120_minutes(state_file):
+    # #11: the default pause is 2h (a 30-min default collided with the nudge)
     med = make_med(med_id="med-001", frequency="once_daily", times=["08:00"])
     write_state(state_file, meds=[med])
 
     handle_snooze("med-001", None, dry_run=False, clock=FakeClock(local_dt(8, 5)))
 
-    assert parse_instant(events(state_file)[0]["ref"]) == utc(local_dt(8, 35))
+    assert parse_instant(events(state_file)[0]["ref"]) == utc(local_dt(10, 5))
+
+
+def test_snooze_default_shrinks_to_fit_before_the_next_dose(state_file):
+    # 08:00/09:00 at 08:05: the dose closes at 09:00 → the default 120
+    # shrinks to 54 minutes (wake at 08:59, before the close)
+    med = make_med(med_id="med-001", frequency="twice_daily", times=["08:00", "09:00"])
+    write_state(state_file, meds=[med])
+
+    handle_snooze("med-001", None, dry_run=False, clock=FakeClock(local_dt(8, 5)))
+
+    assert parse_instant(events(state_file)[0]["ref"]) == utc(local_dt(8, 59))
 
 
 @pytest.mark.parametrize("minutes", [4, 241])
@@ -96,20 +108,21 @@ def test_snooze_out_of_range_rejected(state_file, minutes):
 
 
 def test_snooze_cap_refusal_and_boundary(state_file, capsys):
-    # 08:00/11:00 → gap 3h → cap 90 minutes
+    # 08:00/11:00 at 08:05 → the dose closes at 11:00 → cap 174 minutes
+    # (the wake must land before the close, #11)
     med = make_med(med_id="med-001", frequency="twice_daily", times=["08:00", "11:00"])
     write_state(state_file, meds=[med])
 
     with pytest.raises(SystemExit) as e:
-        handle_snooze("med-001", 120, dry_run=False, clock=FakeClock(local_dt(8, 5)))
+        handle_snooze("med-001", 175, dry_run=False, clock=FakeClock(local_dt(8, 5)))
     assert e.value.code != 0
     out = capsys.readouterr().out
     assert "run into your next dose" in out and "skip instead?" in out
     assert events(state_file) == []
 
     # exactly at the cap is allowed
-    handle_snooze("med-001", 90, dry_run=False, clock=FakeClock(local_dt(8, 5)))
-    assert parse_instant(events(state_file)[0]["ref"]) == utc(local_dt(9, 35))
+    handle_snooze("med-001", 174, dry_run=False, clock=FakeClock(local_dt(8, 5)))
+    assert parse_instant(events(state_file)[0]["ref"]) == utc(local_dt(10, 59))
 
 
 def test_snooze_before_first_tracked_dose_errors(state_file):
@@ -168,9 +181,10 @@ def test_ac19_snooze_command_then_tick_stages(tmp_path, monkeypatch):
     assert env.sent_count("snoozed") == 1
     env.run(local_dt(9, 6))                  # until+30 → nudge
     assert env.sent_count("Late:") == 1
-    env.run(local_dt(9, 29))                 # missed at max(T+90, until+30) = 09:30
+    env.run(local_dt(9, 36))                 # cadence continues from the wake
+    assert env.sent_count("Late:") == 2
     assert env.events("missed") == []
-    env.run(local_dt(9, 31))
+    env.run(local_dt(8, 5) + dtmod.timedelta(days=1))   # next dose closes it
     assert len(env.events("missed")) == 1
 
 
@@ -350,7 +364,8 @@ def test_ac21_undo_before_late_re_reminds(tmp_path, monkeypatch):
     assert env.events("send_intent")[0]["generation"] == 1
 
 
-def test_ac21_undo_after_missed_writes_silent_missed(tmp_path, monkeypatch):
+def test_ac21_undo_reopens_the_dose(tmp_path, monkeypatch):
+    # #11: an undone dose is open again — nudged — until the next dose closes it
     env = make_tick_env(tmp_path, monkeypatch)
     med = make_med(med_id="med-001", frequency="once_daily", times=["08:00"])
     env.write(meds=[med])
@@ -360,10 +375,11 @@ def test_ac21_undo_after_missed_writes_silent_missed(tmp_path, monkeypatch):
     handle_confirm("med-001", None, dry_run=False, clock=FakeClock(local_dt(8, 10)))
     handle_undo("med-001", dry_run=False, clock=FakeClock(local_dt(11, 0)))
 
-    env.run(local_dt(11, 5))                 # past T+missed → silent missed
+    env.run(local_dt(11, 5))
+    assert env.sent_count("Late:") == 1
+    env.run(local_dt(8, 5) + dtmod.timedelta(days=1))
     assert len(env.events("missed")) == 1
     assert env.events("missed")[0]["generation"] == 1
-    assert env.sent() == []
 
 
 # ── pause / unpause ────────────────────────────────────────────────────────────

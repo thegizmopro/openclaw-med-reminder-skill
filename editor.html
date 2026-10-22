@@ -345,25 +345,22 @@ section h2 { font-size: 14px; font-weight: 600; letter-spacing: .03em;
     </div>
 
     <div class="section-divider">Escalation</div>
-    <div class="field-row">
-      <div class="field">
-        <label>Late Threshold (min) *</label>
-        <input id="f-late" type="number" min="1" placeholder="30">
-        <div class="hint">Minutes past due before LATE nudge</div>
-      </div>
-      <div class="field">
-        <label>Missed Threshold (min) *</label>
-        <input id="f-miss" type="number" min="1" placeholder="90">
-        <div class="hint">Must be &gt; late threshold</div>
-      </div>
+    <div class="field">
+      <label>Nudge every (min) *</label>
+      <input id="f-late" type="number" min="1" placeholder="30">
+      <div class="hint">Until you take it, skip it, or pause it &mdash; an untaken dose is logged missed when the next dose is due</div>
+    </div>
+    <!-- Retired since #11 (the next dose closes a dose): kept hidden so the
+         stored values pass through for older readers -->
+    <div class="field" style="display:none">
+      <input id="f-miss" type="number" min="1" placeholder="90">
     </div>
     <div class="field">
       <label>Late Message *</label>
       <textarea id="f-late-msg" placeholder="Hey &mdash; still need to take your {name} ({dose}{unit})."></textarea>
       <div class="hint">Variables: {name} {dose} {unit}</div>
     </div>
-    <div class="field">
-      <label>Missed Message *</label>
+    <div class="field" style="display:none">
       <textarea id="f-miss-msg" placeholder="You missed your {name} dose. Logging it."></textarea>
     </div>
 
@@ -495,9 +492,6 @@ function validate(s) {
       e.push(`${p}.escalation.late_threshold_minutes must be positive integer`);
     if (!Number.isInteger(es.missed_threshold_minutes) || es.missed_threshold_minutes < 1)
       e.push(`${p}.escalation.missed_threshold_minutes must be positive integer`);
-    if (Number.isInteger(es.late_threshold_minutes) && Number.isInteger(es.missed_threshold_minutes)
-        && es.late_threshold_minutes >= es.missed_threshold_minutes)
-      e.push(`${p}: late_threshold (${es.late_threshold_minutes}) must be less than missed_threshold (${es.missed_threshold_minutes})`);
     if (!es.late_message?.trim())   e.push(`${p}.escalation.late_message is required`);
     if (!es.missed_message?.trim()) e.push(`${p}.escalation.missed_message is required`);
 
@@ -913,10 +907,8 @@ function saveMed() {
     times.forEach((t, i) => { if (!HHMM.test(t)) errs.push(`Time ${i+1} "${t}" must be HH:MM (zero-padded, 24h)`); });
     if (freq === 'weekly' && !collectDays().length) errs.push('Pick at least one day of the week');
   }
-  if (isNaN(late) || late < 1)  errs.push('Late threshold must be a positive number');
+  if (isNaN(late) || late < 1)  errs.push('Nudge interval must be a positive number');
   if (isNaN(miss) || miss < 1)  errs.push('Missed threshold must be a positive number');
-  if (!isNaN(late) && !isNaN(miss) && late >= miss)
-    errs.push(`Late threshold (${late}) must be less than missed threshold (${miss})`);
   if (!lateMsg) errs.push('Late message is required');
   if (!missMsg) errs.push('Missed message is required');
 

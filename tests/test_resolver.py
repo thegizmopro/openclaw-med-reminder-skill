@@ -10,6 +10,8 @@ parked away so only stage timing decides):
   ≥ 09:30        missed
 Boundaries are inclusive at the threshold instant.
 """
+import datetime as dtmod
+
 import pytest
 
 from tests.conftest import local_dt, make_med, make_tick_env
@@ -60,16 +62,20 @@ def test_exact_late_threshold_nudge(env):
 def test_late_window_nudge(env):
     env.write(meds=[med()], quiet_start="13:00", quiet_end="14:00", digest_time="23:59")
     env.run(local_dt(7, 0))
-    env.run(local_dt(9, 29))                # 1 min before the missed threshold
-    assert stages(env) == ["nudge"]         # only the highest due stage acted
+    env.run(local_dt(9, 29))                # machine off since 07:00
+    # only the highest due stage acted: the latest nudge slot (09:00, i.e.
+    # T+60) — no reminder, no burst of the skipped 08:30 slot (#11)
+    assert stages(env) == ["nudge-60"]
 
 
-def test_exact_missed_threshold_logs_missed(env):
+def test_exact_next_dose_closes_missed(env):
     env.write(meds=[med()], quiet_start="13:00", quiet_end="14:00", digest_time="23:59")
     env.run(local_dt(7, 0))
-    env.run(local_dt(9, 30))                # exactly T+missed
+    env.run(local_dt(7, 59) + dtmod.timedelta(days=1))   # 1 min before the next dose
+    assert env.events("missed") == []
+    env.run(local_dt(8, 0) + dtmod.timedelta(days=1))    # exactly the next dose
     assert len(env.events("missed")) == 1
-    assert env.sent_count("Missed:") == 1   # fresh → individual message
+    assert env.sent_count("Missed:") == 0   # fresh close is silent (#11)
 
 
 def test_paused_med_no_stages(env):

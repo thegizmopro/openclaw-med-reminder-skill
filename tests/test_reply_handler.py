@@ -335,11 +335,11 @@ def test_defer_is_snooze_alias_with_min_120_cap(state_file):
 
 
 def test_defer_capped_below_120_when_gap_is_tight(state_file):
-    # 08:00/11:00: gap 3h → cap 90min → min(120, 90) = 90
-    med = make_med(med_id="med-001", frequency="twice_daily", times=["08:00", "11:00"])
+    # 08:00/09:30 at 08:05: the dose closes at 09:30 → cap 84min → min(120, 84)
+    med = make_med(med_id="med-001", frequency="twice_daily", times=["08:00", "09:30"])
     write_state(state_file, meds=[med])
     handle_defer("med-001", dry_run=False, clock=FakeClock(local_dt(8, 5)))
-    assert parse_instant(events(state_file)[0]["ref"]) == utc(local_dt(9, 35))
+    assert parse_instant(events(state_file)[0]["ref"]) == utc(local_dt(9, 29))
 
 
 def test_defer_never_writes_deferred_status(state_file):

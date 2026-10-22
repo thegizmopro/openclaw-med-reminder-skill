@@ -106,10 +106,10 @@ EXIT_BAD_OPTION = 2
 # A printed duplicate-override nonce is valid for this long (issue §4).
 NONCE_TTL = timedelta(minutes=10)
 
-# Snooze bounds (issue #1 §6): default 30 minutes, allowed 5–240, and never
-# more than half the gap to the next occurrence. `defer` is the deprecated
-# alias capped at min(120, half-gap).
-SNOOZE_DEFAULT = 30
+# Snooze bounds (issue #1 §6, #11): default 120 minutes, allowed 5–240, and
+# the wake must land before the dose closes at the next dose. `defer` is
+# the deprecated alias capped at min(120, cap).
+SNOOZE_DEFAULT = 120
 SNOOZE_MIN = 5
 SNOOZE_MAX = 240
 DEFER_MINUTES = 120
@@ -432,18 +432,6 @@ def _most_recent_occurrence(med: dict, now: datetime, tz):
     return _occurrence_mod.most_recent_past(sched, now, tz)
 
 
-def _next_occurrence_after(med: dict, occ, tz):
-    """The next scheduled occurrence strictly after `occ` (snooze cap)."""
-    sched = med["schedule"]
-    if sched.get("frequency") == "interval":
-        step = timedelta(hours=float(sched["interval_hours"]))
-        return _occurrence_mod.at_utc(occ.utc + step, tz)
-    nxt = compute_next_due(med, occ.utc, tz)
-    if nxt is None:
-        return None
-    return _occurrence_mod.for_instant(sched, nxt, tz)
-
-
 def _current_dose(med: dict, history, now: datetime, tz):
     """
     The dose a skip/snooze reply targets: the most recent occurrence at or
@@ -461,14 +449,22 @@ def _current_dose(med: dict, history, now: datetime, tz):
 
 
 def _snooze_minutes(med: dict, occ, tz, requested: Optional[int],
-                    defer_alias: bool) -> int:
+                    defer_alias: bool, now: datetime) -> int:
     """
-    Resolve the snooze duration: default 30, range 5–240, capped at half
-    the gap to the next occurrence (issue #1 §6). Raises SystemExit with
-    the spec's refusal when beyond the cap. `defer` uses min(120, cap).
+    Resolve the snooze duration: default 120, range 5–240, and the wake
+    must land before the dose closes at the next dose (#11). An explicit
+    duration past that is refused with the spec's message; the default
+    shrinks to fit. `defer` uses min(120, cap).
     """
-    nxt = _next_occurrence_after(med, occ, tz)
-    cap = ((nxt.utc - occ.utc).total_seconds() / 120.0) if nxt is not None else SNOOZE_MAX
+    close = _occurrence_mod.close_instant(med["schedule"], occ.utc, tz)
+    cap = (close - now).total_seconds() / 60.0 - 1   # wake strictly before the close
+    if requested is None and not defer_alias:
+        minutes = min(SNOOZE_DEFAULT, int(cap))
+        if minutes < SNOOZE_MIN:
+            print(f"Error: snoozing {med['name']} would run into your next "
+                  "dose; skip instead?")
+            raise SystemExit(EXIT_BAD_OPTION)
+        return minutes
     minutes = SNOOZE_DEFAULT if requested is None else requested
     if defer_alias:
         minutes = min(DEFER_MINUTES, int(cap))
@@ -493,9 +489,8 @@ def handle_snooze(med_id: str, minutes: Optional[int], dry_run: bool,
     """
     Snooze the pending dose: writes `snoozed{occurrence, until}` with the
     wake instant in `ref` (the format tick.snooze_until_for reads). The
-    reminder re-fires at `until`, the nudge at until+late, and missed no
-    earlier than max(T+missed, until+late) — so a capped snooze can never
-    run into the next dose.
+    reminder re-fires at `until` and nudges resume every late_threshold
+    from there; the cap keeps `until` before the next dose closes it (#11).
     """
     clock = clock or get_clock()
     state = load_state()
@@ -522,7 +517,7 @@ def handle_snooze(med_id: str, minutes: Optional[int], dry_run: bool,
               f"already {state_desc}.")
         raise SystemExit(EXIT_BAD_OPTION)
 
-    minutes = _snooze_minutes(med, occ, tz, minutes, defer_alias)
+    minutes = _snooze_minutes(med, occ, tz, minutes, defer_alias, now)
     until = now + timedelta(minutes=minutes)
 
     if dry_run:
@@ -739,11 +734,11 @@ def handle_undo(med_id: str, dry_run: bool, clock: Optional[Clock] = None,
         print(f"Undid: skipped {med['name']}{slot}.")
     if occ is not None:
         late = timedelta(minutes=med["escalation"]["late_threshold_minutes"])
-        missed = timedelta(minutes=med["escalation"]["missed_threshold_minutes"])
+        close = _occurrence_mod.close_instant(med["schedule"], occ.utc, tz)
         if now < occ.utc + late:
             print("You'll be reminded again.")
-        elif now >= occ.utc + missed:
-            print("It's past the missed threshold — it will be logged as missed, silently.")
+        elif now >= close:
+            print("The next dose is already due — it will be logged as missed, silently.")
         else:
             print("You'll be nudged again.")
     log.info("UNDO [%s] %s", med["id"], ev["id"])

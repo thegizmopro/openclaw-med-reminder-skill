@@ -260,15 +260,15 @@ def test_ac25_retries_stop_after_the_missed_deadline(env):
     env.run(local_dt(8, 5))
     env.run(local_dt(8, 11))
     env.run(local_dt(8, 22))
-    # long after the occurrence's missed deadline (09:30): the reminder and
-    # nudge retries are dropped — only the silent miss + (failing) catch-up
-    # consolidated message remain
-    env.run(local_dt(13, 0))
+    # long after the occurrence's missed deadline (the next dose, 08:00
+    # tomorrow — #11): today's reminder and nudge retries are dropped
+    env.run(local_dt(13, 0) + timedelta(days=1))
     assert env.sent() == []
     assert len(env.events("missed")) == 1
-    late_stages = {e["stage"] for e in env.events("send_intent")
-                   if e["stage"] in ("reminder", "nudge")}
-    intents = [e for e in env.events("send_intent") if e["stage"] in ("reminder", "nudge")]
+    today = "2026-04-21T08:00#0"
+    intents = [e for e in env.events("send_intent")
+               if e["occurrence_key"] == today
+               and (e["stage"] == "reminder" or e["stage"].startswith("nudge"))]
     assert all(int(e.get("attempt") or 1) <= 3 for e in intents), \
         "no stage retries past the missed deadline"
     assert (env.state_file.parent / "SENDER_DOWN").exists()

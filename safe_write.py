@@ -340,8 +340,9 @@ def validate(state: dict) -> None:
             _die(f"{p}.escalation.late_threshold_minutes must be a positive integer")
         if not isinstance(esc["missed_threshold_minutes"], int) or esc["missed_threshold_minutes"] < 1:
             _die(f"{p}.escalation.missed_threshold_minutes must be a positive integer")
-        if esc["late_threshold_minutes"] >= esc["missed_threshold_minutes"]:
-            _die(f"{p}: late_threshold_minutes must be less than missed_threshold_minutes")
+        # No late < missed ordering check since #11: late_threshold_minutes is
+        # the nudge cadence and missed_threshold_minutes is retired (still
+        # required so pre-#11 readers load the file, but never read).
 
         mstate = med["state"]
         for field in ("status","last_taken","last_reminded","next_due","missed_count","history"):

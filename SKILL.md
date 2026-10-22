@@ -183,22 +183,27 @@ taper, allergy meds for pollen season):
 
 ## Section 3 — Escalation
 
-**Ask (once, for all meds together):**
-> "If you forget a dose, how long should I wait before sending a reminder?
-> And after how long should I just log it as missed?"
+**How it works (#11):** after the reminder, a nudge goes out every
+`late_threshold_minutes` until the user takes the dose, skips it, or pauses
+it ("pause X 90" → snooze). When the med's next dose is due (at most 25h
+later) an unresolved dose is logged missed — silently; the digest shows it.
+Nudges are muted in quiet hours past the first 30 min and resume after.
 
-**Maps to:** `escalation.late_threshold_minutes`, `escalation.missed_threshold_minutes`
-(applied to every med — use the same values unless the user specifies per-med)
+**Ask (once, for all meds together):**
+> "If you haven't taken a dose, how often should I remind you until you do?"
+
+**Maps to:** `escalation.late_threshold_minutes` (applied to every med — use
+the same value unless the user specifies per-med)
 
 **Handling:**
 - Convert to minutes: "30 minutes" → `30`, "an hour" → `60`, "2 hours" → `120`
-- Enforce: `late_threshold < missed_threshold`
-- If only one number given: use it as `late_threshold`, set `missed_threshold = late_threshold * 3`
-- If the user says "don't nag me": `late_threshold: 60`, `missed_threshold: 180`
+- If the user says "don't nag me": `late_threshold_minutes: 60`
+- `missed_threshold_minutes` is retired: always write `90` (still required by
+  the file format, never read)
 
 **Silent defaults:** `late_threshold_minutes: 30`, `missed_threshold_minutes: 90`
 
-**T+late vs quiet hours:** thresholds are the last input, so the §1 cross-check
+**T+late vs quiet hours:** the nudge interval is the last input, so the §1 cross-check
 happens here: for every scheduled-time med, compute dose time + `late_threshold_minutes`
 and refuse or move any dose whose nudge lands in the muted part of quiet hours
 (more than 30 min after quiet start), exactly as §1 describes. `reply.py add-med`
@@ -384,7 +389,8 @@ python3 reply.py confirm med-001 --dose 20:00
 # Everything pending at once (skips paused and as-needed meds):
 python3 reply.py confirm --all
 
-# Not yet / remind me later (default 30 min):
+# Not yet / remind me later (default 120 min, shortened to fit before the next dose):
+python3 reply.py snooze med-001
 python3 reply.py snooze med-001 --minutes 30
 
 # Skip this dose entirely (logged skipped, never missed):
@@ -431,7 +437,7 @@ Never write state based on an ambiguous match. Always confirm with the user firs
 | `took it at 8`, `met at 8am`, `took met this morning` | Confirm with a time | `reply.py confirm <id> --taken-at 08:00` |
 | `snooze met`, `later`, `not yet met`, `remind me in 30` | Snooze | `reply.py snooze <id> [--minutes N]` |
 | `pause met 90`, `pause met for 2 hours` | Snooze this dose N min | `reply.py snooze <id> --minutes N` |
-| `pause met` (no number) | Snooze this dose 2h | `reply.py snooze <id> --minutes 120` |
+| `pause met` (no number) | Snooze this dose 2h | `reply.py snooze <id>` (default 120, shortened to fit before the next dose) |
 | `skip metformin`, `skip 2` | Skip a dose | `reply.py skip <id>` |
 | `undo`, `undo met`, `I didn't take it after all` | Undo last taken/skipped | `reply.py undo <id>` |
 | `status`, `what's due`, `my meds` | Info only | `reply.py status` — relay output, no write |
@@ -549,7 +555,6 @@ Do not recap fields the user didn't ask about. Do not show internal IDs.
 | User gives a med name only, no dose | Ask: "What dose of [name]?" |
 | User gives dose but no unit | Infer from type; if unclear ask once |
 | Conflicting times (e.g. twice daily but only one time given) | Ask for the second time |
-| `late_threshold >= missed_threshold` | Tell the user and ask them to pick again |
 | Unknown timezone | Ask for the nearest major city |
 | User says "I take a lot of meds, let me list them" | Wait for the full list before asking follow-ups |
 | User edits a med after confirmation | Re-generate that med's entry only; re-confirm the changed line |

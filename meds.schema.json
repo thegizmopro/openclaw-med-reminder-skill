@@ -233,13 +233,13 @@
           "type": "integer",
           "minimum": 1,
           "maximum": 480,
-          "description": "Minutes past due before sending the LATE nudge. Default: 30."
+          "description": "Nudge cadence (#11): a nudge every N minutes after the dose (or a snooze wake) until it is taken, skipped, snoozed, or closed as missed when the next dose is due (at most 25h after it). Default: 30."
         },
         "missed_threshold_minutes": {
           "type": "integer",
           "minimum": 1,
           "maximum": 1440,
-          "description": "Minutes past due before logging as MISSED. Must be > late_threshold_minutes. Default: 90."
+          "description": "RETIRED (#11) — no longer read; a dose is logged missed when the next dose is due. Still required so older readers load the file. Default: 90."
         },
         "late_message": {
           "type": "string",
