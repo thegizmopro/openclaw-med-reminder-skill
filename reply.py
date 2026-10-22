@@ -18,6 +18,8 @@ Subcommands (issue #1 §6 — all writes go through transact):
     pause/unpause <med-id>     Stop or resume reminders for one med
     reconstitute <med-id> --vial-mg X --diluent-ml Y
                                Log a vial mix; reminders then show syringe units
+    restock <med-id> --qty N | --set N
+                               Add N inventory units, or record N on hand
     add-med --json -           Add a med from a JSON object on stdin
     edit-med <med-id> --json - Edit a med from a JSON object on stdin
     set-quiet-hours HH:MM HH:MM
@@ -68,6 +70,7 @@ sys.path.insert(0, str(SCRIPT_DIR))
 # Import shared helpers from dispatch — no scheduler-side code brought in
 import dispatch as _dispatch_mod
 import event_store as _event_store_mod
+import inventory as _inv
 import occurrence as _occurrence_mod
 import reconstitution as _rc
 import safe_write as _safe_write_mod
@@ -864,6 +867,53 @@ def handle_reconstitute(med_id: str, vial_mg: float, diluent_ml: float,
     log.info("RECONSTITUTE [%s] %s mg / %s mL", med["id"], vial_mg, diluent_ml)
 
 
+# ── Inventory (PR 8b, #10) ─────────────────────────────────────────────────────
+
+def handle_restock(med_id: str, qty: Optional[float], set_qty: Optional[float],
+                   dry_run: bool, clock: Optional[Clock] = None,
+                   position: Optional[int] = None) -> None:
+    """
+    `--qty N` logs `restocked{qty}` (N inventory units added — the first
+    one starts tracking); `--set N` logs `counted{qty}` (a recount: N on
+    hand now). On hand is always derived, never stored.
+    """
+    clock = clock or get_clock()
+    state = load_state()
+    tz = get_tz(state)
+    now = clock.now_utc()
+    med = _resolve_target(state, med_id, position, tz, now)
+    unit = med.get("inventory_unit")
+    if not unit:
+        print(f"Error: {med['name']} has no inventory_unit — set one first, e.g. "
+              f"edit-med {med['id']} with {{\"inventory_unit\": \"vial\"}}.")
+        raise SystemExit(EXIT_BAD_OPTION)
+    if (qty is None) == (set_qty is None):
+        print("Error: pass exactly one of --qty (units added) or --set (units on hand).")
+        raise SystemExit(EXIT_BAD_OPTION)
+    value = qty if qty is not None else set_qty
+    if not math.isfinite(value) or value < 0 or (qty is not None and value == 0):
+        print(f"Error: {'--qty must be positive' if qty is not None else '--set must be 0 or more'}"
+              f" (got {value}).")
+        raise SystemExit(EXIT_BAD_OPTION)
+    kind = "restocked" if qty is not None else "counted"
+
+    if dry_run:
+        print(f"[DRY RUN] Would log {kind} {value:g} {unit} for {med['name']}.")
+        return
+
+    def fn(state_copy, history_view):
+        if _find_med(state_copy, med["id"]) is None:
+            raise ValueError(f"med {med['id']} disappeared mid-restock")
+        return state_copy, [_event_store_mod.new_event(med["id"], kind, now, qty=value)]
+
+    _safe_write_mod.transact(fn, clock=clock)
+    history = _event_store_mod.load_events(_safe_write_mod.history_file())
+    line = _inv.status_line(med, history, now)
+    verb = f"Added {value:g} {unit}" if qty is not None else f"Recorded {value:g} {unit} on hand"
+    print(f"{verb} for {med['name']}." + (f" Now {line}." if line else ""))
+    log.info("RESTOCK [%s] %s %s", med["id"], kind, value)
+
+
 # ── Edit-time quiet-hours checks (issue #1 §6, AC 27) ─────────────────────────
 #
 # validate() never rejects quiet-hours conflicts (AC 26 — existing state
@@ -1225,6 +1275,9 @@ def handle_status() -> None:
         if nd:
             nd_local = parse_instant(nd).astimezone(tz)
             line += f" | next due: {nd_local:%a} {_fmt_12h(nd_local)}"
+        stock = _inv.status_line(med, history, get_clock().now_utc())
+        if stock:
+            line += f" | {stock}"
         print(line)
     if not state["meds"]:
         print("No meds yet — add one with: reply.py add-med --json -")
@@ -1326,6 +1379,17 @@ def main() -> None:
     p_recon.add_argument("--diluent-ml", type=float, required=True, metavar="ML",
                          help="Bacteriostatic water added, mL")
 
+    p_restock = sub.add_parser("restock",
+                               help="Add inventory (--qty) or record a recount (--set)")
+    p_restock.add_argument("med_id", nargs="?", default=None,
+                           help="Med ID, e.g. med-001 (or use --position)")
+    p_restock.add_argument("--position", type=int, default=None, metavar="N",
+                           help="Pick the Nth med from today's digest order (1-based)")
+    p_restock.add_argument("--qty", type=float, default=None, metavar="N",
+                           help="Inventory units added (in the med's inventory_unit)")
+    p_restock.add_argument("--set", dest="set_qty", type=float, default=None, metavar="N",
+                           help="Inventory units on hand right now (a recount)")
+
     p_add = sub.add_parser("add-med", help="Add a med from a JSON object on stdin")
     p_add.add_argument("--json", action="store_true",
                        help="Read the med's JSON from stdin ('-' or a path)")
@@ -1405,6 +1469,11 @@ def main() -> None:
             parser.error("reconstitute requires a med_id or --position")
         handle_reconstitute(args.med_id, args.vial_mg, args.diluent_ml,
                             args.dry_run, position=args.position)
+    elif args.mode == "restock":
+        if not args.med_id and args.position is None:
+            parser.error("restock requires a med_id or --position")
+        handle_restock(args.med_id, args.qty, args.set_qty, args.dry_run,
+                       position=args.position)
     elif args.mode == "add-med":
         handle_add_med(_read_json_input(args.json_src), args.dry_run)
     elif args.mode == "edit-med":

@@ -294,6 +294,25 @@ section h2 { font-size: 14px; font-weight: 600; letter-spacing: .03em;
       <label for="f-paused">Paused (skip reminders for this med)</label>
     </div>
 
+    <div class="section-divider">Supplies (optional)</div>
+    <div class="field-row">
+      <div class="field">
+        <label>Count stock in</label>
+        <input id="f-inv-unit" type="text" placeholder="vial, tablet, pen, mL">
+        <div class="hint">Leave empty to skip supply tracking. Stock is logged in chat ("I got 3 vials")</div>
+      </div>
+      <div class="field">
+        <label>Reorder below (days)</label>
+        <input id="f-reorder" type="number" min="1" step="1" placeholder="14">
+        <div class="hint">The digest flags "reorder" under this many days of supply</div>
+      </div>
+    </div>
+    <div class="field">
+      <label>Doses per unit</label>
+      <input id="f-dpu" type="number" min="0" step="any" placeholder="worked out when it can be">
+      <div class="hint">Only needed when it can't be derived from the dose, the syringe, or a logged vial mix</div>
+    </div>
+
     <div class="section-divider">Schedule</div>
     <div class="field">
       <label>Frequency *</label>
@@ -448,6 +467,12 @@ function validate(s) {
     if (typeof m.paused !== 'boolean') e.push(`${p}.paused must be boolean`);
     if (m.syringe != null && !(m.syringe in SYRINGE_UNITS_PER_ML))
       e.push(`${p}.syringe must be U-100 or U-50 (or absent)`);
+    if (m.inventory_unit != null && !(typeof m.inventory_unit === 'string' && m.inventory_unit.trim()))
+      e.push(`${p}.inventory_unit must be a non-empty string (or absent)`);
+    if (m.doses_per_unit != null && !(typeof m.doses_per_unit === 'number' && m.doses_per_unit > 0))
+      e.push(`${p}.doses_per_unit must be a positive number (or absent)`);
+    if (m.reorder_when_below_days != null && !(Number.isInteger(m.reorder_when_below_days) && m.reorder_when_below_days >= 1))
+      e.push(`${p}.reorder_when_below_days must be a positive whole number (or absent)`);
 
     const sc = m.schedule || {};
     const FREQS = ['once_daily','twice_daily','interval','weekly','as_needed'];
@@ -750,6 +775,9 @@ function openEditMed(id) {
   document.getElementById('f-unit').value  = med.unit;
   document.getElementById('f-paused').checked = med.paused;
   document.getElementById('f-syringe').value = med.syringe || '';
+  document.getElementById('f-inv-unit').value = med.inventory_unit || '';
+  document.getElementById('f-dpu').value      = med.doses_per_unit ?? '';
+  document.getElementById('f-reorder').value  = med.reorder_when_below_days ?? '';
 
   const s = med.schedule;
   document.getElementById('f-freq').value  = s.frequency;
@@ -808,7 +836,7 @@ function closeModal() {
 
 function clearMedForm() {
   ['f-name','f-dose','f-unit','f-notes','f-late-msg','f-miss-msg','f-interval',
-   'f-syringe','calc-vial','calc-dil'].forEach(id => {
+   'f-syringe','calc-vial','calc-dil','f-inv-unit','f-dpu','f-reorder'].forEach(id => {
     document.getElementById(id).value = '';
   });
   document.getElementById('f-type').value    = 'pill';
@@ -885,6 +913,15 @@ function saveMed() {
   const unit  = document.getElementById('f-unit').value.trim();
   const paused= document.getElementById('f-paused').checked;
   const syringe = document.getElementById('f-syringe').value;
+  // Supplies (PR 8b): empty inputs mean "not set" and remove the field
+  const invUnit = document.getElementById('f-inv-unit').value.trim();
+  const dpuRaw  = document.getElementById('f-dpu').value.trim();
+  const reoRaw  = document.getElementById('f-reorder').value.trim();
+  const supplies = {
+    inventory_unit: invUnit || null,
+    doses_per_unit: dpuRaw === '' ? null : Number(dpuRaw),
+    reorder_when_below_days: reoRaw === '' ? null : Number(reoRaw),
+  };
   const freq  = document.getElementById('f-freq').value;
   const food  = document.getElementById('f-food').checked;
   const notes = document.getElementById('f-notes').value.trim();
@@ -910,6 +947,11 @@ function saveMed() {
   if (isNaN(late) || late < 1)  errs.push('Nudge interval must be a positive number');
   if (isNaN(miss) || miss < 1)  errs.push('Missed threshold must be a positive number');
   if (!lateMsg) errs.push('Late message is required');
+  if (supplies.doses_per_unit !== null && !(supplies.doses_per_unit > 0))
+    errs.push('Doses per unit must be a positive number');
+  if (supplies.reorder_when_below_days !== null
+      && !(Number.isInteger(supplies.reorder_when_below_days) && supplies.reorder_when_below_days >= 1))
+    errs.push('Reorder below must be a whole number of days (1 or more)');
   if (!missMsg) errs.push('Missed message is required');
 
   const errEl = document.getElementById('f-form-errors');
@@ -939,6 +981,7 @@ function saveMed() {
     const med = currentState.meds.find(m => m.id === editingId);
     med.name = name; med.type = type; med.dose = dose; med.unit = unit; med.paused = paused;
     if (syringe) med.syringe = syringe; else delete med.syringe;
+    applySupplies(med, supplies);
     med.schedule   = schedule;
     med.escalation = { late_threshold_minutes: late, missed_threshold_minutes: miss,
                        late_message: lateMsg, missed_message: missMsg };
@@ -948,6 +991,7 @@ function saveMed() {
     currentState.meds.push({
       id: generateId(), name, type, dose, unit, paused,
       ...(syringe ? { syringe } : {}),
+      ...Object.fromEntries(Object.entries(supplies).filter(([, v]) => v !== null)),
       schedule,
       escalation: { late_threshold_minutes: late, missed_threshold_minutes: miss,
                     late_message: lateMsg, missed_message: missMsg },
@@ -959,6 +1003,12 @@ function saveMed() {
   renderMeds();
   closeModal();
   markUnsaved();
+}
+
+function applySupplies(med, supplies) {
+  Object.entries(supplies).forEach(([k, v]) => {
+    if (v === null) delete med[k]; else med[k] = v;
+  });
 }
 
 function deleteMed(id) {

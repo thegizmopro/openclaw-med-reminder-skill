@@ -153,6 +153,7 @@ When you reply to a reminder or digest ("took metformin", "snooze that", "took i
 | `undo` | `undo <id>` (within 24h) |
 | `stop taking metformin` / `resume metformin` | `pause <id>` / `unpause <id>` |
 | `I mixed wolverine: 10 mg with 2 mL` | `reconstitute <id> --vial-mg 10 --diluent-ml 2` (reminders then show syringe units) |
+| `got 3 more vials` / `I have 2 left` | `restock <id> --qty 3` / `restock <id> --set 2` (supply tracking; the digest flags "reorder") |
 | `status` / `what's due` | `status` (read-only) |
 | add / change / remove a med, quiet hours | `add-med` / `edit-med` / `remove` / `set-quiet-hours` |
 
