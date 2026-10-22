@@ -126,6 +126,24 @@ def most_recent_past(sched: dict, asof: datetime, tz: ZoneInfo) -> Optional[Occu
     return window[-1] if window else None
 
 
+# An unresolved dose is closed as missed when the med's next dose arrives
+# (#11), but never later than CLOSE_CAP after it was due — a weekly med is
+# not nagged for a week. 25h, not 24h, so a daily dose across a DST
+# fall-back (a 25h day) still closes at the next dose.
+CLOSE_CAP = timedelta(hours=25)
+
+
+def close_instant(sched: dict, due_utc: datetime, tz: ZoneInfo) -> datetime:
+    """When a dose due at `due_utc` that is still unresolved is closed as
+    missed: the next dose's instant, at most CLOSE_CAP after `due_utc`."""
+    due = _to_utc(due_utc)
+    cap = due + CLOSE_CAP
+    if sched.get("frequency") == "interval":
+        return min(due + timedelta(hours=float(sched["interval_hours"])), cap)
+    nxt = occurrences_between(sched, due, cap, tz)
+    return nxt[0].utc if nxt else cap
+
+
 def _wall_match(sched: dict, instant: datetime, tz: ZoneInfo) -> Optional[Occurrence]:
     """Occurrence whose local wall time matches `instant`'s (any fold)."""
     freq = sched.get("frequency")

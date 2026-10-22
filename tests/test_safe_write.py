@@ -173,12 +173,12 @@ def test_duplicate_med_id_rejected():
 
 # ── Validate: late >= missed rejected ────────────────────────────────────────
 
-def test_late_threshold_gte_missed_rejected():
+def test_late_threshold_no_longer_ordered_against_missed():
+    # #11: late_threshold_minutes is the nudge cadence; missed is retired
     state = _state(1)
     state["meds"][0]["escalation"]["late_threshold_minutes"]   = 90
     state["meds"][0]["escalation"]["missed_threshold_minutes"] = 30
-    with pytest.raises(ValueError, match="less than missed"):
-        sw.validate(state)
+    sw.validate(state)
 
 
 # ── day_of_week: single string or canonical list (PR 7) ─────────────────────

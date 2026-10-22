@@ -21,6 +21,7 @@ expressed as send_intent/sent with `stage` set (issue §1).
 import json
 import logging
 import os
+import re
 import uuid
 from copy import deepcopy
 from datetime import datetime, timezone
@@ -42,6 +43,8 @@ VALID_EVENTS = frozenset({
 VALID_STAGES = frozenset({
     "reminder", "snooze_reminder", "nudge", "catchup", "overnight", "digest",
 })
+# Repeat nudges (#11) are "nudge-<minutes after the dose was due>"
+_REPEAT_NUDGE = re.compile(r"^nudge-[0-9]+$")
 
 # Serialization field order (issue §1); absent fields are omitted, not nulled.
 _EVENT_FIELDS = (
@@ -83,7 +86,8 @@ def new_event(med_id: str, event: str, ts_utc: datetime,
             val = fields.pop(key)
             if val is not None:
                 ev[key] = val
-    if "stage" in ev and ev["stage"] not in VALID_STAGES:
+    if "stage" in ev and ev["stage"] not in VALID_STAGES \
+            and not _REPEAT_NUDGE.match(ev["stage"]):
         raise ValueError(f"unknown stage '{ev['stage']}' (valid: {sorted(VALID_STAGES)})")
     if fields:
         raise TypeError(f"unknown event fields: {sorted(fields)}")
@@ -308,7 +312,8 @@ _MIRROR_EVENT_MAP = {"taken": "taken", "missed": "missed"}
 def mirror_entry(event: dict) -> Optional[dict]:
     """Legacy state.history entry for a store event, or None if unrepresentable."""
     ev = event.get("event")
-    if ev == "sent" and event.get("stage") == "nudge":
+    if ev == "sent" and (event.get("stage") == "nudge"
+                         or _REPEAT_NUDGE.match(event.get("stage") or "")):
         legacy = "late_nudge_sent"
     elif ev in _MIRROR_EVENT_MAP:
         legacy = _MIRROR_EVENT_MAP[ev]

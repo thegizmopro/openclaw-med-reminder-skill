@@ -16,9 +16,11 @@ One entry point, run every N minutes (default 5). Each tick:
      misses or catch-up lines — catch-up and watermark advance included.
   4. Per occurrence only the highest due stage acts: reminder (quiet-
      hours exempt — the user chose the time), snooze_reminder, nudge
-     (muted in quiet hours except the first 30 min), missed (always
-     logged; message muted in quiet hours). Catch-up past the missed
-     deadline writes silent misses plus ONE consolidated message.
+     (repeats every late_threshold_minutes from T or the snooze wake;
+     muted in quiet hours except the first 30 min), missed (logged
+     silently when the med's next dose arrives, at most CLOSE_CAP after
+     T — #11). Catch-up past the missed deadline (the machine was off)
+     writes silent misses plus ONE consolidated message.
   5. Sends are at-least-once with leases: send_intent{lease, attempt}
      is decided under transact, the subprocess runs outside the lock
      (60s timeout), and a second transact records sent/send_failed.
@@ -427,14 +429,10 @@ def _resolve_tz(state: dict, plan: Plan, ev) -> ZoneInfo:
 
 
 def _lookback(state: dict) -> timedelta:
-    """min(max missed threshold + 24h, 72h) across meds (issue §3.3)."""
-    worst = timedelta(minutes=90)
-    for med in state.get("meds", []):
-        try:
-            worst = max(worst, timedelta(minutes=med["escalation"]["missed_threshold_minutes"]))
-        except (KeyError, TypeError, ValueError):
-            continue
-    return min(worst + timedelta(hours=24), LOOKBACK_CAP)
+    """min(longest open window + 24h, 72h) (issue §3.3). A dose stays open
+    at most occurrence.CLOSE_CAP (#11), so the window is the same for every
+    med."""
+    return min(occurrence.CLOSE_CAP + timedelta(hours=24), LOOKBACK_CAP)
 
 
 def _clock_anomaly(plan: Plan, ev, wm):
@@ -569,32 +567,32 @@ def _process_occurrence(plan: Plan, state: dict, med: dict, occ: Occurrence,
     if res in ("taken", "skipped"):
         return
 
-    late = timedelta(minutes=med["escalation"]["late_threshold_minutes"])
-    missed_min = timedelta(minutes=med["escalation"]["missed_threshold_minutes"])
+    # late_threshold_minutes is the nudge cadence (#11): nudges repeat every
+    # `interval` from the anchor (T, or the snooze wake) until the dose is
+    # taken, skipped, snoozed again, or closed as missed when the next dose
+    # arrives. missed_threshold_minutes is retired — no longer read.
+    interval = timedelta(minutes=med["escalation"]["late_threshold_minutes"])
     snoozed_until = snooze_until_for(ev, med_id, key, gen)
     now = plan.now
     T = occ.utc
 
-    nudge_due = (snoozed_until or T) + late
-    missed_due = max(T + missed_min,
-                     (snoozed_until + late) if snoozed_until else T + missed_min)
+    anchor = snoozed_until or T
+    missed_due = occurrence.close_instant(med["schedule"], T, tz)
 
     if now >= missed_due:
         if res == "missed":
             return   # already terminal; delivery retries happen in _retry_scan
         _log_missed(plan, state, med, occ, gen, tz)
         fresh = (now - missed_due) <= missed_fresh_grace(tick_minutes)
-        if fresh and not in_quiet(now, quiet, tz):
-            # missed-dose messaging rides the catchup stage (issue §1: the
-            # stage vocabulary has no per-occurrence 'missed' stage)
-            plan_send(plan, idx, med, occ, gen, "catchup", missed_text(med))
-        elif not fresh and gen == 0:
+        # A fresh close is silent (#11): the user was nudged all along and
+        # the next dose's reminder is going out now; the miss shows in the
+        # digest (and in the overnight summary when it closed in quiet hours).
+        if not fresh and gen == 0:
             # a stale discovery means the machine was off → consolidated
             # message. An undone-and-redone generation (gen ≥ 1) stays
             # silent: the user just undid a taken dose, nothing was "off"
             # (AC 21).
             plan.catchup_lines.append((med, occ))
-        # fresh + quiet: silent now; the overnight summary covers it
         return
 
     # Unresolved and still inside the escalation window: the watermark may
@@ -603,13 +601,16 @@ def _process_occurrence(plan: Plan, state: dict, med: dict, occ: Occurrence,
     # oldest still-pending occurrence and jumps to `now` once all are done.
     plan.pending_floor = T if plan.pending_floor is None else min(plan.pending_floor, T)
 
-    if now >= nudge_due:
+    if now >= anchor + interval:
+        # only the latest due slot acts — slots a sleeping machine skipped
+        # never burst out later
+        slot = anchor + interval * ((now - anchor) // interval)
         # muted in quiet hours, except when it falls in the first 30 min
-        if in_quiet(nudge_due, quiet, tz) and not in_quiet_head(nudge_due, quiet, tz):
+        if in_quiet(slot, quiet, tz) and not in_quiet_head(slot, quiet, tz):
             log.info("tick: nudge for %s %s muted (quiet hours)", med_id, key)
             return
         warning = _double_dose_guard(ev, med, T, tz)
-        plan_send(plan, idx, med, occ, gen, "nudge",
+        plan_send(plan, idx, med, occ, gen, nudge_stage(slot, T, interval),
                   nudge_text(med, tz, warning, reconstitution.med_draw(med, ev, now)))
         return
 
@@ -653,6 +654,32 @@ def _log_missed(plan: Plan, state: dict, med: dict, occ: Occurrence, gen: int, t
 # Stage precedence per occurrence: only the highest due stage acts, so a
 # retry of a lower stage is dropped when a higher one fires this tick.
 _STAGE_RANK = {"reminder": 1, "snooze_reminder": 2, "nudge": 3, "catchup": 4}
+
+
+def nudge_stage(slot, T, interval) -> str:
+    """
+    Stage name for the nudge at `slot` (#11). The first nudge after T keeps
+    the plain "nudge" name (compatible with sends recorded before #11);
+    later ones are "nudge-<minutes after T>". Naming the slot by its offset
+    keeps every repeat — including those re-anchored by a snooze — a
+    distinct, once-only send in the send index.
+    """
+    offset = int((slot - T).total_seconds() // 60)
+    if offset == int(interval.total_seconds() // 60):
+        return "nudge"
+    return f"nudge-{offset}"
+
+
+def is_nudge(stage: str) -> bool:
+    return stage == "nudge" or stage.startswith("nudge-")
+
+
+def _stage_rank(stage: str) -> float:
+    """Later nudges outrank earlier ones (a stale nudge retry is dropped
+    when a newer one fires) and all stay below catchup."""
+    if stage.startswith("nudge-"):
+        return 3 + int(stage[len("nudge-"):]) / 1e6
+    return _STAGE_RANK.get(stage, 0)
 
 
 def plan_send(plan: Plan, idx, med: dict, occ: Occurrence, gen: int,
@@ -712,7 +739,7 @@ def queue_send(plan: Plan, med_id: str, key: str, gen: int, stage: str,
     plan.handled.add((med_id, key, gen, stage))
     if med_id != GLOBAL_MED_ID:
         occ_key = (med_id, key, gen)
-        rank = _STAGE_RANK.get(stage, 0)
+        rank = _stage_rank(stage)
         if rank > plan.queued_rank.get(occ_key, 0):
             plan.queued_rank[occ_key] = rank
 
@@ -734,7 +761,7 @@ def _retry_scan(plan: Plan, state: dict, ev, idx, tz):
             continue
         # a higher stage firing this tick supersedes the lower one's retry
         if med_id != GLOBAL_MED_ID and \
-                _STAGE_RANK.get(stage, 0) < plan.queued_rank.get((med_id, key, gen), 0):
+                _stage_rank(stage) < plan.queued_rank.get((med_id, key, gen), 0):
             continue
         med = meds.get(med_id)
         if med_id != GLOBAL_MED_ID and (med is None or med.get("paused")):
@@ -754,14 +781,20 @@ def _retry_scan(plan: Plan, state: dict, ev, idx, tz):
         else:
             repeat = True
 
-        late = timedelta(minutes=(med.get("escalation") or {}).get("late_threshold_minutes", 30))
-        missed_min = timedelta(
-            minutes=(med.get("escalation") or {}).get("missed_threshold_minutes", 90))
-        snoozed_until = snooze_until_for(ev, med_id, key, gen)
-        missed_due = max(occ_utc + missed_min,
-                         (snoozed_until + late) if snoozed_until else occ_utc + missed_min)
-        if stage in MUTED_STAGES_ON_PAUSE:
+        missed_due = None
+        if med_id != GLOBAL_MED_ID:
+            try:
+                missed_due = occurrence.close_instant(med["schedule"], occ_utc, tz)
+            except (KeyError, TypeError, ValueError):
+                continue   # a broken schedule is alerted by _process_med
+        if stage in MUTED_STAGES_ON_PAUSE or is_nudge(stage):
             deadline = missed_due
+            if is_nudge(stage):
+                # a nudge is stale once the next slot is due — that one
+                # carries the same message
+                interval = timedelta(minutes=(med.get("escalation") or {}).get(
+                    "late_threshold_minutes", 30))
+                deadline = min(deadline, _ts(tr.intent) + interval)
         elif stage == "catchup":
             # a per-occurrence missed message outlives its missed deadline
             # by the retry grace; the consolidated/global messages don't
@@ -790,7 +823,7 @@ def _rebuild_text(plan: Plan, state: dict, med: dict, ev, tz, stage: str,
     if stage in ("reminder", "snooze_reminder"):
         return reminder_text(med, tz, warning, snoozed=(stage == "snooze_reminder"),
                              draw=draw)
-    if stage == "nudge":
+    if is_nudge(stage):
         return nudge_text(med, tz, warning, draw)
     if stage == "catchup" and med.get("id") is not None and med.get("id") != GLOBAL_MED_ID:
         return missed_text(med)          # per-occurrence missed message
@@ -1207,7 +1240,7 @@ def _execute_sends(plan: Plan, clock: Clock) -> int:
                     if s.stage in ("reminder", "snooze_reminder"):
                         med["state"]["status"] = "reminded"
                         med["state"]["last_reminded"] = recorded.isoformat()
-                    elif s.stage == "nudge":
+                    elif is_nudge(s.stage):
                         med["state"]["status"] = "late"
                         med["state"]["last_reminded"] = recorded.isoformat()
                 elif med is not None:

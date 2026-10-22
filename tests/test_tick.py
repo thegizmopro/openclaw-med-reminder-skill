@@ -103,8 +103,10 @@ def test_watermark_trails_a_pending_escalation(env):
     assert wm <= utc(local_dt(8, 0))
     env.run(local_dt(8, 40))                # nudge still fires
     assert env.sent_count("Late:") == 1
-    env.run(local_dt(9, 40))                # missed still fires
-    assert env.sent_count("Missed:") == 1
+    env.run(local_dt(19, 0))                # nudging continues all day (#11)
+    assert env.sent_count("Late:") == 2
+    env.run(local_dt(8, 5) + dtmod.timedelta(days=1))   # next dose closes it
+    assert len(env.events("missed")) == 1
 
 
 def parse_hb(raw):
@@ -133,16 +135,20 @@ def test_machine_off_through_nudge_sends_nudge_only(env):
     assert not any("Reminder" in m for m in msgs)
 
 
-def test_missed_logged_with_individual_message_when_fresh(env):
+def test_missed_logged_silently_when_next_dose_arrives(env):
+    # #11: an unresolved dose stays open (nudged) until the next dose is due,
+    # then closes as missed — silently; the next dose's reminder goes out
     env.write(meds=[once_daily()])
     env.run(local_dt(7, 55))
     env.run(local_dt(8, 5))
     env.run(local_dt(8, 40))
-    env.run(local_dt(9, 35))                # missed due 09:30, fresh
-    assert env.sent_count("Missed:") == 1
+    env.run(local_dt(23, 55))
+    assert env.events("missed") == []       # old T+90 deadline is gone
+    env.run(local_dt(8, 5) + dtmod.timedelta(days=1))
+    assert env.sent_count("Missed:") == 0
     missed = env.events("missed")
     assert len(missed) == 1 and missed[0]["occurrence_key"] == "2026-04-21T08:00#0"
-    assert env.med_state()["status"] == "missed"
+    assert env.sent_count("Reminder") == 2  # today's and tomorrow's
     assert env.med_state()["missed_count"] == 1
     # next_due rolls past the missed dose (legacy field; compare instants)
     from clock import parse_instant
@@ -185,8 +191,8 @@ def four_meds_two_doses():
 def test_ac14_catchup_one_consolidated_message(env):
     env.write(meds=four_meds_two_doses())
     env.run(local_dt(7, 0))                 # last tick before the gap
-    env.run(local_dt(12, 0))                # machine "off" 07:00–12:00
-    msgs = env.sent()
+    env.run(local_dt(21, 0))                # machine "off" 07:00–21:00: the 08:00
+    msgs = env.sent()                       # doses closed at 20:00 while it was off
     consolidated = [m for m in msgs if "wasn't logged" in m]
     assert len(consolidated) == 1, f"exactly one consolidated message, got {msgs}"
     for i in range(1, 5):
@@ -200,7 +206,8 @@ def test_ac14_catchup_one_consolidated_message(env):
 def test_catchup_line_mentions_the_reply_hint(env):
     env.write(meds=[once_daily()])
     env.run(local_dt(7, 0))
-    env.run(local_dt(15, 0))                # 08:00 dose long past missed
+    env.run(local_dt(9, 0) + dtmod.timedelta(days=1))   # 08:00 dose closed at
+                                                        # 08:00 tomorrow, while off
     m = [x for x in env.sent() if "wasn't logged" in x][0]
     assert "took metformin at 8" in m
     assert "check your med's instructions" in m
@@ -216,8 +223,9 @@ def test_ac12_interval_reminds_nudges_and_misses(env):
     assert env.sent_count("Reminder") == 1
     env.run(local_dt(8, 40))
     assert env.sent_count("Late:") == 1
-    env.run(local_dt(9, 40))
-    assert env.sent_count("Missed:") == 1
+    env.run(local_dt(16, 5))                # next interval dose closes 08:00
+    assert env.sent_count("Missed:") == 0
+    assert env.sent_count("Reminder") == 2
     # anchor keyed by UTC instant
     assert env.events("missed")[0]["occurrence_key"] == "2026-04-21T15:00:00Z"
 
@@ -248,12 +256,13 @@ def test_ac12_interval_20h_gap_produces_exactly_one_message(env):
     env.run(datetime(2026, 4, 20, 8, 40, tzinfo=TZ))
     env.sent_file.write_text("", encoding="utf-8")
     env.run(datetime(2026, 4, 21, 8, 0, tzinfo=TZ))   # 20h later
-    # overdue and never confirmed: 08:00 d1, 16:00 d1 (missed 17:30) and
-    # 00:00 d2 (missed 01:30) are all past their missed deadlines → one
-    # consolidated message; 08:00 d2 == now → its reminder is due as well
+    # overdue and never confirmed: 08:00 d1 (closed 16:00) and 16:00 d1
+    # (closed 00:00) closed while the machine was off → one consolidated
+    # message; 00:00 d2 closes right now as 08:00 d2 arrives (fresh, so
+    # silent) and 08:00 d2's reminder is due as well
     msgs = [m for m in env.sent() if "wasn't logged" in m]
     assert len(msgs) == 1
-    assert "8:00am" in msgs[0] and "4:00pm" in msgs[0] and "12:00am" in msgs[0]
+    assert "8:00am" in msgs[0] and "4:00pm" in msgs[0] and "12:00am" not in msgs[0]
     assert len(env.events("missed")) == 3
     assert env.sent_count("Reminder") == 1
 
@@ -309,11 +318,13 @@ def test_ac19_snooze_stages(env):
     assert len(msgs) == 1 and "snoozed" in msgs[0]
     env.run(local_dt(9, 6))                 # nudge at until+30
     assert env.sent_count("Late:") == 1
-    # missed at max(T+90, until+30) = 09:30 — no earlier (the AC's 09:35
-    # numbers assume different rounding; §3.4's formula is the contract)
-    env.run(local_dt(9, 29))
+    env.run(local_dt(9, 31))                # no new slot yet (next is 09:35)
+    assert env.sent_count("Late:") == 1
+    env.run(local_dt(9, 36))                # cadence re-anchored on the wake
+    assert env.sent_count("Late:") == 2
+    assert {e["stage"] for e in env.events("send_intent")} >= {"nudge-65", "nudge-95"}
     assert env.events("missed") == []
-    env.run(local_dt(9, 31))
+    env.run(local_dt(8, 5) + dtmod.timedelta(days=1))
     assert len(env.events("missed")) == 1
 
 
@@ -341,7 +352,9 @@ def test_ac21_undo_bumps_generation_and_re_reminds(env):
     assert env.events("send_intent")[0]["generation"] == 1
 
 
-def test_ac21_undo_after_missed_writes_silent_missed(env):
+def test_ac21_undo_reopens_the_dose_until_the_next_one(env):
+    # #11: an undone dose is open again — nudged on the cadence — and closes
+    # silently as missed when the next dose arrives
     env.write(meds=[once_daily()])
     env.run(local_dt(7, 55))
     env.seed([
@@ -349,10 +362,13 @@ def test_ac21_undo_after_missed_writes_silent_missed(env):
                               occurrence=occ("08:00")),
         undone_event("med-001", occ("08:00"), local_dt(11, 0)),
     ])
-    env.run(local_dt(11, 5))                # past T+missed → silent missed, no send
+    env.run(local_dt(11, 5))
+    assert env.sent_count("Late:") == 1
+    assert env.events("send_intent")[0]["generation"] == 1
+    env.run(local_dt(8, 5) + dtmod.timedelta(days=1))
     assert len(env.events("missed")) == 1
     assert env.events("missed")[0]["generation"] == 1
-    assert env.sent() == []
+    assert env.sent_count("wasn't logged") == 0
 
 
 # ── Quiet hours (AC 28 + message suppression) ─────────────────────────────────
@@ -374,64 +390,50 @@ def test_ac28_nudge_sent_in_first_30min_of_quiet_hours(env):
 
 def test_nudge_muted_mid_quiet_hours(env):
     env.write(meds=[once_daily(times=("20:00",))])
-    med = env.state()["meds"][0]
-    med["escalation"]["late_threshold_minutes"] = 210   # nudge due 23:30 (muted)
-    med["escalation"]["missed_threshold_minutes"] = 220  # missed due 23:40
-    env.state_file.write_text(json.dumps(env.state()), encoding="utf-8")
+    state = env.state()
+    state["meds"][0]["escalation"]["late_threshold_minutes"] = 210   # slots 23:30, 03:00, 06:30, 10:00
+    env.state_file.write_text(json.dumps(state), encoding="utf-8")
     env.run(local_dt(19, 55))
     env.run(local_dt(20, 5))                # reminder
     env.run(local_dt(23, 55))
     assert env.sent_count("Late:") == 0     # nudge muted mid-quiet
-    assert len(env.events("missed")) == 1   # …but the miss is logged silently
-    assert env.sent_count("Missed:") == 0
-    assert env.sent_count("Late:") == 0
+    env.run(local_dt(3, 5) + dtmod.timedelta(days=1))
+    env.run(local_dt(7, 5) + dtmod.timedelta(days=1))
+    assert env.sent_count("Late:") == 0     # 03:00 and 06:30 muted, no burst at 07:00
+    env.run(local_dt(10, 5) + dtmod.timedelta(days=1))
+    assert env.sent_count("Late:") == 1     # first slot after quiet hours
+
+
+def night_dose_closed_in_quiet_hours(env):
+    """23:30 daily dose never taken: it closes as missed when the next
+    night's 23:30 dose arrives — inside quiet hours."""
+    env.write(meds=[once_daily(times=("23:30",))])
+    env.run(local_dt(23, 25))
+    env.run(local_dt(23, 35))               # reminder (quiet-exempt)
+    env.run(local_dt(23, 35) + dtmod.timedelta(days=1))  # closes, quiet
 
 
 def test_missed_event_logged_without_message_in_quiet_hours(env):
-    env.write(meds=[once_daily(times=("20:00",))])
-    med = env.state()["meds"][0]
-    med["escalation"]["late_threshold_minutes"] = 130   # nudge due 22:10 (quiet)
-    med["escalation"]["missed_threshold_minutes"] = 300  # missed due 01:00
-    env.state_file.write_text(json.dumps(env.state()), encoding="utf-8")
-    env.run(local_dt(19, 55))
-    env.run(local_dt(20, 5))                # reminder
-    env.run(local_dt(22, 5))                # nudge not yet due
-    env.run(local_dt(1, 5) + dtmod.timedelta(days=1))    # 01:05, quiet
+    night_dose_closed_in_quiet_hours(env)
     assert len(env.events("missed")) == 1
     assert env.sent_count("Missed:") == 0
-    assert env.sent_count("Late:") == 0     # the 22:10 nudge stays muted
+    assert env.sent_count("wasn't logged") == 0
 
 
 def test_ac28_overnight_summary_after_quiet_hours_end(env):
-    env.write(meds=[once_daily(times=("20:00",))])
-    med = env.state()["meds"][0]
-    med["escalation"]["late_threshold_minutes"] = 130
-    med["escalation"]["missed_threshold_minutes"] = 300   # missed due 01:00
-    env.state_file.write_text(json.dumps(env.state()), encoding="utf-8")
-    env.run(local_dt(19, 55))
-    env.run(local_dt(20, 5))                # reminder
-    env.run(local_dt(22, 5))
-    env.run(local_dt(1, 5) + dtmod.timedelta(days=1))    # silent missed overnight
-    env.run(local_dt(7, 5) + dtmod.timedelta(days=1))    # first tick after 07:00
+    night_dose_closed_in_quiet_hours(env)
+    env.run(local_dt(7, 5) + dtmod.timedelta(days=2))    # first tick after 07:00
     summary = [m for m in env.sent() if "While you slept" in m]
     assert len(summary) == 1
-    assert "Metformin (8:00pm)" in summary[0]
+    assert "Metformin (11:30pm)" in summary[0]
     # once per local date
-    env.run(local_dt(7, 10) + dtmod.timedelta(days=1))
+    env.run(local_dt(7, 10) + dtmod.timedelta(days=2))
     assert len([m for m in env.sent() if "While you slept" in m]) == 1
 
 
 def test_overnight_skipped_when_more_than_4h_late(env):
-    env.write(meds=[once_daily(times=("20:00",))])
-    med = env.state()["meds"][0]
-    med["escalation"]["late_threshold_minutes"] = 130
-    med["escalation"]["missed_threshold_minutes"] = 300
-    env.state_file.write_text(json.dumps(env.state()), encoding="utf-8")
-    env.run(local_dt(19, 55))
-    env.run(local_dt(20, 5))
-    env.run(local_dt(22, 5))
-    env.run(local_dt(1, 5) + dtmod.timedelta(days=1))
-    env.run(local_dt(12, 0) + dtmod.timedelta(days=1))   # way past 07:00+4h
+    night_dose_closed_in_quiet_hours(env)
+    env.run(local_dt(12, 0) + dtmod.timedelta(days=2))   # way past 07:00+4h
     assert env.sent_count("While you slept") == 0
 
 
@@ -515,19 +517,20 @@ def test_72h_cap_sends_away_message_and_limits_catchup(env):
     assert len(away) == 1
     assert "over 3 days" in away[0]
     # 5 days of once-daily doses, capped at 72h: the window at 12:00 covers
-    # Apr 18 12:00 → Apr 21 12:00, so exactly the doses on 19/20/21 are
-    # enumerated (all past missed → silent + one consolidated message)
-    assert len(env.events("missed")) == 3
+    # Apr 18 12:00 → Apr 21 12:00, so the doses on 19/20/21 are enumerated.
+    # 19 and 20 closed when the next dose arrived (silent + one consolidated
+    # message); today's 08:00 is still open, so it is nudged instead (#11)
+    assert len(env.events("missed")) == 2
     assert env.sent_count("wasn't logged") == 1
+    assert env.sent_count("Late:") == 1
 
 
 def test_72h_cap_backfills_at_most_three_days(env):
     env.write(meds=[once_daily()])
     env.run(local_dt(12, 0) - dtmod.timedelta(days=5))
     env.run(local_dt(12, 0))
-    assert len(env.events("missed")) == 3
     keys = sorted(e["occurrence_key"] for e in env.events("missed"))
-    assert keys == ["2026-04-19T08:00#0", "2026-04-20T08:00#0", "2026-04-21T08:00#0"]
+    assert keys == ["2026-04-19T08:00#0", "2026-04-20T08:00#0"]
 
 
 # ── AC 16: fault isolation ────────────────────────────────────────────────────

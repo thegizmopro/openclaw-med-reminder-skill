@@ -124,7 +124,11 @@ def test_weekly_sun_2330_nudge_lands_monday_midnight(env):
     env.run(dtmod.datetime(2026, 4, 20, 0, 5, tzinfo=TZ))     # Mon 00:05
     assert env.sent_count("Late:") == 1                       # nudge due Mon 00:00
     env.run(dtmod.datetime(2026, 4, 20, 1, 5, tzinfo=TZ))     # Mon 01:05
-    assert len(env.events("missed")) == 1                     # missed due Mon 01:00
+    assert env.events("missed") == []                         # still open (#11)
+    assert env.sent_count("Late:") == 2                       # 01:00 slot (quiet is daytime here)
+    # a weekly dose closes at CLOSE_CAP (25h), not a week later
+    env.run(dtmod.datetime(2026, 4, 21, 0, 35, tzinfo=TZ))    # Tue 00:35
+    assert len(env.events("missed")) == 1
 
 
 def test_weekly_wrong_day_never_reminds(env):

@@ -231,7 +231,9 @@ def test_end_date_day_still_fires(env):
     env.run(local_dt(7, 55))
     env.run(local_dt(8, 5))                    # reminder on the last day
     assert env.sent_count("Reminder") == 1
-    env.run(local_dt(9, 40))                   # missed still fires for it
+    # it closes when the (out-of-course) next dose would arrive — missed
+    # still fires for it, while Wednesday's dose itself is never enumerated
+    env.run(local_dt(8, 5) + dtmod.timedelta(days=1))
     missed = env.events("missed")
     assert len(missed) == 1 and missed[0]["occurrence_key"] == "2026-04-21T08:00#0"
 
