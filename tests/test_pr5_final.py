@@ -4,8 +4,8 @@ PR 5 final tests — SKILL.md and docs (issue #1 §8, AC 38).
 SKILL.md must have valid frontmatter, route every write through reply.py
 (no dispatch.py confirm/defer, no safe-write.sh write instructions, no
 agent full-state writes), document the reply intents and exit codes, and
-carry the interview quiet-hours rules. CLAUDE.md is not shipped, and
-safe-write.sh is a thin shim around safe_write.py.
+carry the interview quiet-hours rules. CLAUDE.md is not shipped, and the
+retired safe-write.sh shim stays gone (#11).
 """
 import os
 import re
@@ -161,36 +161,7 @@ def test_claude_md_not_shipped():
     assert not (REPO / "CLAUDE.md").exists()
 
 
-# ── safe-write.sh is a thin shim (issue §8) ──────────────────────────────────
+# ── safe-write.sh is retired (#11) ───────────────────────────────────────────
 
-def test_safe_write_sh_is_a_thin_wrapper():
-    sh = (REPO / "safe-write.sh").read_text(encoding="utf-8")
-    assert "safe_write.py" in sh, "the shim must exec safe_write.py"
-    assert re.search(r"exec\s+python3", sh), "the shim must exec, not duplicate"
-    # The inline validator (and its lock/mtime machinery) is gone.
-    for gone in ("VALIDATION ERROR", "VALIDATE_FILE", "MTIME_BEFORE", "mkdir \"$LOCK_DIR\""):
-        assert gone not in sh
-
-
-@pytest.mark.skipif(shutil.which("bash") is None, reason="bash not available")
-def test_safe_write_sh_shim_end_to_end(tmp_path):
-    """The deprecated shim still writes atomically via safe_write.py."""
-    state = tmp_path / "meds-state.json"
-    payload = (
-        '{"version":"1","global":{"timezone":"America/Los_Angeles",'
-        '"quiet_hours":{"start":"22:00","end":"07:00"},"paused":false,'
-        '"digest_time":"07:30","delivery_channel":"telegram"},"meds":[]}'
-    )
-    env = dict(os.environ)
-    env.update({
-        "MEDS_STATE_FILE": str(state),
-        "MEDS_LOG_FILE": str(tmp_path / "w.log"),
-        "MEDS_HISTORY_FILE": str(tmp_path / "h.jsonl"),
-    })
-    run = subprocess.run(
-        ["bash", str(REPO / "safe-write.sh")], input=payload,
-        capture_output=True, text=True, timeout=60, env=env,
-    )
-    assert run.returncode == 0, run.stderr
-    assert state.exists()
-    assert '"meds"' in state.read_text(encoding="utf-8")
+def test_safe_write_sh_removed():
+    assert not (REPO / "safe-write.sh").exists()

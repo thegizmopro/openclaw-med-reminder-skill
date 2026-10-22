@@ -251,7 +251,7 @@ Two files change at runtime, both next to the scripts by default:
 - **`history.jsonl`** — the append-only event log and source of truth. Every reminder, dose, nudge, skip, snooze, and undo is one line here. Adherence and the digest's 7-day line are computed from it, and it is never trimmed.
 - **`meds-state.json`** — the editable cache: prescription, schedule, quiet hours, and the last 30 events mirrored per med for the editor and older tooling.
 
-All writes go through `safe_write.py`: structural validation, an OS file lock, a sha256 write token (a stale token aborts — two writers can never clobber each other), a rotating `.bak`, then an atomic replace. `reply.py show-state` prints the current token for CLI writers. `safe-write.sh` remains as a deprecated shim that execs `safe_write.py`.
+All writes go through `safe_write.py`: structural validation, an OS file lock, a sha256 write token (a stale token aborts — two writers can never clobber each other), a rotating `.bak`, then an atomic replace. `reply.py show-state` prints the current token for CLI writers.
 
 On POSIX, state, history, backups, tmp files, and logs are created `0600`.
 
@@ -313,7 +313,6 @@ openclaw-med-reminder-skill/
 ├── occurrence.py, clock.py  # UTC occurrence helpers, injectable Clock
 ├── setup-tasks.py           # registers the tick (Windows/macOS/Linux)
 ├── safe_write.py            # atomic validated state writer + transact
-├── safe-write.sh            # deprecated shim → safe_write.py
 ├── generate-passport.py     # med passport HTML generator
 ├── doctor.py                # health check: state, sender, tick, heartbeat
 ├── editor.html              # browser-based state editor

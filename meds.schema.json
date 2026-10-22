@@ -257,7 +257,7 @@
       "type": "object",
       "required": ["status", "last_taken", "last_reminded", "next_due", "missed_count", "history"],
       "additionalProperties": false,
-      "description": "Runtime state. Written only by safe-write.sh (dispatch) or the AI reply handler.",
+      "description": "Runtime state. Written only through safe_write.py (the tick and reply.py).",
       "properties": {
         "status": {
           "type": "string",
