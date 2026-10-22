@@ -9,6 +9,8 @@ Separate from dispatch.py (the scheduler) because these have different:
   - retry semantics: agent can re-invoke; scheduler uses advisory skip
 
 Subcommands (issue #1 §6 — all writes go through transact):
+    init --timezone TZ --quiet-start HH:MM --quiet-end HH:MM --channel NAME
+                               Create meds-state.json (first run only)
     confirm <med-id>           Mark one med as taken (prescribed dose)
     confirm --all              Mark all scheduled, non-paused meds as taken
     skip <med-id>              Skip a dose (past/current, or --dose HH:MM)
@@ -1151,6 +1153,66 @@ def handle_set_quiet_hours(start: str, end: str, dry_run: bool,
     log.info("SET-QUIET-HOURS %s-%s", start, end)
 
 
+# ── Init (first run, #10) ──────────────────────────────────────────────────────
+
+def handle_init(timezone_name: str, quiet_start: str, quiet_end: str,
+                digest_time: Optional[str], channel: str, dry_run: bool) -> None:
+    """
+    Create meds-state.json from the interview's global answers — no meds,
+    no runtime state (meds go in through add-med). Refuses when the file
+    already exists, so it can never clobber a live setup. The digest
+    defaults to wake time + 30 min, pulled back to 5 min before quiet
+    hours when that would land inside them.
+    """
+    if _safe_write_mod.STATE_FILE.exists():
+        print(f"Error: {_safe_write_mod.STATE_FILE} already exists — use "
+              "set-quiet-hours / add-med / edit-med to change it.")
+        raise SystemExit(EXIT_BAD_OPTION)
+    try:
+        ZoneInfo(timezone_name)
+    except (ValueError, KeyError, OSError):
+        print(f"Error: unknown timezone '{timezone_name}' — use an IANA name "
+              "like America/Los_Angeles.")
+        raise SystemExit(EXIT_BAD_OPTION)
+    for label, value in (("--quiet-start", quiet_start), ("--quiet-end", quiet_end),
+                         ("--digest-time", digest_time)):
+        if value is not None and not _HHMM_RE.match(value):
+            print(f"Error: {label} must be HH:MM (got '{value}').")
+            raise SystemExit(EXIT_BAD_OPTION)
+    if not channel.strip():
+        print("Error: --channel must not be empty.")
+        raise SystemExit(EXIT_BAD_OPTION)
+
+    quiet = {"start": quiet_start, "end": quiet_end}
+    if digest_time is None:
+        digest = (_hhmm_mins(quiet_end) + 30) % 1440
+        if _in_quiet_window(digest, quiet):
+            digest = (_hhmm_mins(quiet_start) - 5) % 1440
+        digest_time = _mins_hhmm(digest)
+
+    state = {
+        "version": "1",
+        "global": {
+            "timezone": timezone_name,
+            "quiet_hours": quiet,
+            "paused": False,
+            "digest_time": digest_time,
+            "delivery_channel": channel.strip(),
+        },
+        "meds": [],
+    }
+    if dry_run:
+        print(f"[DRY RUN] Would create {_safe_write_mod.STATE_FILE}: "
+              f"{timezone_name}, quiet hours {quiet_start}–{quiet_end}, "
+              f"digest {digest_time}, channel {channel.strip()}.")
+        return
+    # 'absent': the write is refused if the file appeared in the meantime
+    _safe_write_mod.safe_write(state, expected_sha256="absent")
+    print(f"Created {_safe_write_mod.STATE_FILE}: {timezone_name}, quiet hours "
+          f"{quiet_start}–{quiet_end}, digest {digest_time}. Add meds with add-med.")
+    log.info("INIT %s", _safe_write_mod.STATE_FILE)
+
+
 # ── Remove / status / show-state (issue #1 §6) ─────────────────────────────────
 
 def handle_remove(med_id: str, yes: bool, dry_run: bool,
@@ -1342,6 +1404,18 @@ def main() -> None:
     p_edit.add_argument("json_src", nargs="?", default="-", metavar="-|PATH",
                         help="'-' (stdin, default) or a path to the JSON file")
 
+    p_init = sub.add_parser("init", help="Create meds-state.json (first run only)")
+    p_init.add_argument("--timezone", required=True, metavar="TZ",
+                        help="IANA timezone, e.g. America/Los_Angeles")
+    p_init.add_argument("--quiet-start", required=True, metavar="HH:MM",
+                        help="Quiet hours start (bedtime)")
+    p_init.add_argument("--quiet-end", required=True, metavar="HH:MM",
+                        help="Quiet hours end (wake time)")
+    p_init.add_argument("--digest-time", default=None, metavar="HH:MM",
+                        help="Daily digest time (default: quiet end + 30 min)")
+    p_init.add_argument("--channel", required=True, metavar="NAME",
+                        help="Delivery channel, e.g. telegram")
+
     p_quiet = sub.add_parser("set-quiet-hours", help="Set the quiet-hours window")
     p_quiet.add_argument("start", metavar="HH:MM", help="Quiet hours start")
     p_quiet.add_argument("end", metavar="HH:MM", help="Quiet hours end")
@@ -1412,6 +1486,9 @@ def main() -> None:
             parser.error("edit-med requires a med_id or --position")
         handle_edit_med(args.med_id, _read_json_input(args.json_src), args.dry_run,
                         position=args.position)
+    elif args.mode == "init":
+        handle_init(args.timezone, args.quiet_start, args.quiet_end,
+                    args.digest_time, args.channel, args.dry_run)
     elif args.mode == "set-quiet-hours":
         handle_set_quiet_hours(args.start, args.end, args.dry_run)
     elif args.mode == "remove":

@@ -263,25 +263,14 @@ register the scheduler. Never compose and write the full state yourself.
    no meds, no runtime state:
 
    ```bash
-   python3 - << 'EOF' | python3 safe_write.py --expected-sha256 absent
-   {
-     "version": "1",
-     "global": {
-       "timezone": "America/Los_Angeles",
-       "quiet_hours": { "start": "22:00", "end": "07:00" },
-       "paused": false,
-       "digest_time": "07:30",
-       "delivery_channel": "telegram"
-     },
-     "meds": []
-   }
-   EOF
+   python3 reply.py init --timezone America/Los_Angeles \
+       --quiet-start 22:00 --quiet-end 07:00 --channel telegram
    ```
 
-   This is the only write that doesn't go through `reply.py`, and it is safe
-   because the `absent` token means the file must not exist yet and the content
-   has nothing that can go stale. Fill the values from the interview;
-   `delivery_channel` comes from context (never ask).
+   Fill the values from the interview; `--channel` comes from context (never
+   ask). `--digest-time` is optional — it defaults to wake time + 30 min
+   (Section 1's rule), so pass it only if the user named one. `init` refuses
+   when the file already exists, so it can never overwrite a live setup.
 
 3. **Add every med through Section 7's `add-med`** so validation, id assignment
    and the §1/§3 quiet-hours checks run per med:
@@ -551,7 +540,7 @@ Do not recap fields the user didn't ask about. Do not show internal IDs.
 | User confirms an `as_needed` med | Run `reply.py confirm <id>` — it works for as_needed; no next_due is set |
 | `add-med` / `edit-med` / `set-quiet-hours` refuses a quiet-hours conflict | Relay the suggested fix verbatim; move the dose or adjust quiet hours, then re-run |
 | `--position N` refused as stale | The digest order is from a previous day — resolve the med by name instead |
-| State file not found | Tell the user; the command's error prints the fix (`cp meds-state.template.json meds-state.json`) and the path from `MEDS_STATE_FILE` |
+| State file not found | First run: run the interview and `reply.py init` (Section 4). Otherwise tell the user the path from `MEDS_STATE_FILE` |
 
 ---
 
