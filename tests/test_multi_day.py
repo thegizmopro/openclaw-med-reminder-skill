@@ -105,10 +105,12 @@ def test_digest_labels_multi_day():
         make_med(med_id="med-003", name="Legacy", frequency="weekly",
                  times=["09:00"], day_of_week="mon"),
     ])
-    text = tick.digest_text(state, [], TZ, local_dt(9, 0, day=20))
-    assert "Metformin 500mg | Mon–Fri 9:00am" in text
-    assert "Methotrexate 500mg | Tue+Sat 9:00am" in text
-    assert "Legacy 500mg | Mon 9:00am" in text      # legacy form unchanged
+    # each med is listed only on its own days, so check on Mon and on Tue
+    monday = tick.digest_text(state, [], TZ, local_dt(9, 0, day=20))
+    tuesday = tick.digest_text(state, [], TZ, local_dt(9, 0, day=21))
+    assert "Metformin 500mg | Mon–Fri 9:00am" in monday
+    assert "Legacy 500mg | Mon 9:00am" in monday     # legacy form unchanged
+    assert "Methotrexate 500mg | Tue+Sat 9:00am" in tuesday
 
 
 def test_status_labels_multi_day(state_file, capsys):

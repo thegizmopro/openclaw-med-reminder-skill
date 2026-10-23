@@ -80,8 +80,9 @@ def test_digest_lists_weekly_day(env):
     env.write(meds=[make_med(med_id="med-001", frequency="weekly",
                              times=["09:00"], day_of_week="mon")],
               digest_time="07:30")
-    env.run(local_dt(7, 0))
-    env.run(local_dt(7, 32))
+    monday = dtmod.timedelta(days=-1)              # Mon Apr 20 — its day
+    env.run(local_dt(7, 0) + monday)
+    env.run(local_dt(7, 32) + monday)
     assert "Mon 9:00am" in digest_msgs(env)[0]
 
 
@@ -170,3 +171,53 @@ def test_empty_meds_no_digest(env):
     env.run(local_dt(7, 0))
     env.run(local_dt(7, 32))
     assert env.sent() == []
+
+
+# ── weekly meds only on their days ────────────────────────────────────────────
+
+def weekly_and_daily():
+    return [make_med(med_id="med-001", name="MOTS-c", frequency="weekly",
+                     times=["08:00"], day_of_week=["tue", "sat"]),
+            make_med(med_id="med-002", name="Ipamorelin", frequency="weekly",
+                     times=["19:00"], day_of_week=["mon", "tue", "wed", "thu", "fri"]),
+            make_med(med_id="med-003", name="T", frequency="once_daily", times=["08:00"])]
+
+
+def digest_on(env, day_offset):
+    d = dtmod.timedelta(days=day_offset)
+    env.run(local_dt(7, 0) + d)
+    env.run(local_dt(7, 32) + d)
+    return digest_msgs(env)[-1]
+
+
+def test_digest_skips_weekly_meds_on_their_off_days(env):
+    env.write(meds=weekly_and_daily(), digest_time="07:30")
+    friday = digest_on(env, 3)                       # Fri Apr 24
+    assert "MOTS-c" not in friday
+    assert "1. Ipamorelin" in friday and "2. T " in friday
+
+
+def test_digest_lists_weekly_meds_on_their_days(env):
+    env.write(meds=weekly_and_daily(), digest_time="07:30")
+    tuesday = digest_on(env, 0)                      # Tue Apr 21
+    assert "1. MOTS-c" in tuesday and "2. Ipamorelin" in tuesday and "3. T " in tuesday
+    saturday = digest_on(env, 4)                     # Sat Apr 25
+    assert "1. MOTS-c" in saturday and "Ipamorelin" not in saturday
+
+
+def test_position_order_matches_the_listed_meds(env):
+    env.write(meds=weekly_and_daily(), digest_time="07:30")
+    digest_on(env, 3)
+    assert env.state()["global"]["last_digest_order"] == ["med-002", "med-003"]
+
+
+def test_off_day_med_keeps_its_supplies_line(env):
+    meds = weekly_and_daily()
+    meds[0]["inventory_unit"] = "vial"
+    meds[0]["doses_per_unit"] = 10
+    env.write(meds=meds, digest_time="07:30")
+    env.seed([event_store.new_event("med-001", "restocked",
+                                    local_dt(6, 0) + dtmod.timedelta(days=3), qty=2)])
+    friday = digest_on(env, 3)
+    assert "Supplies:\nMOTS-c: ~2 vials left" in friday
+    assert "1. MOTS-c" not in friday
