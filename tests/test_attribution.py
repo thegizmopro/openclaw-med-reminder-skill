@@ -245,9 +245,10 @@ def test_min_gap_interval_half_interval():
     assert min_gap(make_med(frequency="interval", interval_hours=8)) == timedelta(hours=4)
 
 
-def test_min_gap_weekly_24h():
+def test_min_gap_weekly_from_its_days():
+    # one day a week → half of 7 days (#25; was a flat 24h)
     assert min_gap(make_med(frequency="weekly", times=["09:00"], day_of_week="mon")) == \
-        timedelta(hours=24)
+        timedelta(hours=84)
 
 
 def test_min_gap_as_needed_4h():

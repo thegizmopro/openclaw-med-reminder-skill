@@ -70,7 +70,8 @@ def min_gap(med: dict) -> timedelta:
 
     Per-med min_gap_hours when set; otherwise half the shortest scheduled
     gap: once daily → 12h, 08:00/20:00 → 6h, interval N → N/2,
-    weekly → 24h, as_needed → 4h.
+    weekly → from its days (Mon–Fri 19:00 → 12h, Tue+Sat → 36h, one day a
+    week → 3.5d; #25), as_needed → 4h.
     """
     mgh = med.get("min_gap_hours")
     if mgh:
@@ -79,8 +80,16 @@ def min_gap(med: dict) -> timedelta:
     freq = sched.get("frequency")
     if freq == "interval":
         return timedelta(hours=float(sched.get("interval_hours") or 4) / 2)
-    if freq == "weekly":
-        return timedelta(hours=24)
+    if freq == "weekly" and sched.get("day_of_week"):
+        # minute-of-week of every dose, then the shortest cyclic gap (#25):
+        # a flat 24h treated a Mon–Fri med's next-day dose as a duplicate
+        week = 7 * 24 * 60
+        days = _occ.day_indexes(sched["day_of_week"])
+        slots = sorted(d * 24 * 60 + _hhmm_minutes(t)
+                       for d in days for t in (sched.get("times") or ["08:00"]))
+        gaps = [(slots[(i + 1) % len(slots)] - slots[i]) % week or week
+                for i in range(len(slots))]
+        return timedelta(minutes=min(gaps) / 2)
     if freq == "as_needed":
         return timedelta(hours=4)
     times = sorted(sched.get("times") or ["08:00"])
@@ -113,6 +122,52 @@ def last_taken_before(events, med_id: str, taken_at: datetime) -> Optional[dict]
         if at < taken_at and (best_at is None or at > best_at):
             best, best_at = e, at
     return best
+
+
+def duplicate_of(events, med: dict, occ, taken_at: datetime) -> Optional[dict]:
+    """
+    The earlier `taken` this confirm would duplicate, or None (#25).
+
+    - Crediting a dose that is already logged taken (e.g. a --dose pin) is
+      always a duplicate.
+    - Otherwise only a log within min_gap of the previous one can be — and
+      not when this confirm credits the next scheduled dose after the one
+      the previous log credited (normal progression: yesterday's dose, then
+      today's), however close they are. A back-fill of an OLDER dose, an
+      early credit of a future dose, or an unattributed log right after a
+      dose still counts.
+    """
+    if occ is not None:
+        gen = generation(events, med["id"], occ.key)
+        if outcome_for(events, med["id"], occ.key, gen) == "taken":
+            return next((e for e in reversed(list(events))
+                         if e.get("event") == "taken" and e.get("med_id") == med["id"]
+                         and e.get("occurrence_key") == occ.key
+                         and int(e.get("generation") or 0) == gen), None)
+    last = last_taken_before(events, med["id"], taken_at)
+    if last is None or taken_at - _taken_instant(last) >= min_gap(med):
+        return None
+    if (occ is not None and last.get("occurrence_utc")
+            and parse_instant(last["occurrence_utc"]) < occ.utc <= taken_at):
+        return None
+    return last
+
+
+def when_label(instant: datetime, tz: ZoneInfo, ref: datetime) -> str:
+    """'today at 8:45pm' / 'yesterday at 8:45pm' / 'Mon at 8:45pm' /
+    'Oct 14 at 8:45pm' — the local day of `instant` relative to `ref` (#25)."""
+    local = instant.astimezone(tz)
+    days = (ref.astimezone(tz).date() - local.date()).days
+    clock_str = f"{local.hour % 12 or 12}:{local.minute:02d}{'am' if local.hour < 12 else 'pm'}"
+    if days == 0:
+        day = "today"
+    elif days == 1:
+        day = "yesterday"
+    elif 1 < days < 7:
+        day = f"{local:%a}"
+    else:
+        day = f"{local:%b} {local.day}"
+    return f"{day} at {clock_str}"
 
 
 def taken_within(events, med_id: str, lo: datetime, hi: datetime) -> Optional[dict]:

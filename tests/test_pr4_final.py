@@ -190,7 +190,7 @@ def test_double_dose_warning_after_command_confirm(tmp_path, monkeypatch):
 
     msgs = env.sent()
     assert "You logged Metformin" not in msgs[0]      # day 1: clean
-    assert "You logged Metformin at 9:00pm" in msgs[-1]
+    assert "You logged Metformin yesterday at 9:00pm" in msgs[-1]
     assert "Don't take another" in msgs[-1]
 
 
