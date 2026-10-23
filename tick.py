@@ -176,9 +176,11 @@ def _in_window(med: dict, today) -> bool:
 
 # ── Message builders ──────────────────────────────────────────────────────────
 
-def double_dose_warning(med: dict, taken_event: dict, tz: ZoneInfo) -> str:
+def double_dose_warning(med: dict, taken_event: dict, tz: ZoneInfo, ref=None) -> str:
+    """The caution on a reminder/nudge for a dose logged shortly before it;
+    names the day relative to `ref`, the dose being reminded about (#25)."""
     at = parse_instant(taken_event.get("taken_at_utc") or taken_event["ts_utc"])
-    return (f"You logged {med['name']} at {fmt_12h(at.astimezone(tz))}. "
+    return (f"You logged {med['name']} {attribution.when_label(at, tz, ref or at)}. "
             "Don't take another unless your prescriber says so. "
             "Reply 'took it' only if you take this dose.")
 
@@ -659,7 +661,7 @@ def _process_occurrence(plan: Plan, state: dict, med: dict, occ: Occurrence,
 def _double_dose_guard(ev, med: dict, T, tz) -> str:
     gap = attribution.min_gap(med)
     last = attribution.taken_within(ev, med["id"], T - gap, T)
-    return double_dose_warning(med, last, tz) if last else ""
+    return double_dose_warning(med, last, tz, ref=T) if last else ""
 
 
 def _log_missed(plan: Plan, state: dict, med: dict, occ: Occurrence, gen: int, tz):

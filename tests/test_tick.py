@@ -291,7 +291,7 @@ def test_ac22_reminder_includes_double_dose_warning(env):
     # gap is 12h; the 02:30 taken is 5.5h before T=08:00 → within the gap
     env.run(local_dt(8, 5))
     msg = env.sent()[0]
-    assert "You logged Metformin at 2:30am" in msg
+    assert "You logged Metformin today at 2:30am" in msg
     assert "Don't take another unless your prescriber says so" in msg
 
 

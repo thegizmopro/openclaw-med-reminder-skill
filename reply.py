@@ -40,7 +40,8 @@ Options:
     --dry-run                  Print without writing state
     --state PATH               Path to meds-state.json (overrides MEDS_STATE_FILE)
 
-Exit codes (confirm): 3 = duplicate within the med's minimum gap (a
+Exit codes (confirm): 3 = duplicate: that dose is already logged, or a log
+within the med's minimum gap that isn't simply the next scheduled dose (a
 --force nonce is printed); 4 = ambiguous which dose (the agent asks).
 
 Environment:
@@ -88,12 +89,13 @@ from attribution import (
     DIGEST_GRACE,
     EARLY_WINDOW,
     attribute,
+    duplicate_of,
     generation as occurrence_generation,
-    last_taken_before,
     min_gap,
     nearest_dose_occurrence,
     outcome_for,
     resolve_taken_at,
+    when_label,
 )
 from datetime import datetime, timedelta, timezone
 from occurrence import Occurrence
@@ -298,13 +300,13 @@ def handle_confirm(med_id: str, dose_taken: Optional[str], dry_run: bool,
     history = _event_store_mod.load_events(_safe_write_mod.history_file())
     occ = _decide_credit(med, history, taken_at, tz, dose_pin)
 
-    last = last_taken_before(history, med_id, taken_at)
     gap = min_gap(med)
-    duplicate = last is not None and (taken_at - _taken_instant(last)) < gap
+    last = duplicate_of(history, med, occ, taken_at)
 
     if dry_run:
-        if duplicate:
-            print(f"[DRY RUN] Would refuse: already logged within {gap}.")
+        if last is not None:
+            print(f"[DRY RUN] Would refuse: already logged "
+                  f"{when_label(_taken_instant(last), tz, now)}.")
         else:
             slot = _fmt_12h(occ.local) if occ else "no scheduled dose"
             print(f"[DRY RUN] Would log {med['name']} as your {slot} dose.")
@@ -318,15 +320,15 @@ def handle_confirm(med_id: str, dose_taken: Optional[str], dry_run: bool,
             raise ValueError(f"med {med_id} disappeared mid-confirm")
         # re-decide under the lock — a tick or another confirm may have acted
         occ_c = _decide_credit(med_c, history_view, taken_at, tz, dose_pin)
-        last_c = last_taken_before(history_view, med_id, taken_at)
-        dup_c = last_c is not None and (taken_at - _taken_instant(last_c)) < gap
+        last_c = duplicate_of(history_view, med_c, occ_c, taken_at)
+        dup_c = last_c is not None
 
         if dup_c and not (force and _valid_nonce(state_copy, med_id, force, now)):
             if force:
                 print("Error: that override nonce is not valid (wrong or older "
                       "than 10 minutes). Here is a fresh one.")
             nonce = _offer_nonce(state_copy, med_id, taken_at, now)
-            outcome["duplicate"] = (last_c, nonce)
+            outcome["duplicate"] = (last_c, occ_c, nonce)
             return state_copy, []
 
         if dup_c and force:
@@ -338,11 +340,14 @@ def handle_confirm(med_id: str, dose_taken: Optional[str], dry_run: bool,
     _safe_write_mod.transact(fn, clock=clock)
 
     if "duplicate" in outcome:
-        last_ev, nonce = outcome["duplicate"]
+        last_ev, dup_occ, nonce = outcome["duplicate"]
         at = _taken_instant(last_ev).astimezone(tz)
-        print(f"Already logged {med['name']} at {_fmt_12h(at)}. "
-              f"That's within the {int(gap.total_seconds() // 3600)}-hour "
-              f"minimum gap for this med.")
+        same_dose = dup_occ is not None and last_ev.get("occurrence_key") == dup_occ.key
+        why = (f"That's your {_fmt_12h(dup_occ.local)} dose — it's already logged."
+               if same_dose else
+               f"That's within the {int(gap.total_seconds() // 3600)}-hour "
+               f"minimum gap for this med.")
+        print(f"Already logged {med['name']} {when_label(at, tz, now)}. {why}")
         print(f"If you really took it again, rerun with: --force {nonce} "
               f"(valid 10 minutes)")
         log.info("CONFIRM [%s] refused as duplicate of %s", med_id, at.isoformat())
@@ -389,8 +394,7 @@ def handle_confirm_all(dose_taken: Optional[str], dry_run: bool,
             except SystemExit:
                 notes.append(f"{med['name']} (which dose? confirm it individually)")
                 continue
-            last = last_taken_before(history_view, med["id"], now)
-            if last is not None and (now - _taken_instant(last)) < min_gap(med):
+            if duplicate_of(history_view, med, occ, now) is not None:
                 notes.append(f"{med['name']} (already logged recently)")
                 continue
             events.append(_apply_taken(state_copy, med, occ, now, dose_taken, history_view))
