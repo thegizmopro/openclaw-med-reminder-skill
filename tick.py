@@ -174,6 +174,18 @@ def _in_window(med: dict, today) -> bool:
     return True
 
 
+def _due_on(med: dict, today) -> bool:
+    """True when the med belongs in `today`'s digest: inside its date range
+    and, for a weekly med, on one of its days (a Tue+Sat med isn't listed
+    on Friday). Daily, interval and as-needed meds are listed every day."""
+    if not _in_window(med, today):
+        return False
+    sched = med.get("schedule") or {}
+    if sched.get("frequency") == "weekly" and sched.get("day_of_week"):
+        return today.weekday() in occurrence.day_indexes(sched["day_of_week"])
+    return True
+
+
 # ── Message builders ──────────────────────────────────────────────────────────
 
 def double_dose_warning(med: dict, taken_event: dict, tz: ZoneInfo, ref=None) -> str:
@@ -1002,7 +1014,7 @@ def _daily_messages(plan: Plan, state: dict, ev, idx, tz):
     if digest_due <= now <= digest_due + DAILY_LATE_LIMIT:
         key = f"digest#{today.isoformat()}"
         listed = [m for m in state.get("meds", [])
-                  if not m.get("paused") and _in_window(m, today)]
+                  if not m.get("paused") and _due_on(m, today)]
         # a pending course-complete note sends the digest even with nothing
         # left to list (PR 6) — a lone ended course still gets announced
         if not _sent_for(idx, key, "digest") and (
@@ -1131,7 +1143,7 @@ def digest_text(state: dict, ev, tz, now) -> str:
     """Daily summary (format kept from the pre-tick digest)."""
     today = now.astimezone(tz).date()
     active = [m for m in state.get("meds", [])
-              if not m.get("paused") and _in_window(m, today)]
+              if not m.get("paused") and _due_on(m, today)]
     date_str = now.astimezone(tz).strftime("%a %b ") + str(now.astimezone(tz).day)
     lines = [f"Meds for {date_str}:"]
     for i, med in enumerate(active, 1):
@@ -1152,8 +1164,10 @@ def digest_text(state: dict, ev, tz, now) -> str:
         lines.append("")
         lines.extend(done)
 
-    # derived stock and refill flags (PR 8b, #10)
-    stock = [(m, inventory.status_line(m, ev, now)) for m in active]
+    # derived stock and refill flags (PR 8b, #10) — every tracked med, not
+    # only today's: a Tue+Sat med's stock still matters on Friday
+    stock = [(m, inventory.status_line(m, ev, now)) for m in state.get("meds", [])
+             if not m.get("paused") and _in_window(m, today)]
     stock = [f"{m['name']}: {line}" for m, line in stock if line]
     if stock:
         lines.append("")
