@@ -27,8 +27,9 @@ One entry point, run every N minutes (default 5). Each tick:
      (60s timeout), and a second transact records sent/send_failed.
      Retries need an expired lease; retries after an unknown outcome
      are prefixed "(repeat — ignore if you already got this)". A
-     SENDER_DOWN marker tracks outages; the first successful send
-     afterwards prepends the outage window.
+     SENDER_DOWN marker tracks outages (for doctor); a message that
+     keeps failing while other sends get through is reported once, in a
+     message of its own (#21) — nothing is prefixed to other messages.
   6. Digest and overnight summary are stages keyed by local date,
      once/day, skipped if more than 4h late (folded into catch-up).
   7. Per-med try/except isolates faults (one alert/day per failing
@@ -383,6 +384,7 @@ def plan_tick(state: dict, history, now, tick_minutes: int = 5,
         if plan.catchup_lines and not in_quiet(now, quiet, tz):
             _catchup_message(plan, state, ev, idx)
         _retry_scan(plan, state, ev, idx, tz)
+        _delivery_notes(plan, state, ev, idx, tz)
 
     # Advance the watermark (heartbeat carries it; the state copy is updated
     # for the next transact — never counts as state_dirty on its own). The
@@ -855,6 +857,9 @@ def _rebuild_text(plan: Plan, state: dict, med: dict, ev, tz, stage: str,
         return missed_text(med)          # per-occurrence missed message
     if stage == "digest":
         return digest_text(state, ev, tz, plan.now)
+    if stage == "delivery":
+        m, k, g, s = key[len("delivery#"):].split("|")
+        return delivery_text(state, ev, tz, (m, k, int(g), s))
     if stage == "overnight":
         lines = _overnight_lines(state, ev, tz, plan.now)
         return "While you slept:\n" + "\n".join(f"- {l}" for l in lines)
@@ -882,6 +887,87 @@ def _global_med_stub() -> dict:
 
 
 # ── Digest / overnight / away / catch-up ───────────────────────────────────────
+
+# A message is reported once it has failed this many times while other
+# sends got through (#21); older failures are left alone.
+STUCK_AFTER = 3
+STUCK_LOOKBACK = timedelta(hours=24)
+
+
+def _failures_of(ev, k4) -> list:
+    return [e for e in ev if e.get("event") == "send_failed"
+            and (e.get("med_id"), e.get("occurrence_key"),
+                 int(e.get("generation") or 0), e.get("stage")) == k4]
+
+
+def _delivery_notes(plan: Plan, state: dict, ev, idx, tz):
+    """
+    #21: a message that keeps failing while OTHER sends get through is a
+    problem with that message, not the channel — say so once, on its own,
+    naming it. When nothing has got through since it started failing, the
+    channel is down and a note would only fail too (doctor reports the
+    SENDER_DOWN marker). Superseded or resolved doses are not reported.
+    """
+    if in_quiet(plan.now, state["global"]["quiet_hours"], tz):
+        return
+    sent_at = [_ts(e) for e in ev if e.get("event") == "sent"]
+    if not sent_at:
+        return
+    last_sent = max(sent_at)
+    # a message being retried this very tick may get through — never claim
+    # it failed in the same breath; the next tick knows the outcome
+    retrying = {(s.med_id, s.occurrence_key, s.generation, s.stage) for s in plan.sends}
+    for k4, tr in list(idx.items()):
+        med_id, key, gen, stage = k4
+        if stage == "delivery" or tr.sent is not None or tr.failed is None:
+            continue
+        if k4 in retrying:
+            continue
+        if int(tr.failed.get("attempt") or 1) < STUCK_AFTER:
+            continue
+        if plan.now - _ts(tr.failed) > STUCK_LOOKBACK:
+            continue
+        first_fail = min(_ts(e) for e in _failures_of(ev, k4))
+        if last_sent < first_fail:
+            continue                      # nothing got through: channel outage
+        if med_id != GLOBAL_MED_ID:
+            if event_store.outcome(ev, key, gen, med_id=med_id) in ("taken", "skipped"):
+                continue
+            if any((m, k, g) == (med_id, key, gen) and other.sent is not None
+                   and _stage_rank(s) > _stage_rank(stage)
+                   for (m, k, g, s), other in idx.items()):
+                continue                  # a later stage for this dose got through
+            if plan.queued_rank.get((med_id, key, gen), 0) > _stage_rank(stage):
+                continue                  # …or is going out now; judge next tick
+        note_key = f"delivery#{med_id}|{key}|{gen}|{stage}"
+        plan_send(plan, idx, GLOBAL_MED_ID, Occurrence(utc=plan.now, key=note_key, tz=tz),
+                  0, "delivery", delivery_text(state, ev, tz, k4))
+
+
+def delivery_text(state: dict, ev, tz, k4) -> str:
+    med_id, key, gen, stage = k4
+    fails = _failures_of(ev, k4)
+    attempts = max(int(e.get("attempt") or 1) for e in fails)
+    last = max(_ts(e) for e in fails).astimezone(tz)
+    occ_utc = fails[-1].get("occurrence_utc")
+    when = fmt_12h(parse_instant(occ_utc).astimezone(tz)) if occ_utc else ""
+    name = next((m["name"] for m in state.get("meds", []) if m["id"] == med_id), med_id)
+    if stage == "digest":
+        label = f"the {when} digest"
+    elif stage == "overnight":
+        label = "the overnight summary"
+    elif stage == "catchup":
+        label = "a catch-up message"
+    elif stage in ("reminder", "snooze_reminder"):
+        label = f"the {when} {name} reminder"
+    elif is_nudge(stage):
+        label = f"a {name} nudge"
+    else:
+        label = "a message"
+    return (f"Delivery problem: {label} couldn't be sent ({attempts} attempts, "
+            f"last {fmt_12h(last)}). Other messages are going through, so it's "
+            "this message, not the channel — run doctor.py if it keeps happening.")
+
 
 def _sent_for(idx, key: str, stage: str) -> bool:
     tr = idx.get((GLOBAL_MED_ID, key, 0, stage))
@@ -1204,42 +1290,28 @@ def _execute_sends(plan: Plan, clock: Clock) -> int:
     if not sends and not texts:
         return 0
 
-    marker_ts = _read_sender_down()
-    note_pending = marker_ts is not None
+    # SENDER_DOWN (for doctor) means "the last send failed and nothing has
+    # got through since": any success clears it. Messages are never
+    # prefixed — a message that keeps failing is reported on its own (#21).
     failures = 0
     results = []   # (Send, ok, error)
 
-    def with_outage_note(text):
-        """First successful send after an outage prepends the window note."""
-        if not note_pending:
-            return text
-        return (f"Delivery was down from {fmt_12h(marker_ts.astimezone(plan.tz))} "
-                f"to {fmt_12h(now.astimezone(plan.tz))}; you may have missed:\n\n{text}")
-
     for s in sends:
-        ok, err = dispatch.send_once(with_outage_note(s.text), timeout=SEND_TIMEOUT)
+        ok, err = dispatch.send_once(s.text, timeout=SEND_TIMEOUT)
         if ok:
-            if note_pending:
-                _clear_sender_down()
-                note_pending = False
+            _clear_sender_down()
             results.append((s, True, ""))
         else:
             failures += 1
             _mark_sender_down(now)
-            if marker_ts is None:
-                marker_ts = now
             results.append((s, False, err))
     for text in texts:
-        ok, err = dispatch.send_once(with_outage_note(text), timeout=SEND_TIMEOUT)
+        ok, err = dispatch.send_once(text, timeout=SEND_TIMEOUT)
         if ok:
-            if note_pending:
-                _clear_sender_down()
-                note_pending = False
+            _clear_sender_down()
         else:
             failures += 1
             _mark_sender_down(now)
-            if marker_ts is None:
-                marker_ts = now
         if ok:
             log.info("tick: alert sent")
         else:
@@ -1298,14 +1370,6 @@ def _execute_sends(plan: Plan, clock: Clock) -> int:
 
 
 # ── SENDER_DOWN marker ─────────────────────────────────────────────────────────
-
-def _read_sender_down():
-    try:
-        data = json.loads(sender_down_file().read_text(encoding="utf-8"))
-        return parse_instant(data["since_utc"])
-    except (OSError, ValueError, KeyError):
-        return None
-
 
 def _mark_sender_down(now):
     """Write the marker once per outage — it keeps the outage START."""

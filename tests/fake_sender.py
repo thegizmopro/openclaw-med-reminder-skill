@@ -5,6 +5,9 @@ Appends each message to $FAKE_SEND_OUT as "<text>\\n---\\n" so tests can
 count and inspect sends. Behavior switches via marker files:
 
   $FAKE_SEND_FAIL exists   → exit 1, nothing appended
+  $FAKE_SEND_FAIL_MATCH exists → exit 1 only when the text contains the
+                             file's contents (one message failing while
+                             others go through — #21)
   $FAKE_SEND_SLEEP exists  → sleep float(file contents) seconds BEFORE
                              delivering (hung-sender timeout tests)
   $FAKE_SEND_TRIP exists   → deliver, THEN sleep float(file contents)
@@ -31,6 +34,12 @@ text = sys.stdin.read()
 if os.path.exists(os.environ.get("FAKE_SEND_FAIL", "")):
     sys.stderr.write("fake_sender: injected failure\n")
     sys.exit(1)
+
+if os.path.exists(os.environ.get("FAKE_SEND_FAIL_MATCH", "")):
+    with open(os.environ["FAKE_SEND_FAIL_MATCH"], encoding="utf-8") as f:
+        if f.read() in text:
+            sys.stderr.write("fake_sender: injected failure (match)\n")
+            sys.exit(1)
 
 with open(out, "a", encoding="utf-8") as f:
     f.write(text + "\n---\n")
