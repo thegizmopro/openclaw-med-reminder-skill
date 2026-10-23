@@ -68,10 +68,13 @@ MESSAGE=$(cat)   # full message text arrives on stdin
 #   -H "Content-Type: application/json" \
 #   -d "{\"text\": $(echo "$MESSAGE" | python3 -c 'import json,sys; print(json.dumps(sys.stdin.read()))')}"
 
-# Example: Telegram
-# curl -s "https://api.telegram.org/bot$TELEGRAM_TOKEN/sendMessage" \
-#   -d chat_id="$TELEGRAM_CHAT_ID" \
-#   --data-urlencode text="$MESSAGE" > /dev/null
+# Example: Telegram — the text goes to curl on STDIN ("text@-"), never as an
+# argument: on Windows, Git Bash re-encodes arguments to the ANSI code page,
+# so non-ASCII text (the digest's "Mon–Fri") arrives as invalid UTF-8 (#20)
+# RESP=$(printf '%s' "$MESSAGE" | curl -s "https://api.telegram.org/bot$TELEGRAM_TOKEN/sendMessage" \
+#   --data-urlencode chat_id="$TELEGRAM_CHAT_ID" \
+#   --data-urlencode "text@-")
+# echo "$RESP" | grep -q '"ok":true' || { echo "telegram: $RESP" >&2; exit 1; }
 
 # Example: log to file only (for testing)
 echo "$MESSAGE" >> ~/med-reminder-sent.log

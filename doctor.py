@@ -329,7 +329,11 @@ def send_test() -> None:
         send_message("[med reminder] doctor test — ignore this message", dry_run=False)
         ok("test message sent — check your channel")
     except SystemExit:
-        fail("test send failed — see dispatch.log for the sender's error output")
+        # the test text is deliberately non-ASCII (the em dash): a sender that
+        # passes the message as a command-line argument mangles it on Windows
+        fail("test send failed — see dispatch.log for the sender's error output. "
+             "If plain-ASCII sends work, the sender must read the text from "
+             "stdin (curl --data-urlencode \"text@-\"), see README (#20)")
 
 
 # ── Entry point ────────────────────────────────────────────────────────────────

@@ -345,6 +345,28 @@ command. It covers dose confirmations, snoozes, skips, undos, med edits, and sta
 This is the most load-bearing part of the skill. An incorrect write corrupts state.
 Follow the protocol below exactly for every reply that mutates state.
 
+### Logging discipline (hard rules)
+
+The tick reads only `meds-state.json` and `history.jsonl` — your conversation
+memory is invisible to it. A "took" reply that never reaches `reply.py` leaves
+the dose open, and the user keeps getting nudged.
+
+1. Every med event the user reports (took / took-at / different dose / snooze /
+   skip / pause / dose change) goes through `reply.py`. Nothing else counts as
+   logged.
+2. Claim "logged" only after the command succeeded: exit code 0 **and** its
+   printed line, which you quote to the user ("Logged as your 8:00am dose.").
+   Exit 0 alone is not proof — `confirm` on a paused med exits 0 but prints
+   "Skipped: X is paused." and logs nothing. Don't verify by reading
+   `meds-state.json`: its per-med history only mirrors taken/missed/nudge
+   entries (last 30), so skips, snoozes and restocks never appear there.
+3. Dose differs from protocol: `confirm <id> --taken-at HH:MM --dose-taken 10units`
+   records the actual dose next to the prescribed one. Then ask "step-down or
+   one-off?" BEFORE any `edit-med`.
+4. Reminder text comes from the med's `dose` field. If reminders quote a stale
+   dose, the protocol edit has not landed: apply it with `reply.py edit-med`
+   (never by writing the state file), then confirm with `reply.py status`.
+
 ---
 
 ### Write protocol (mandatory for all state mutations)
