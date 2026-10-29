@@ -226,6 +226,69 @@ def nudge_text(med: dict, tz: ZoneInfo, warning: str = "", draw=None) -> str:
     return msg
 
 
+_GROUP_HEADS = {
+    "reminder": "Reminder — your {when} meds:",
+    "snooze_reminder": "Reminder (snoozed) — your {when} meds:",
+    "nudge": "Still to take — your {when} meds:",
+}
+
+
+def group_text(kind: str, T, members: list, ev, tz: ZoneInfo, now) -> str:
+    """
+    One message for several meds due at the same minute (#26): a header
+    with the dose time, then one line per med — dose (or syringe units),
+    "take with food", and indented double-dose warning / notes. `members`
+    is [(med, Send)] in send order; any member's repeat prefix carries over.
+    """
+    lines = [_GROUP_HEADS[kind].format(when=fmt_12h(T.astimezone(tz)))]
+    for med, _s in members:
+        draw = reconstitution.med_draw(med, ev, now)
+        line = f"- {med['name']} {draw_note(med, draw) if draw else med['dose'] + med['unit']}"
+        if med["schedule"].get("with_food"):
+            line += " — take with food"
+        lines.append(line)
+        warning = _double_dose_guard(ev, med, T, tz)
+        if warning:
+            lines.append(f"  {warning}")
+        if kind != "nudge" and med["schedule"].get("notes"):
+            lines.append(f"  {med['schedule']['notes']}")
+    text = "\n".join(lines)
+    if any(s.repeat for _m, s in members):
+        text = "(repeat — ignore if you already got this) " + text
+    return text
+
+
+def _group_sends(plan: Plan, state: dict, ev, tz):
+    """
+    #26: reminders (or snoozed reminders, or nudges) for different meds
+    due at the same minute, going out in the same tick, become one
+    message. Each med keeps its own Send — intent, sent/failed record,
+    retries — and they share a `group`, so _execute_sends sends the text
+    once and records the outcome for every member. A lone med keeps its
+    own (possibly custom) text.
+    """
+    meds = {m["id"]: m for m in state.get("meds", [])}
+    buckets: dict = {}
+    for s in plan.sends:
+        if s.med_id == GLOBAL_MED_ID or s.med_id not in meds:
+            continue
+        if is_nudge(s.stage):
+            kind = "nudge"
+        elif s.stage in ("reminder", "snooze_reminder"):
+            kind = s.stage
+        else:
+            continue
+        T = parse_instant(s.occurrence_utc).replace(second=0, microsecond=0)
+        buckets.setdefault((T, kind), []).append(s)
+    for (T, kind), sends in buckets.items():
+        if len({s.med_id for s in sends}) < 2:
+            continue
+        gid = f"group#{T.isoformat()}#{kind}"
+        text = group_text(kind, T, [(meds[s.med_id], s) for s in sends], ev, tz, plan.now)
+        for s in sends:
+            s.text, s.group = text, gid
+
+
 def missed_text(med: dict) -> str:
     return dispatch.expand(med["escalation"]["missed_message"], med)
 
@@ -291,6 +354,8 @@ class Send:
     attempt: int
     text: str
     intent_id: str
+    repeat: bool = False   # text carries the "(repeat …)" prefix
+    group: str = ""        # sends sharing a group go out as ONE message (#26)
 
 
 class Plan:
@@ -399,6 +464,7 @@ def plan_tick(state: dict, history, now, tick_minutes: int = 5,
             _catchup_message(plan, state, ev, idx)
         _retry_scan(plan, state, ev, idx, tz)
         _delivery_notes(plan, state, ev, idx, tz)
+        _group_sends(plan, state, ev, tz)
 
     # Advance the watermark (heartbeat carries it; the state copy is updated
     # for the next transact — never counts as state_dirty on its own). The
@@ -777,7 +843,7 @@ def queue_send(plan: Plan, med_id: str, key: str, gen: int, stage: str,
     plan.sends.append(Send(med_id=med_id, occurrence_key=key,
                            occurrence_utc=occurrence_utc_iso, generation=gen,
                            stage=stage, attempt=attempt, text=text,
-                           intent_id=iid))
+                           intent_id=iid, repeat=repeat))
     plan.handled.add((med_id, key, gen, stage))
     if med_id != GLOBAL_MED_ID:
         occ_key = (med_id, key, gen)
@@ -1271,7 +1337,12 @@ def _tick_locked(dry_run: bool, clock: Clock, tick_minutes: int):
     pre = plan_tick(state, history, now, tick_minutes, hb_wm)
 
     if dry_run:
+        shown = set()
         for s in pre.sends:
+            if s.group:
+                if s.group in shown:
+                    continue
+                shown.add(s.group)
             print(f"\n{'-' * 56}\n[DRY RUN] Would send ({s.stage}):\n{s.text}\n{'-' * 56}")
         for text in pre.alerts:
             print(f"\n[DRY RUN] Alert: {text}")
@@ -1311,9 +1382,16 @@ def _execute_sends(plan: Plan, clock: Clock) -> int:
     # prefixed — a message that keeps failing is reported on its own (#21).
     failures = 0
     results = []   # (Send, ok, error)
+    group_outcome = {}   # #26: a group's text goes out once; every member shares it
 
     for s in sends:
+        if s.group and s.group in group_outcome:
+            ok, err = group_outcome[s.group]
+            results.append((s, ok, "" if ok else err))
+            continue
         ok, err = dispatch.send_once(s.text, timeout=SEND_TIMEOUT)
+        if s.group:
+            group_outcome[s.group] = (ok, err)
         if ok:
             _clear_sender_down()
             results.append((s, True, ""))

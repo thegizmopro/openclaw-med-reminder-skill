@@ -108,8 +108,10 @@ def test_no_note_while_everything_is_failing(env):
 
 
 def two_meds():
+    # different minutes: same-minute meds share one message (#26), and these
+    # tests need Metformin's sends to fail while Lisinopril's get through
     return [make_med(med_id="med-001", name="Metformin", times=["08:00"]),
-            make_med(med_id="med-002", name="Lisinopril", times=["08:00"])]
+            make_med(med_id="med-002", name="Lisinopril", times=["08:01"])]
 
 
 def test_failing_reminder_is_reported(env):
