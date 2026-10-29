@@ -447,6 +447,11 @@ Never write state based on an ambiguous match. Always confirm with the user firs
 
 ### Reply intent map
 
+Meds due at the same minute arrive as one message ("Reminder — your 7:00pm
+meds:" with a line per med). A reply to it can name one med ("took
+wolverine" → confirm that one) or all of them ("took both", "all taken" →
+`confirm --all`); later nudges list only the meds still untaken.
+
 | User says | Intent | Command |
 |-----------|--------|---------|
 | `yes`, `done`, `all taken`, `took them all` | Confirm all | `reply.py confirm --all` |

@@ -131,7 +131,7 @@ python3 setup-tasks.py --clear
 Every scheduled run is one `dispatch.py tick`:
 
 1. **Enumerate** each med's dose occurrences between the tick watermark and now — all time math in UTC, so DST spring-forward and fall-back behave (a 01:30 dose on fall-back day reminds once, at the first instance).
-2. **Stage** each occurrence: reminder → snoozed reminder → late nudge → missed. Only the highest due stage acts; a dose confirmed inside its minimum-gap window never re-fires.
+2. **Stage** each occurrence: reminder → snoozed reminder → late nudge → missed. Only the highest due stage acts; a dose confirmed inside its minimum-gap window never re-fires. Meds due at the same minute share one reminder (and one nudge per round) listing each med still untaken; each med is still tracked on its own.
 3. **Catch up** after sleep or downtime: past-due-but-recent doses get an actionable nudge; anything past the missed deadline is logged `missed` silently with one consolidated message, so 20 missed hours don't spam 20 messages.
 4. **Send at-least-once** under a lease with a 60s timeout. A crash between send and record produces exactly one repeat, prefixed `(repeat — ignore if you already got this)`. A message that keeps failing while others get through is reported once, on its own ("Delivery problem: the 8:00am digest couldn't be sent …"); a full sender outage is tracked for `doctor.py`, and nothing is ever prefixed to an unrelated message.
 5. **Persist** every decision (`reminded`, `taken`, `missed`, …) to the append-only `history.jsonl` under an OS file lock. History is the source of truth; the state file is a cache. A crash at any point heals on the next tick.
