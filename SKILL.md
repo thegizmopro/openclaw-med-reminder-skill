@@ -5,6 +5,8 @@ description: Send medication reminders over the user's messaging channel — int
 
 # Med Reminder Skill — Interview Guide
 
+> Reminder tool, not a medical device — you are responsible for confirming your own doses. MIT licensed.
+
 This file tells the AI how to interview a user and produce a valid `meds-state.json`.
 Follow the sections in order. Each section has one primary question, the fields it maps
 to, how to handle common answers, and what defaults to apply silently.

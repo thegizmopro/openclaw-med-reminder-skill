@@ -2,6 +2,8 @@
 
 An OpenClaw skill that sends medication reminders through whatever messaging app you already use — WhatsApp, Telegram, SMS, or anything else you can script. Reminders land in a conversation you're already in, not as a notification you swipe away.
 
+> **This is a reminder tool, not a medical device.** It does not diagnose, prescribe, or verify anything medical. You are responsible for confirming your own doses. Provided as-is under the MIT License, without warranty of any kind — see [LICENSE](LICENSE).
+
 Three escalation tiers per dose: on-time reminder → late nudge → missed log. Each med has its own schedule, dose, and thresholds. State lives in a JSON file plus an append-only event log — no database, no backend, no account.
 
 > ⚠️ **Do not run intermediate builds on real meds.** Builds before the PR 4 reply commands are not safe for real use. If you are upgrading an existing install, dogfood the new build with a fake med for a few days before trusting it with a real schedule.
