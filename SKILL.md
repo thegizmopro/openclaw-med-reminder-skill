@@ -1,6 +1,6 @@
 ---
 name: med-reminder
-description: Send medication reminders over the user's messaging channel — interview once to build meds-state.json, then handle dose replies (took / took-at / snooze / skip / undo) through reply.py.
+description: Send medication reminders over the user's messaging channel — interview once to build meds-state.json, then handle dose replies (took / took-at / snooze / skip / undo) in plain language. Injection-aware: reconstituted peptides and other mg/mL vials get automatic syringe-unit math, so reminders read "Ipamorelin 200mcg = 20 units on your U-100".
 ---
 
 # Med Reminder Skill — Interview Guide
