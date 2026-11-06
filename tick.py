@@ -1237,7 +1237,9 @@ def digest_text(state: dict, ev, tz, now) -> str:
             prefix = f"{dispatch.fmt_days(day)} " if day else ""
             time_str = prefix + ", ".join(dispatch.fmt_12h(t) for t in sched["times"])
         food = " (with food)" if sched.get("with_food") else ""
-        lines.append(f"{i}. {med['name']} {med['dose']}{med['unit']} | {time_str}{food}")
+        draw = reconstitution.med_draw(med, ev, now)
+        dose = draw_note(med, draw) if draw else med['dose'] + med['unit']
+        lines.append(f"{i}. {med['name']} {dose} | {time_str}{food}")
     done = _course_done_lines(state, ev, tz, now)
     if done:
         lines.append("")
