@@ -680,13 +680,15 @@ def _other_registered_windows_tasks(h: str) -> set:
 
 def clear(h: str, state_path, run=_run, dry_run: bool = False) -> int:
     """Remove this state's tick and every legacy job. Other state files'
-    ticks (found via their registries) are left alone."""
+    ticks (found via their registries or by tick-<hash> name) are left alone."""
     if sys.platform == "win32":
         names = list_medreminder_tasks(run)
         if names is not None:
             protected = _other_registered_windows_tasks(h)
             for name in names:
-                if name in protected:
+                # any other state's tick is protected even without a registry
+                if name in protected or (is_tick_task(name)
+                                         and name != tick_task_full_name(h)):
                     continue
                 if dry_run:
                     print(f"  [DRY RUN] schtasks /delete /tn {name} /f")
